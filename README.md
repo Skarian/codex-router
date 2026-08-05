@@ -1,16 +1,16 @@
 # Codex Router
 
 Codex Router sends text to existing Codex tasks from the command line. Add a
-short local name for each task, then send instructions from Termux, shell
-scripts, voice workflows, or other clients.
+short local name for each task, then send instructions from shells, scripts,
+voice workflows, or other clients.
 
 ```sh
-echo 'Check the latest changes and run the tests.' |
-  codex-router send main --stdin --json
+echo 'Turn off the living room light.' |
+  codex-router send home --stdin --json
 ```
 
 ```json
-{"type":"completed","text":"The tests pass."}
+{"type":"completed","text":"The living room light is off."}
 ```
 
 ## Install
@@ -27,9 +27,9 @@ Create `~/.codex-router.toml`:
 
 ```toml
 [[agents]]
-id = "main"
-label = "Main"
-cwd = "/data/data/com.termux/files/home/projects/main"
+id = "home"
+label = "Home Assistant"
+cwd = "/home/user/projects/home-assistant"
 thread_id = "019..."
 model = "gpt-5.3-codex-spark"
 reasoning = "medium"
@@ -47,8 +47,8 @@ with full access and approvals disabled.
 codex-router agents list
 codex-router doctor
 
-printf '%s' 'Summarize the current state.' |
-  codex-router send main --stdin
+echo 'What is the thermostat set to?' |
+  codex-router send home --stdin
 ```
 
 Use `--json` for one final JSON object. Use `--stream` for completed reasoning,

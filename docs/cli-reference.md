@@ -15,8 +15,8 @@ codex-router [--config PATH] send AGENT_ID --stdin [--json | --stream]
 
 ```toml
 [[agents]]
-id = "main"
-label = "Main"
+id = "home"
+label = "Home Assistant"
 cwd = "/absolute/path/to/project"
 thread_id = "019..."
 model = "gpt-5.3-codex-spark"
@@ -46,7 +46,7 @@ codex-router agents list
 
 ```text
 ID    LABEL
-main  Main
+home  Home Assistant
 ```
 
 JSON mode returns an array in configuration order:
@@ -56,7 +56,7 @@ codex-router agents list --json
 ```
 
 ```json
-[{"id":"main","label":"Main"}]
+[{"id":"home","label":"Home Assistant"}]
 ```
 
 ## `doctor`
@@ -77,9 +77,9 @@ JSON mode returns every check:
   "checks": [
     {"name":"config","ok":true,"text":"Configuration is valid."},
     {"name":"codex","ok":true,"text":"codex-cli 0.146.0"},
-    {"name":"agent:main:cwd","ok":true,"text":"Working directory is accessible."},
+    {"name":"agent:home:cwd","ok":true,"text":"Working directory is accessible."},
     {"name":"app-server","ok":true,"text":"App-server initialized over proxy."},
-    {"name":"agent:main:thread","ok":true,"text":"Task exists."}
+    {"name":"agent:home:thread","ok":true,"text":"Task exists."}
   ]
 }
 ```
@@ -90,33 +90,33 @@ Reads one message from stdin, resumes the selected task, starts a turn, and
 waits for its final response.
 
 ```sh
-printf '%s' 'Run the focused tests.' |
-  codex-router send main --stdin
+echo 'Turn off the living room light.' |
+  codex-router send home --stdin
 ```
 
 Plain mode prints the final response text. JSON mode returns one terminal
 object:
 
 ```sh
-printf '%s' 'Run the focused tests.' |
-  codex-router send main --stdin --json
+echo 'Turn off the living room light.' |
+  codex-router send home --stdin --json
 ```
 
 ```json
-{"type":"completed","text":"The focused tests pass."}
+{"type":"completed","text":"The living room light is off."}
 ```
 
 Stream mode emits completed semantic messages as JSON Lines:
 
 ```sh
-printf '%s' 'Run the focused tests.' |
-  codex-router send main --stdin --stream
+echo 'Turn off the living room light.' |
+  codex-router send home --stdin --stream
 ```
 
 ```jsonl
-{"type":"reasoning","text":"I am checking the test configuration."}
-{"type":"commentary","text":"The focused suite is running."}
-{"type":"completed","text":"The focused tests pass."}
+{"type":"reasoning","text":"I am checking the living room light."}
+{"type":"commentary","text":"The living room light is on."}
+{"type":"completed","text":"The living room light is off."}
 ```
 
 Stream events contain completed reasoning summaries and commentary messages.
@@ -140,7 +140,7 @@ absent, it starts `codex app-server --listen stdio://` for the command.
 JSON and stream modes use this shape:
 
 ```json
-{"type":"failed","code":"agent_busy","text":"Main is already working. Try again after the current turn finishes."}
+{"type":"failed","code":"agent_busy","text":"Home Assistant is already working. Try again after the current turn finishes."}
 ```
 
 An uncertain delivery also includes `"ambiguous": true`. Treat that result as
