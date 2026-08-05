@@ -55,3 +55,13 @@ test("waitForTurn emits only completed semantic units and the terminal final ans
   ]);
   assert.deepEqual(await result, { type: "completed", text: "Done" });
 });
+
+test("waitForTurn drains terminal notifications buffered before subscription", async () => {
+  const transport = new EventTransport();
+  const client = new JsonRpcClient(transport);
+  const result = waitForTurn(client, "thread", "fast-turn", () => undefined, undefined, [
+    { method: "item/completed", params: { threadId: "thread", turnId: "fast-turn", item: { type: "agentMessage", phase: "final_answer", text: "Immediate" } } },
+    { method: "turn/completed", params: { threadId: "thread", turn: { id: "fast-turn", status: "completed" } } },
+  ]);
+  assert.deepEqual(await result, { type: "completed", text: "Immediate" });
+});

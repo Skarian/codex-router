@@ -94,6 +94,7 @@ export function waitForTurn(
   turnId: string,
   emit: (message: SemanticMessage) => void,
   signal?: AbortSignal,
+  initialNotifications: ReadonlyArray<{ method: string; params: unknown }> = [],
 ): Promise<SemanticMessage> {
   let finalText: string | undefined;
   const timeoutMs = Number.parseInt(process.env.CODEX_ROUTER_TURN_TIMEOUT_MS ?? "", 10) || DEFAULT_TURN_TIMEOUT_MS;
@@ -112,7 +113,7 @@ export function waitForTurn(
     };
     const onAbort = () => finish(() => reject(new RouterError("interrupted", "The Codex turn was interrupted by the caller.", { ambiguous: true })));
     const unsubscribeClose = client.onClose((error) => finish(() => reject(error)));
-    const unsubscribe = client.onNotification((method, rawParams) => {
+    const handleNotification = (method: string, rawParams: unknown) => {
       try {
         const params = object(rawParams);
         if (!params || params.threadId !== threadId) return;
@@ -145,7 +146,9 @@ export function waitForTurn(
           ? error
           : new RouterError("app_server_protocol_failed", "Codex app-server emitted an invalid turn event.", { cause: error })));
       }
-    });
+    };
+    const unsubscribe = client.onNotification(handleNotification);
+    for (const notification of initialNotifications) handleNotification(notification.method, notification.params);
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
   });
@@ -174,6 +177,11 @@ export async function sendTurn(
     }
 
     connection.client.markTurnAccepted();
+    const buffered: Array<{ method: string; params: unknown }> = [];
+    const stopBuffering = connection.client.onNotification((method, params) => {
+      if (buffered.length === 64) buffered.shift();
+      buffered.push({ method, params });
+    });
     const started = await connection.client.request("turn/start", {
       threadId: agent.threadId,
       input: [{ type: "text", text, text_elements: [] }],
@@ -188,7 +196,9 @@ export async function sendTurn(
     if (typeof turn?.id !== "string") {
       throw new RouterError("app_server_protocol_failed", "Codex app-server returned an invalid turn/start response.");
     }
-    const result = await waitForTurn(connection.client, agent.threadId, turn.id, emit, signal);
+    const resultPromise = waitForTurn(connection.client, agent.threadId, turn.id, emit, signal, buffered);
+    stopBuffering();
+    const result = await resultPromise;
     return { result, transportKind: connection.transportKind };
   } finally {
     await connection.close().catch(() => undefined);

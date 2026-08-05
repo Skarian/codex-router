@@ -15,7 +15,10 @@ export declare function listAgents(config: RouterConfig): Array<{
 }>;
 export declare function formatAgentTable(config: RouterConfig): string;
 export declare function runDoctor(config: RouterConfig): Promise<DoctorCheck[]>;
-export declare function waitForTurn(client: JsonRpcClient, threadId: string, turnId: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal): Promise<SemanticMessage>;
+export declare function waitForTurn(client: JsonRpcClient, threadId: string, turnId: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal, initialNotifications?: ReadonlyArray<{
+    method: string;
+    params: unknown;
+}>): Promise<SemanticMessage>;
 export declare function sendTurn(agent: AgentConfig, text: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal): Promise<{
     result: SemanticMessage;
     transportKind: "proxy" | "stdio";
