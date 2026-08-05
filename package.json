@@ -12,7 +12,6 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepare": "npm run build",
     "test": "npm run build && node --test dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
