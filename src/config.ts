@@ -11,6 +11,7 @@ export interface AgentConfig {
   threadId: string;
   model: string;
   reasoning?: string;
+  sshHost?: string;
 }
 
 export interface RouterConfig {
@@ -67,12 +68,16 @@ export function parseConfig(source: string): RouterConfig {
     const threadId = requiredString(record, "thread_id", agentName);
     const model = requiredString(record, "model", agentName);
     const reasoning = optionalString(record, "reasoning", agentName);
+    const sshHost = optionalString(record, "ssh_host", agentName);
 
     if (!ID_PATTERN.test(id)) {
       throw new RouterError("config_invalid", `${agentName} has an invalid id field.`);
     }
     if (!isAbsolute(cwd)) {
       throw new RouterError("config_invalid", `${agentName} has an invalid cwd field.`);
+    }
+    if (sshHost?.startsWith("-") || /\s/u.test(sshHost ?? "")) {
+      throw new RouterError("config_invalid", `${agentName} has an invalid ssh_host field.`);
     }
     if (ids.has(id)) {
       throw new RouterError("config_invalid", `Agent id ${JSON.stringify(id)} is duplicated.`);
@@ -82,7 +87,15 @@ export function parseConfig(source: string): RouterConfig {
     }
     ids.add(id);
     labels.add(label);
-    return { id, label, cwd, threadId, model, ...(reasoning === undefined ? {} : { reasoning }) };
+    return {
+      id,
+      label,
+      cwd,
+      threadId,
+      model,
+      ...(reasoning === undefined ? {} : { reasoning }),
+      ...(sshHost === undefined ? {} : { sshHost }),
+    };
   });
 
   return { agents };

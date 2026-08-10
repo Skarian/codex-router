@@ -31,6 +31,18 @@ test("parseConfig allows Codex to choose the model's default reasoning effort", 
   assert.equal(config.agents[0]?.reasoning, undefined);
 });
 
+test("parseConfig accepts an SSH host for a remote agent", () => {
+  const config = parseConfig(VALID.replace('reasoning = "medium"', 'reasoning = "medium"\nssh_host = "doordash.exe.xyz"'));
+  assert.equal(config.agents[0]?.sshHost, "doordash.exe.xyz");
+});
+
+test("parseConfig rejects SSH hosts that could be parsed as options", () => {
+  assert.throws(
+    () => parseConfig(VALID.replace('reasoning = "medium"', 'reasoning = "medium"\nssh_host = "-oProxyCommand=bad"')),
+    (error: unknown) => error instanceof RouterError && error.code === "config_invalid",
+  );
+});
+
 test("parseConfig rejects a present but empty reasoning effort", () => {
   assert.throws(
     () => parseConfig(VALID.replace('reasoning = "medium"', 'reasoning = ""')),

@@ -4,4 +4,4 @@ export interface AppServerConnection {
     readonly transportKind: "proxy" | "stdio";
     close(): Promise<void>;
 }
-export declare function connectAppServer(): Promise<AppServerConnection>;
+export declare function connectAppServer(sshHost?: string): Promise<AppServerConnection>;

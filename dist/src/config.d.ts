@@ -5,6 +5,7 @@ export interface AgentConfig {
     threadId: string;
     model: string;
     reasoning?: string;
+    sshHost?: string;
 }
 export interface RouterConfig {
     agents: AgentConfig[];

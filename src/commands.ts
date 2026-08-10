@@ -5,6 +5,7 @@ import type { AgentConfig, RouterConfig } from "./config.js";
 import { RouterError } from "./errors.js";
 import { connectAppServer } from "./app-server.js";
 import type { JsonRpcClient } from "./json-rpc.js";
+import { codexProcessSpec, sshProcessSpec } from "./transport.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_BYTES = 256 * 1024;
@@ -45,6 +46,15 @@ export function formatAgentTable(config: RouterConfig): string {
 }
 
 async function checkDirectory(agent: AgentConfig): Promise<DoctorCheck> {
+  if (agent.sshHost !== undefined) {
+    try {
+      const spec = sshProcessSpec(agent.sshHost, ["test", "-d", agent.cwd]);
+      await execFileAsync(spec.command, spec.args, { timeout: 10_000 });
+      return { name: `agent:${agent.id}:cwd`, ok: true, text: "Working directory is accessible." };
+    } catch {
+      return { name: `agent:${agent.id}:cwd`, ok: false, text: "Working directory is not accessible." };
+    }
+  }
   try {
     const info = await stat(agent.cwd);
     return info.isDirectory()
@@ -57,33 +67,72 @@ async function checkDirectory(agent: AgentConfig): Promise<DoctorCheck> {
 
 export async function runDoctor(config: RouterConfig): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [{ name: "config", ok: true, text: "Configuration is valid." }];
-  try {
-    const { stdout } = await execFileAsync("codex", ["--version"], { timeout: 5_000 });
-    checks.push({ name: "codex", ok: true, text: stdout.trim() || "Codex executable is available." });
-  } catch {
-    checks.push({ name: "codex", ok: false, text: "Codex executable is unavailable." });
+  const localAgents = config.agents.filter(({ sshHost }) => sshHost === undefined);
+  const remoteAgents = config.agents.filter(({ sshHost }) => sshHost !== undefined);
+  if (localAgents.length > 0 || config.agents.length === 0) {
+    try {
+      const { stdout } = await execFileAsync("codex", ["--version"], { timeout: 5_000 });
+      checks.push({ name: "codex", ok: true, text: stdout.trim() || "Codex executable is available." });
+    } catch {
+      checks.push({ name: "codex", ok: false, text: "Codex executable is unavailable." });
+    }
   }
   checks.push(...await Promise.all(config.agents.map(checkDirectory)));
 
-  let connection: Awaited<ReturnType<typeof connectAppServer>> | undefined;
-  try {
-    connection = await connectAppServer();
-    checks.push({ name: "app-server", ok: true, text: `App-server initialized over ${connection.transportKind}.` });
-    for (const agent of config.agents) {
+  for (const agent of remoteAgents) {
+    try {
+      const spec = codexProcessSpec(["--version"], agent.sshHost);
+      const { stdout } = await execFileAsync(spec.command, spec.args, { timeout: 10_000 });
+      checks.push({ name: `agent:${agent.id}:codex`, ok: true, text: stdout.trim() || "Codex executable is available." });
+    } catch {
+      checks.push({ name: `agent:${agent.id}:codex`, ok: false, text: "Codex executable is unavailable." });
+    }
+  }
+
+  if (localAgents.length > 0 || config.agents.length === 0) {
+    let connection: Awaited<ReturnType<typeof connectAppServer>> | undefined;
+    try {
+      connection = await connectAppServer();
+      checks.push({ name: "app-server", ok: true, text: `App-server initialized over ${connection.transportKind}.` });
+      for (const agent of localAgents) {
+        try {
+          await connection.client.request("thread/read", { threadId: agent.threadId, includeTurns: false });
+          checks.push({ name: `agent:${agent.id}:thread`, ok: true, text: "Task exists." });
+        } catch {
+          checks.push({ name: `agent:${agent.id}:thread`, ok: false, text: "Task is unavailable." });
+        }
+      }
+    } catch {
+      checks.push({ name: "app-server", ok: false, text: "App-server is unavailable." });
+      for (const agent of localAgents) {
+        checks.push({ name: `agent:${agent.id}:thread`, ok: false, text: "Task was not checked." });
+      }
+    } finally {
+      await connection?.close().catch(() => undefined);
+    }
+  }
+
+  for (const agent of remoteAgents) {
+    let remoteConnection: Awaited<ReturnType<typeof connectAppServer>> | undefined;
+    try {
+      remoteConnection = await connectAppServer(agent.sshHost);
+      checks.push({
+        name: `agent:${agent.id}:app-server`,
+        ok: true,
+        text: `App-server initialized over SSH ${remoteConnection.transportKind}.`,
+      });
       try {
-        await connection.client.request("thread/read", { threadId: agent.threadId, includeTurns: false });
+        await remoteConnection.client.request("thread/read", { threadId: agent.threadId, includeTurns: false });
         checks.push({ name: `agent:${agent.id}:thread`, ok: true, text: "Task exists." });
       } catch {
         checks.push({ name: `agent:${agent.id}:thread`, ok: false, text: "Task is unavailable." });
       }
-    }
-  } catch {
-    checks.push({ name: "app-server", ok: false, text: "App-server is unavailable." });
-    for (const agent of config.agents) {
+    } catch {
+      checks.push({ name: `agent:${agent.id}:app-server`, ok: false, text: "App-server is unavailable over SSH." });
       checks.push({ name: `agent:${agent.id}:thread`, ok: false, text: "Task was not checked." });
+    } finally {
+      await remoteConnection?.close().catch(() => undefined);
     }
-  } finally {
-    await connection?.close().catch(() => undefined);
   }
   return checks;
 }
@@ -162,7 +211,7 @@ export async function sendTurn(
 ): Promise<{ result: SemanticMessage; transportKind: "proxy" | "stdio" }> {
   const directory = await checkDirectory(agent);
   if (!directory.ok) throw new RouterError("working_directory_invalid", `${agent.label}'s working directory is unavailable.`);
-  const connection = await connectAppServer();
+  const connection = await connectAppServer(agent.sshHost);
   try {
     let resumeResult: unknown;
     try {

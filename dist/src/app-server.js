@@ -1,9 +1,12 @@
+import { execFile } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { RouterError } from "./errors.js";
 import { JsonRpcClient } from "./json-rpc.js";
-import { ProxyTransport, StdioTransport } from "./transport.js";
+import { ProxyTransport, sshProcessSpec, StdioTransport } from "./transport.js";
+const execFileAsync = promisify(execFile);
 async function codexHome() {
     const configured = process.env.CODEX_HOME?.trim();
     if (!configured)
@@ -26,7 +29,23 @@ async function socketState(path) {
         throw new RouterError("app_server_connect_failed", "The Codex control socket could not be inspected.", { cause: error });
     }
 }
-async function chooseTransport() {
+async function remoteControlSocketExists(sshHost) {
+    const script = 'codex_home=${CODEX_HOME:-"$HOME/.codex"}; test -S "$codex_home/app-server-control/app-server-control.sock"';
+    const spec = sshProcessSpec(sshHost, ["sh", "-c", script]);
+    try {
+        await execFileAsync(spec.command, spec.args, { timeout: 10_000 });
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+async function chooseTransport(sshHost) {
+    if (sshHost !== undefined) {
+        return await remoteControlSocketExists(sshHost)
+            ? new ProxyTransport(sshHost)
+            : new StdioTransport(sshHost);
+    }
     const socketPath = join(await codexHome(), "app-server-control", "app-server-control.sock");
     let state = await socketState(socketPath);
     if (state === "absent")
@@ -36,8 +55,8 @@ async function chooseTransport() {
     }
     return state === "socket" ? new ProxyTransport() : new StdioTransport();
 }
-export async function connectAppServer() {
-    const transport = await chooseTransport();
+export async function connectAppServer(sshHost) {
+    const transport = await chooseTransport(sshHost);
     try {
         await transport.start();
         const client = new JsonRpcClient(transport);

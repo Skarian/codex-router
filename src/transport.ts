@@ -17,6 +17,22 @@ export interface MessageTransport {
   close(): Promise<void>;
 }
 
+export interface ProcessSpec {
+  command: string;
+  args: string[];
+}
+
+function remoteCommand(args: string[]): string {
+  return args.map((value) => `'${value.replaceAll("'", `'"'"'`)}'`).join(" ");
+}
+
+export function sshProcessSpec(sshHost: string, args: string[]): ProcessSpec {
+  return {
+    command: "ssh",
+    args: ["-T", "-oBatchMode=yes", "-oConnectTimeout=10", sshHost, remoteCommand(args)],
+  };
+}
+
 abstract class BaseTransport implements MessageTransport {
   abstract readonly kind: TransportKind;
   private readonly messageListeners = new Set<MessageListener>();
@@ -45,8 +61,15 @@ abstract class BaseTransport implements MessageTransport {
   }
 }
 
-function spawnCodex(args: string[]): ChildProcessWithoutNullStreams {
-  const child = spawn("codex", args, { stdio: ["pipe", "pipe", "pipe"] });
+export function codexProcessSpec(args: string[], sshHost?: string): ProcessSpec {
+  return sshHost === undefined
+    ? { command: "codex", args }
+    : sshProcessSpec(sshHost, ["codex", ...args]);
+}
+
+function spawnCodex(args: string[], sshHost?: string): ChildProcessWithoutNullStreams {
+  const spec = codexProcessSpec(args, sshHost);
+  const child = spawn(spec.command, spec.args, { stdio: ["pipe", "pipe", "pipe"] });
   // Codex writes diagnostics to stderr. Drain it so a full pipe cannot block
   // protocol progress; normal router output deliberately does not expose it.
   child.stderr.resume();
@@ -80,8 +103,12 @@ export class StdioTransport extends BaseTransport {
   private child?: ChildProcessWithoutNullStreams;
   private closing = false;
 
+  constructor(private readonly sshHost?: string) {
+    super();
+  }
+
   async start(): Promise<void> {
-    const child = spawnCodex(["app-server", "--listen", "stdio://"]);
+    const child = spawnCodex(["app-server", "--listen", "stdio://"], this.sshHost);
     this.child = child;
     await waitForSpawn(child, "app_server_start_failed");
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -120,8 +147,12 @@ export class ProxyTransport extends BaseTransport {
   private socket?: WebSocket;
   private closing = false;
 
+  constructor(private readonly sshHost?: string) {
+    super();
+  }
+
   async start(): Promise<void> {
-    const child = spawnCodex(["app-server", "proxy"]);
+    const child = spawnCodex(["app-server", "proxy"], this.sshHost);
     this.child = child;
     await waitForSpawn(child, "codex_unavailable");
     const duplex = Duplex.from({ readable: child.stdout, writable: child.stdin });

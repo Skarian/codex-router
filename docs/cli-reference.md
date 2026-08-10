@@ -31,9 +31,17 @@ reasoning = "medium"
 | `thread_id` | yes | Existing Codex task ID |
 | `model` | yes | Model selected for each turn |
 | `reasoning` | no | Reasoning effort override; omission uses the model default |
+| `ssh_host` | no | OpenSSH host or alias on which Codex runs |
 
 Agent IDs are lowercase slugs that begin with a letter. IDs and labels are
 unique within the file. Agents appear in file order.
+
+When `ssh_host` is present, the router checks the remote Codex control socket.
+It connects with `ssh -T HOST codex app-server proxy` when native remote control
+is running; otherwise it starts
+`ssh -T HOST codex app-server --listen stdio://`. All other agent fields remain
+in this local configuration; `cwd` and `thread_id` identify resources on the
+remote machine. SSH credentials and connection options come from OpenSSH.
 
 ## `agents list`
 
@@ -63,6 +71,9 @@ codex-router agents list --json
 
 Checks the configuration, Codex executable, configured directories, app-server
 connection, and task IDs.
+
+For remote agents, the Codex, directory, app-server, and task checks run through
+SSH.
 
 ```sh
 codex-router doctor
@@ -131,9 +142,10 @@ The router serializes sends for each configured agent. A busy task returns
 `agent_busy` immediately. Clients can submit another send after the active turn
 finishes.
 
-When native Codex remote control is running, the router connects through
-`codex app-server proxy` and shares that app-server. When the control socket is
-absent, it starts `codex app-server --listen stdio://` for the command.
+When native Codex remote control is running locally or on an agent's SSH host,
+the router connects through `codex app-server proxy` and shares that app-server.
+When the relevant control socket is absent, it starts
+`codex app-server --listen stdio://` for the command.
 
 ## Failures
 
