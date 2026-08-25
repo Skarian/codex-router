@@ -24,7 +24,13 @@ export interface ProcessSpec {
 
 const STDERR_TAIL_BYTES = 16 * 1024;
 const STDERR_DIAGNOSTIC_BYTES = 1_024;
+const SHUTDOWN_TERM_GRACE_MS = 500;
 const stderrTails = new WeakMap<ChildProcessWithoutNullStreams, string>();
+
+export interface TransportShutdownTimings {
+  eofGraceMs: number;
+  termGraceMs: number;
+}
 
 function remoteCommand(args: string[]): string {
   return args.map((value) => `'${value.replaceAll("'", `'"'"'`)}'`).join(" ");
@@ -128,25 +134,58 @@ function waitForSpawn(child: ChildProcessWithoutNullStreams, code: "codex_unavai
   });
 }
 
-async function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      resolve();
-    }, timeoutMs);
-    timer.unref();
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve();
-    });
+function hasExited(child: ChildProcessWithoutNullStreams): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child: ChildProcessWithoutNullStreams, timeoutMs?: number): Promise<boolean> {
+  if (hasExited(child)) return Promise.resolve(true);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (exited: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child.removeListener("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    child.once("exit", onExit);
+    if (hasExited(child)) {
+      finish(true);
+      return;
+    }
+    if (timeoutMs !== undefined) {
+      timer = setTimeout(() => finish(false), timeoutMs);
+      timer.unref();
+    }
   });
+}
+
+export async function terminateChild(
+  child: ChildProcessWithoutNullStreams,
+  timings: TransportShutdownTimings,
+): Promise<void> {
+  if (await waitForChildExit(child, timings.eofGraceMs)) return;
+  child.kill("SIGTERM");
+  if (await waitForChildExit(child, timings.termGraceMs)) return;
+  child.kill("SIGKILL");
+  await waitForChildExit(child);
 }
 
 export class StdioTransport extends BaseTransport {
   readonly kind = "stdio" as const;
   private child?: ChildProcessWithoutNullStreams;
   private closing = false;
+  private closePromise?: Promise<void>;
+
+  constructor(private readonly shutdownTimings: TransportShutdownTimings = {
+    eofGraceMs: 2_000,
+    termGraceMs: SHUTDOWN_TERM_GRACE_MS,
+  }) {
+    super();
+  }
 
   async start(): Promise<void> {
     const child = spawnCodex(["app-server", "--listen", "stdio://"]);
@@ -173,12 +212,17 @@ export class StdioTransport extends BaseTransport {
     });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closePromise ??= this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
     const child = this.child;
     if (!child) return;
     this.closing = true;
     child.stdin.end();
-    await waitForExit(child, 2_000);
+    await terminateChild(child, this.shutdownTimings);
   }
 }
 
@@ -187,8 +231,15 @@ export class ProxyTransport extends BaseTransport {
   private child?: ChildProcessWithoutNullStreams;
   private socket?: WebSocket;
   private closing = false;
+  private closePromise?: Promise<void>;
 
-  constructor(private readonly sshHost?: string) {
+  constructor(
+    private readonly sshHost?: string,
+    private readonly shutdownTimings: TransportShutdownTimings = {
+      eofGraceMs: 1_000,
+      termGraceMs: SHUTDOWN_TERM_GRACE_MS,
+    },
+  ) {
     super();
   }
 
@@ -243,7 +294,12 @@ export class ProxyTransport extends BaseTransport {
     });
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closePromise ??= this.closeOnce();
+    return this.closePromise;
+  }
+
+  private async closeOnce(): Promise<void> {
     this.closing = true;
     const socket = this.socket;
     if (socket && socket.readyState === WebSocket.OPEN) socket.close();
@@ -251,7 +307,7 @@ export class ProxyTransport extends BaseTransport {
     const child = this.child;
     if (child) {
       child.stdin.end();
-      await waitForExit(child, 1_000);
+      await terminateChild(child, this.shutdownTimings);
     }
   }
 }

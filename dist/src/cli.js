@@ -3,6 +3,16 @@ import { resolve } from "node:path";
 import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
 import { cancelTurn, formatAgentTable, listAgents, runDoctor, sendTurn } from "./commands.js";
+let stdoutClosed = false;
+let activeAbortController;
+function handleStdoutError(error) {
+    if (error.code !== "EPIPE")
+        throw error;
+    stdoutClosed = true;
+    process.exitCode = 0;
+    activeAbortController?.abort();
+}
+process.stdout.on("error", handleStdoutError);
 function usage() {
     return [
         "Usage:",
@@ -42,7 +52,17 @@ function parseArgs(argv) {
     return { configPath, command, json, stream, stdin };
 }
 function printJson(value) {
-    process.stdout.write(`${JSON.stringify(value)}\n`);
+    writeStdout(`${JSON.stringify(value)}\n`);
+}
+function writeStdout(text) {
+    if (stdoutClosed)
+        return;
+    try {
+        process.stdout.write(text);
+    }
+    catch (error) {
+        handleStdoutError(error);
+    }
 }
 async function readStdin() {
     process.stdin.setEncoding("utf8");
@@ -73,7 +93,7 @@ async function main() {
             if (parsed.json)
                 printJson(listAgents(config));
             else
-                process.stdout.write(`${formatAgentTable(config)}\n`);
+                writeStdout(`${formatAgentTable(config)}\n`);
             return;
         }
         if (first === "doctor" && second === undefined && !parsed.stdin && !parsed.stream) {
@@ -83,7 +103,7 @@ async function main() {
                 printJson({ ok, checks });
             else
                 for (const check of checks)
-                    process.stdout.write(`${check.ok ? "OK" : "FAIL"}  ${check.name}  ${check.text}\n`);
+                    writeStdout(`${check.ok ? "OK" : "FAIL"}  ${check.name}  ${check.text}\n`);
             if (!ok)
                 process.exitCode = 1;
             return;
@@ -92,6 +112,7 @@ async function main() {
             const agent = findAgent(config, second);
             const text = await readStdin();
             const abortController = new AbortController();
+            activeAbortController = abortController;
             const onSignal = () => {
                 process.exitCode = 1;
                 abortController.abort();
@@ -107,9 +128,11 @@ async function main() {
                 if (parsed.json || parsed.stream)
                     printJson(result);
                 else
-                    process.stdout.write(`${result.text}\n`);
+                    writeStdout(`${result.text}\n`);
             }
             finally {
+                if (activeAbortController === abortController)
+                    activeAbortController = undefined;
                 process.removeListener("SIGINT", onSignal);
                 process.removeListener("SIGTERM", onSignal);
             }
@@ -121,14 +144,18 @@ async function main() {
             if (parsed.json)
                 printJson(result);
             else if (result.type === "interrupt_requested")
-                process.stdout.write(`Interrupt requested for ${agent.label}.\n`);
+                writeStdout(`Interrupt requested for ${agent.label}.\n`);
             else
-                process.stdout.write(`${agent.label} is already idle.\n`);
+                writeStdout(`${agent.label} is already idle.\n`);
             return;
         }
         throw new RouterError("input_invalid", "Invalid command usage.");
     }
     catch (error) {
+        if (stdoutClosed) {
+            process.exitCode = 0;
+            return;
+        }
         const failure = asRouterError(error);
         if (parsed.json || parsed.stream)
             printJson(failedMessage(failure));

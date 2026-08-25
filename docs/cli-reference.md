@@ -206,6 +206,9 @@ When the local control socket is absent, it owns
 remote stdio; they start or reuse the persistent Codex daemon and connect by
 proxy.
 
+If a local control socket exists but cannot be connected, the router falls back
+once to owned stdio. It does not delete the socket or start a local daemon.
+
 ## Failures
 
 JSON and stream modes use this shape:

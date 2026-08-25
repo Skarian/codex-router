@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
-import { boundedProcessDiagnostic, codexProcessSpec, safeSshDiagnostic } from "../src/transport.js";
+import { boundedProcessDiagnostic, codexProcessSpec, ProxyTransport, safeSshDiagnostic, StdioTransport, terminateChild } from "../src/transport.js";
 
 const SSH_OPTIONS = [
   "-T",
@@ -53,4 +55,41 @@ test("process diagnostics are flattened and bounded", () => {
 test("only recognizable SSH diagnostics are safe for user-facing failures", () => {
   assert.equal(safeSshDiagnostic("ssh: connect to host example: Operation timed out"), "ssh: connect to host example: Operation timed out");
   assert.equal(safeSshDiagnostic("remote Codex internal diagnostic with a path"), undefined);
+});
+
+test("child shutdown waits for EOF, then TERM, then SIGKILL as needed", async () => {
+  const eofChild = spawn(process.execPath, ["-e", "process.stdin.resume(); process.stdin.on('end', () => process.exit(0))"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  await once(eofChild, "spawn");
+  eofChild.stdin.end();
+  await terminateChild(eofChild, { eofGraceMs: 100, termGraceMs: 100 });
+  assert.equal(eofChild.exitCode, 0);
+
+  const termChild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => process.exit(0)); console.log('ready'); setInterval(() => {}, 1000)"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  await once(termChild.stdout, "data");
+  termChild.stdin.end();
+  await terminateChild(termChild, { eofGraceMs: 10, termGraceMs: 100 });
+  assert.equal(termChild.exitCode, 0);
+
+  const killChild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  await once(killChild.stdout, "data");
+  const pid = killChild.pid;
+  killChild.stdin.end();
+  await terminateChild(killChild, { eofGraceMs: 10, termGraceMs: 10 });
+  assert.equal(killChild.signalCode, "SIGKILL");
+  assert.throws(() => process.kill(pid!, 0), (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH");
+});
+
+test("transport close is idempotent for concurrent callers", async () => {
+  for (const transport of [new StdioTransport(), new ProxyTransport()]) {
+    const first = transport.close();
+    const second = transport.close();
+    assert.equal(first, second);
+    await Promise.all([first, second]);
+  }
 });

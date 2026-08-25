@@ -5,6 +5,7 @@ import WebSocket from "ws";
 import { RouterError } from "./errors.js";
 const STDERR_TAIL_BYTES = 16 * 1024;
 const STDERR_DIAGNOSTIC_BYTES = 1_024;
+const SHUTDOWN_TERM_GRACE_MS = 500;
 const stderrTails = new WeakMap();
 function remoteCommand(args) {
     return args.map((value) => `'${value.replaceAll("'", `'"'"'`)}'`).join(" ");
@@ -93,25 +94,58 @@ function waitForSpawn(child, code) {
         child.once("error", (error) => reject(new RouterError(code, "The Codex app-server process could not be started.", { cause: error })));
     });
 }
-async function waitForExit(child, timeoutMs) {
-    if (child.exitCode !== null || child.signalCode !== null)
-        return;
-    await new Promise((resolve) => {
-        const timer = setTimeout(() => {
-            child.kill("SIGTERM");
-            resolve();
-        }, timeoutMs);
-        timer.unref();
-        child.once("exit", () => {
-            clearTimeout(timer);
-            resolve();
-        });
+function hasExited(child) {
+    return child.exitCode !== null || child.signalCode !== null;
+}
+function waitForChildExit(child, timeoutMs) {
+    if (hasExited(child))
+        return Promise.resolve(true);
+    return new Promise((resolve) => {
+        let settled = false;
+        let timer;
+        const finish = (exited) => {
+            if (settled)
+                return;
+            settled = true;
+            if (timer)
+                clearTimeout(timer);
+            child.removeListener("exit", onExit);
+            resolve(exited);
+        };
+        const onExit = () => finish(true);
+        child.once("exit", onExit);
+        if (hasExited(child)) {
+            finish(true);
+            return;
+        }
+        if (timeoutMs !== undefined) {
+            timer = setTimeout(() => finish(false), timeoutMs);
+            timer.unref();
+        }
     });
 }
+export async function terminateChild(child, timings) {
+    if (await waitForChildExit(child, timings.eofGraceMs))
+        return;
+    child.kill("SIGTERM");
+    if (await waitForChildExit(child, timings.termGraceMs))
+        return;
+    child.kill("SIGKILL");
+    await waitForChildExit(child);
+}
 export class StdioTransport extends BaseTransport {
+    shutdownTimings;
     kind = "stdio";
     child;
     closing = false;
+    closePromise;
+    constructor(shutdownTimings = {
+        eofGraceMs: 2_000,
+        termGraceMs: SHUTDOWN_TERM_GRACE_MS,
+    }) {
+        super();
+        this.shutdownTimings = shutdownTimings;
+    }
     async start() {
         const child = spawnCodex(["app-server", "--listen", "stdio://"]);
         this.child = child;
@@ -138,24 +172,34 @@ export class StdioTransport extends BaseTransport {
             child.stdin.write(`${JSON.stringify(message)}\n`, (error) => error ? reject(error) : resolve());
         });
     }
-    async close() {
+    close() {
+        this.closePromise ??= this.closeOnce();
+        return this.closePromise;
+    }
+    async closeOnce() {
         const child = this.child;
         if (!child)
             return;
         this.closing = true;
         child.stdin.end();
-        await waitForExit(child, 2_000);
+        await terminateChild(child, this.shutdownTimings);
     }
 }
 export class ProxyTransport extends BaseTransport {
     sshHost;
+    shutdownTimings;
     kind = "proxy";
     child;
     socket;
     closing = false;
-    constructor(sshHost) {
+    closePromise;
+    constructor(sshHost, shutdownTimings = {
+        eofGraceMs: 1_000,
+        termGraceMs: SHUTDOWN_TERM_GRACE_MS,
+    }) {
         super();
         this.sshHost = sshHost;
+        this.shutdownTimings = shutdownTimings;
     }
     async start() {
         const child = spawnCodex(["app-server", "proxy"], this.sshHost);
@@ -208,7 +252,11 @@ export class ProxyTransport extends BaseTransport {
             socket.send(JSON.stringify(message), (error) => error ? reject(error) : resolve());
         });
     }
-    async close() {
+    close() {
+        this.closePromise ??= this.closeOnce();
+        return this.closePromise;
+    }
+    async closeOnce() {
         this.closing = true;
         const socket = this.socket;
         if (socket && socket.readyState === WebSocket.OPEN)
@@ -218,7 +266,7 @@ export class ProxyTransport extends BaseTransport {
         const child = this.child;
         if (child) {
             child.stdin.end();
-            await waitForExit(child, 1_000);
+            await terminateChild(child, this.shutdownTimings);
         }
     }
 }

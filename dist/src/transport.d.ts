@@ -1,3 +1,4 @@
+import { type ChildProcessWithoutNullStreams } from "node:child_process";
 export type TransportKind = "proxy" | "stdio";
 type MessageListener = (message: unknown) => void;
 type CloseListener = (error?: Error) => void;
@@ -12,6 +13,10 @@ export interface MessageTransport {
 export interface ProcessSpec {
     command: string;
     args: string[];
+}
+export interface TransportShutdownTimings {
+    eofGraceMs: number;
+    termGraceMs: number;
 }
 export declare function sshProcessSpec(sshHost: string, args: string[]): ProcessSpec;
 declare abstract class BaseTransport implements MessageTransport {
@@ -29,23 +34,31 @@ declare abstract class BaseTransport implements MessageTransport {
 export declare function codexProcessSpec(args: string[], sshHost?: string): ProcessSpec;
 export declare function boundedProcessDiagnostic(stderr: string): string | undefined;
 export declare function safeSshDiagnostic(stderr: string): string | undefined;
+export declare function terminateChild(child: ChildProcessWithoutNullStreams, timings: TransportShutdownTimings): Promise<void>;
 export declare class StdioTransport extends BaseTransport {
+    private readonly shutdownTimings;
     readonly kind: "stdio";
     private child?;
     private closing;
+    private closePromise?;
+    constructor(shutdownTimings?: TransportShutdownTimings);
     start(): Promise<void>;
     send(message: unknown): Promise<void>;
     close(): Promise<void>;
+    private closeOnce;
 }
 export declare class ProxyTransport extends BaseTransport {
     private readonly sshHost?;
+    private readonly shutdownTimings;
     readonly kind: "proxy";
     private child?;
     private socket?;
     private closing;
-    constructor(sshHost?: string | undefined);
+    private closePromise?;
+    constructor(sshHost?: string | undefined, shutdownTimings?: TransportShutdownTimings);
     start(): Promise<void>;
     send(message: unknown): Promise<void>;
     close(): Promise<void>;
+    private closeOnce;
 }
 export {};

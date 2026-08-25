@@ -11,6 +11,12 @@ export declare function parseRemoteControlSocketState(stdout: string): RemoteSoc
 export declare function parseDaemonStartResult(stdout: string): Record<string, unknown>;
 export declare function remoteDaemonStartSpec(sshHost: string): ReturnType<typeof sshProcessSpec>;
 export declare function remoteDaemonAvailable(sshHost: string): Promise<boolean>;
+export interface LocalAppServerOperations {
+    probe(): Promise<"absent" | "socket" | "other">;
+    connectProxy(): Promise<AppServerConnection>;
+    connectStdio(): Promise<AppServerConnection>;
+}
+export declare function connectLocalAppServer(operations?: LocalAppServerOperations): Promise<AppServerConnection>;
 export interface RemoteProxyOperations {
     probe(): Promise<RemoteSocketState>;
     startDaemon(): Promise<void>;

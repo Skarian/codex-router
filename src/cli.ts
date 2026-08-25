@@ -12,6 +12,18 @@ interface ParsedArgs {
   stdin: boolean;
 }
 
+let stdoutClosed = false;
+let activeAbortController: AbortController | undefined;
+
+function handleStdoutError(error: NodeJS.ErrnoException): void {
+  if (error.code !== "EPIPE") throw error;
+  stdoutClosed = true;
+  process.exitCode = 0;
+  activeAbortController?.abort();
+}
+
+process.stdout.on("error", handleStdoutError);
+
 function usage(): string {
   return [
     "Usage:",
@@ -45,7 +57,16 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function printJson(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  writeStdout(`${JSON.stringify(value)}\n`);
+}
+
+function writeStdout(text: string): void {
+  if (stdoutClosed) return;
+  try {
+    process.stdout.write(text);
+  } catch (error) {
+    handleStdoutError(error as NodeJS.ErrnoException);
+  }
 }
 
 async function readStdin(): Promise<string> {
@@ -74,14 +95,14 @@ async function main(): Promise<void> {
     const config = await loadConfig(parsed.configPath);
     if (first === "agents" && second === "list" && third === undefined && !parsed.stdin && !parsed.stream) {
       if (parsed.json) printJson(listAgents(config));
-      else process.stdout.write(`${formatAgentTable(config)}\n`);
+      else writeStdout(`${formatAgentTable(config)}\n`);
       return;
     }
     if (first === "doctor" && second === undefined && !parsed.stdin && !parsed.stream) {
       const checks = await runDoctor(config);
       const ok = checks.every((check) => check.ok);
       if (parsed.json) printJson({ ok, checks });
-      else for (const check of checks) process.stdout.write(`${check.ok ? "OK" : "FAIL"}  ${check.name}  ${check.text}\n`);
+      else for (const check of checks) writeStdout(`${check.ok ? "OK" : "FAIL"}  ${check.name}  ${check.text}\n`);
       if (!ok) process.exitCode = 1;
       return;
     }
@@ -89,6 +110,7 @@ async function main(): Promise<void> {
       const agent = findAgent(config, second);
       const text = await readStdin();
       const abortController = new AbortController();
+      activeAbortController = abortController;
       const onSignal = () => {
         process.exitCode = 1;
         abortController.abort();
@@ -101,8 +123,9 @@ async function main(): Promise<void> {
         };
         const { result } = await sendTurn(agent, text, emit, abortController.signal);
         if (parsed.json || parsed.stream) printJson(result);
-        else process.stdout.write(`${result.text}\n`);
+        else writeStdout(`${result.text}\n`);
       } finally {
+        if (activeAbortController === abortController) activeAbortController = undefined;
         process.removeListener("SIGINT", onSignal);
         process.removeListener("SIGTERM", onSignal);
       }
@@ -112,12 +135,16 @@ async function main(): Promise<void> {
       const agent = findAgent(config, second);
       const result = await cancelTurn(agent);
       if (parsed.json) printJson(result);
-      else if (result.type === "interrupt_requested") process.stdout.write(`Interrupt requested for ${agent.label}.\n`);
-      else process.stdout.write(`${agent.label} is already idle.\n`);
+      else if (result.type === "interrupt_requested") writeStdout(`Interrupt requested for ${agent.label}.\n`);
+      else writeStdout(`${agent.label} is already idle.\n`);
       return;
     }
     throw new RouterError("input_invalid", "Invalid command usage.");
   } catch (error) {
+    if (stdoutClosed) {
+      process.exitCode = 0;
+      return;
+    }
     const failure = asRouterError(error);
     if (parsed.json || parsed.stream) printJson(failedMessage(failure));
     else process.stderr.write(`${failure.message}\n`);

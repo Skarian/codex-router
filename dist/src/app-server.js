@@ -114,16 +114,6 @@ export async function remoteDaemonAvailable(sshHost) {
         throw new RouterError("app_server_connect_failed", "The remote Codex daemon capability could not be inspected over SSH.", { cause: error });
     }
 }
-async function chooseLocalTransport() {
-    const socketPath = join(await codexHome(), "app-server-control", "app-server-control.sock");
-    let state = await socketState(socketPath);
-    if (state === "absent")
-        state = await socketState(socketPath);
-    if (state === "other") {
-        throw new RouterError("app_server_connect_failed", "The Codex control-socket path exists but is not a Unix socket.");
-    }
-    return state === "socket" ? new ProxyTransport() : new StdioTransport();
-}
 async function connectTransport(transport) {
     try {
         await transport.start();
@@ -154,6 +144,32 @@ async function connectTransport(transport) {
             : "The owned Codex app-server could not be initialized.", { cause: error });
     }
 }
+export async function connectLocalAppServer(operations) {
+    const defaults = operations ?? {
+        probe: async () => {
+            const socketPath = join(await codexHome(), "app-server-control", "app-server-control.sock");
+            return socketState(socketPath);
+        },
+        connectProxy: () => connectTransport(new ProxyTransport()),
+        connectStdio: () => connectTransport(new StdioTransport()),
+    };
+    let state = await defaults.probe();
+    if (state === "absent")
+        state = await defaults.probe();
+    if (state === "other") {
+        throw new RouterError("app_server_connect_failed", "The Codex control-socket path exists but is not a Unix socket.");
+    }
+    if (state === "absent")
+        return defaults.connectStdio();
+    try {
+        return await defaults.connectProxy();
+    }
+    catch (error) {
+        if (!(error instanceof RouterError) || error.code !== "app_server_connect_failed")
+            throw error;
+        return defaults.connectStdio();
+    }
+}
 export async function ensureRemoteProxy(operations) {
     const state = await operations.probe();
     if (state === "socket") {
@@ -179,7 +195,7 @@ export async function connectExistingRemoteProxy(sshHost) {
 }
 export async function connectAppServer(sshHost) {
     if (sshHost === undefined)
-        return connectTransport(await chooseLocalTransport());
+        return connectLocalAppServer();
     return ensureRemoteProxy({
         probe: () => remoteControlSocketState(sshHost),
         startDaemon: () => startRemoteDaemon(sshHost),

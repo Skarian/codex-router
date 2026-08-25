@@ -79,7 +79,9 @@ steers that turn and waits for its shared final response. `cancel` explicitly
 requests interruption of the active turn and is a successful no-op when idle.
 
 Locally, Codex Router connects to an existing control socket when available and
-otherwise owns an app-server for the command. For SSH agents, the router always
+otherwise owns an app-server for the command. If a local socket is stale and
+cannot be connected, it falls back once to an owned app-server without deleting
+the socket or starting a local daemon. For SSH agents, the router always
 uses a persistent remote app-server: the first send starts the supported Codex
 daemon when needed, then connects through `codex app-server proxy`. The router
 does not install or update Codex, enable remote control, or stop the daemon.

@@ -121,16 +121,6 @@ export async function remoteDaemonAvailable(sshHost: string): Promise<boolean> {
   }
 }
 
-async function chooseLocalTransport(): Promise<MessageTransport> {
-  const socketPath = join(await codexHome(), "app-server-control", "app-server-control.sock");
-  let state = await socketState(socketPath);
-  if (state === "absent") state = await socketState(socketPath);
-  if (state === "other") {
-    throw new RouterError("app_server_connect_failed", "The Codex control-socket path exists but is not a Unix socket.");
-  }
-  return state === "socket" ? new ProxyTransport() : new StdioTransport();
-}
-
 async function connectTransport(transport: MessageTransport): Promise<AppServerConnection> {
   try {
     await transport.start();
@@ -167,6 +157,35 @@ async function connectTransport(transport: MessageTransport): Promise<AppServerC
   }
 }
 
+export interface LocalAppServerOperations {
+  probe(): Promise<"absent" | "socket" | "other">;
+  connectProxy(): Promise<AppServerConnection>;
+  connectStdio(): Promise<AppServerConnection>;
+}
+
+export async function connectLocalAppServer(operations?: LocalAppServerOperations): Promise<AppServerConnection> {
+  const defaults: LocalAppServerOperations = operations ?? {
+    probe: async () => {
+      const socketPath = join(await codexHome(), "app-server-control", "app-server-control.sock");
+      return socketState(socketPath);
+    },
+    connectProxy: () => connectTransport(new ProxyTransport()),
+    connectStdio: () => connectTransport(new StdioTransport()),
+  };
+  let state = await defaults.probe();
+  if (state === "absent") state = await defaults.probe();
+  if (state === "other") {
+    throw new RouterError("app_server_connect_failed", "The Codex control-socket path exists but is not a Unix socket.");
+  }
+  if (state === "absent") return defaults.connectStdio();
+  try {
+    return await defaults.connectProxy();
+  } catch (error) {
+    if (!(error instanceof RouterError) || error.code !== "app_server_connect_failed") throw error;
+    return defaults.connectStdio();
+  }
+}
+
 export interface RemoteProxyOperations {
   probe(): Promise<RemoteSocketState>;
   startDaemon(): Promise<void>;
@@ -199,7 +218,7 @@ export async function connectExistingRemoteProxy(sshHost: string): Promise<AppSe
 }
 
 export async function connectAppServer(sshHost?: string): Promise<AppServerConnection> {
-  if (sshHost === undefined) return connectTransport(await chooseLocalTransport());
+  if (sshHost === undefined) return connectLocalAppServer();
   return ensureRemoteProxy({
     probe: () => remoteControlSocketState(sshHost),
     startDaemon: () => startRemoteDaemon(sshHost),

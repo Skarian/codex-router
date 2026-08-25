@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  connectLocalAppServer,
   ensureRemoteProxy,
   parseDaemonStartResult,
   parseRemoteControlSocketState,
@@ -95,4 +96,53 @@ test("daemon start must expose a socket before proxy connection", async () => {
     }),
     (error: unknown) => error instanceof RouterError && error.code === "app_server_start_failed",
   );
+});
+
+test("local app-server falls back to owned stdio only for an unreachable socket proxy", async () => {
+  const fallbackCalls: string[] = [];
+  const fallback = await connectLocalAppServer({
+    probe: async () => "socket",
+    connectProxy: async () => {
+      fallbackCalls.push("proxy");
+      throw new RouterError("app_server_connect_failed", "stale socket");
+    },
+    connectStdio: async () => {
+      fallbackCalls.push("stdio");
+      return { ...connection(), transportKind: "stdio" };
+    },
+  });
+  assert.equal(fallback.transportKind, "stdio");
+  assert.deepEqual(fallbackCalls, ["proxy", "stdio"]);
+
+  for (const code of ["app_server_protocol_failed", "timeout", "codex_unavailable"] as const) {
+    const calls: string[] = [];
+    await assert.rejects(
+      connectLocalAppServer({
+        probe: async () => "socket",
+        connectProxy: async () => {
+          calls.push("proxy");
+          throw new RouterError(code, "definite failure");
+        },
+        connectStdio: async () => {
+          calls.push("stdio");
+          return { ...connection(), transportKind: "stdio" };
+        },
+      }),
+      (error: unknown) => error instanceof RouterError && error.code === code,
+    );
+    assert.deepEqual(calls, ["proxy"]);
+  }
+});
+
+test("local app-server uses stdio directly when the socket is absent", async () => {
+  const calls: string[] = [];
+  const states = ["absent", "absent"] as const;
+  let probe = 0;
+  const result = await connectLocalAppServer({
+    probe: async () => states[probe++] ?? "absent",
+    connectProxy: async () => { calls.push("proxy"); return connection(); },
+    connectStdio: async () => { calls.push("stdio"); return { ...connection(), transportKind: "stdio" }; },
+  });
+  assert.equal(result.transportKind, "stdio");
+  assert.deepEqual(calls, ["stdio"]);
 });
