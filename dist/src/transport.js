@@ -3,13 +3,24 @@ import { Duplex } from "node:stream";
 import { createInterface } from "node:readline";
 import WebSocket from "ws";
 import { RouterError } from "./errors.js";
+const STDERR_TAIL_BYTES = 16 * 1024;
+const STDERR_DIAGNOSTIC_BYTES = 1_024;
+const stderrTails = new WeakMap();
 function remoteCommand(args) {
     return args.map((value) => `'${value.replaceAll("'", `'"'"'`)}'`).join(" ");
 }
 export function sshProcessSpec(sshHost, args) {
     return {
         command: "ssh",
-        args: ["-T", "-oBatchMode=yes", "-oConnectTimeout=10", sshHost, remoteCommand(args)],
+        args: [
+            "-T",
+            "-oBatchMode=yes",
+            "-oConnectTimeout=10",
+            "-oServerAliveInterval=15",
+            "-oServerAliveCountMax=4",
+            sshHost,
+            remoteCommand(args),
+        ],
     };
 }
 class BaseTransport {
@@ -40,10 +51,41 @@ export function codexProcessSpec(args, sshHost) {
 function spawnCodex(args, sshHost) {
     const spec = codexProcessSpec(args, sshHost);
     const child = spawn(spec.command, spec.args, { stdio: ["pipe", "pipe", "pipe"] });
-    // Codex writes diagnostics to stderr. Drain it so a full pipe cannot block
-    // protocol progress; normal router output deliberately does not expose it.
-    child.stderr.resume();
+    stderrTails.set(child, "");
+    child.stderr.on("data", (chunk) => {
+        const next = `${stderrTails.get(child) ?? ""}${chunk.toString()}`;
+        stderrTails.set(child, Buffer.byteLength(next, "utf8") <= STDERR_TAIL_BYTES
+            ? next
+            : Buffer.from(next).subarray(-STDERR_TAIL_BYTES).toString("utf8"));
+    });
     return child;
+}
+export function boundedProcessDiagnostic(stderr) {
+    const clean = stderr.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, "").replace(/\s+/g, " ").trim();
+    if (!clean)
+        return undefined;
+    const bytes = Buffer.from(clean);
+    return bytes.length <= STDERR_DIAGNOSTIC_BYTES
+        ? clean
+        : bytes.subarray(bytes.length - STDERR_DIAGNOSTIC_BYTES).toString("utf8");
+}
+export function safeSshDiagnostic(stderr) {
+    const diagnostic = boundedProcessDiagnostic(stderr);
+    if (!diagnostic)
+        return undefined;
+    return /^(ssh:|connection (?:closed|reset)|broken pipe|kex_exchange_identification:)/i.test(diagnostic)
+        ? diagnostic
+        : undefined;
+}
+function processError(message, child, sshHost) {
+    const diagnostic = boundedProcessDiagnostic(stderrTails.get(child) ?? "");
+    const safeDiagnostic = sshHost === undefined ? undefined : safeSshDiagnostic(diagnostic ?? "");
+    return new Error(`${message}${safeDiagnostic ? ` ${safeDiagnostic}` : ""}`, {
+        cause: diagnostic === undefined ? undefined : new Error(diagnostic),
+    });
+}
+function processExitError(label, child, code, signal, sshHost) {
+    return processError(`${label} exited (${code ?? signal ?? "unknown"}).`, child, sshHost);
 }
 function waitForSpawn(child, code) {
     return new Promise((resolve, reject) => {
@@ -90,7 +132,7 @@ export class StdioTransport extends BaseTransport {
         });
         child.once("exit", (code, signal) => {
             if (!this.closing)
-                this.emitClose(new Error(`Owned app-server exited (${code ?? signal ?? "unknown"}).`));
+                this.emitClose(processExitError("Owned app-server", child, code, signal, this.sshHost));
         });
     }
     async send(message) {
@@ -149,12 +191,13 @@ export class ProxyTransport extends BaseTransport {
             }
         });
         socket.on("close", () => {
-            if (!this.closing)
-                this.emitClose(new Error("The app-server proxy connection closed."));
+            if (!this.closing) {
+                this.emitClose(processError("The app-server proxy connection closed.", child, this.sshHost));
+            }
         });
         child.once("exit", (code, signal) => {
             if (!this.closing)
-                this.emitClose(new Error(`The app-server proxy exited (${code ?? signal ?? "unknown"}).`));
+                this.emitClose(processExitError("The app-server proxy", child, code, signal, this.sshHost));
         });
         await new Promise((resolve, reject) => {
             socket.once("open", resolve);

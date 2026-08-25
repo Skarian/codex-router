@@ -42,6 +42,12 @@ is running; otherwise it starts
 `ssh -T HOST codex app-server --listen stdio://`. All other agent fields remain
 in this local configuration; `cwd` and `thread_id` identify resources on the
 remote machine. SSH credentials and connection options come from OpenSSH.
+The router adds encrypted SSH keepalives (`ServerAliveInterval=15` and
+`ServerAliveCountMax=4`). If an SSH proxy disconnects after a turn is accepted,
+the router reconnects within the original turn timeout, resumes the task, and
+correlates the same turn before continuing. It never blindly submits the input
+again. This recovery is limited to proxy mode; an SSH disconnect can terminate
+the fallback command-owned stdio app-server.
 
 ## `agents list`
 

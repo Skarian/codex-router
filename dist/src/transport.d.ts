@@ -27,6 +27,8 @@ declare abstract class BaseTransport implements MessageTransport {
     protected emitClose(error?: Error): void;
 }
 export declare function codexProcessSpec(args: string[], sshHost?: string): ProcessSpec;
+export declare function boundedProcessDiagnostic(stderr: string): string | undefined;
+export declare function safeSshDiagnostic(stderr: string): string | undefined;
 export declare class StdioTransport extends BaseTransport {
     private readonly sshHost?;
     readonly kind: "stdio";

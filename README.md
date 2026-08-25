@@ -74,6 +74,11 @@ commentary, and final messages as JSON Lines.
 Codex Router connects to the app-server used by native remote control when its
 standard control socket is available, including on configured SSH hosts.
 Otherwise, it starts an app-server for the command and closes it afterward.
+SSH proxy connections use protocol keepalives. If a proxy connection drops
+during a turn, the router reconnects to the same running app-server, resumes
+the task, and continues waiting for that exact turn. This recovery does not
+apply to the fallback owned app-server, because losing its SSH session can
+terminate the remote process.
 
 See [CLI reference](docs/cli-reference.md) for commands, output shapes, exit
 codes, and failure codes.

@@ -36,14 +36,25 @@ async function socketState(path: string): Promise<"absent" | "socket" | "other">
 }
 
 async function remoteControlSocketExists(sshHost: string): Promise<boolean> {
-  const script = 'codex_home=${CODEX_HOME:-"$HOME/.codex"}; test -S "$codex_home/app-server-control/app-server-control.sock"';
+  const script = 'codex_home=${CODEX_HOME:-"$HOME/.codex"}; socket="$codex_home/app-server-control/app-server-control.sock"; if test -S "$socket"; then printf socket; elif test -e "$socket"; then printf other; else printf absent; fi';
   const spec = sshProcessSpec(sshHost, ["sh", "-c", script]);
   try {
-    await execFileAsync(spec.command, spec.args, { timeout: 10_000 });
-    return true;
-  } catch {
-    return false;
+    const { stdout } = await execFileAsync(spec.command, spec.args, { timeout: 10_000 });
+    return parseRemoteControlSocketState(stdout);
+  } catch (error) {
+    if (error instanceof RouterError) throw error;
+    throw new RouterError("app_server_connect_failed", "The remote Codex control socket could not be inspected over SSH.", { cause: error });
   }
+}
+
+export function parseRemoteControlSocketState(stdout: string): boolean {
+  const state = stdout.trim();
+  if (state === "socket") return true;
+  if (state === "absent") return false;
+  if (state === "other") {
+    throw new RouterError("app_server_connect_failed", "The remote Codex control-socket path exists but is not a Unix socket.");
+  }
+  throw new RouterError("app_server_protocol_failed", "The remote Codex control-socket probe returned an invalid response.");
 }
 
 async function chooseTransport(sshHost?: string): Promise<MessageTransport> {
@@ -61,8 +72,10 @@ async function chooseTransport(sshHost?: string): Promise<MessageTransport> {
   return state === "socket" ? new ProxyTransport() : new StdioTransport();
 }
 
-export async function connectAppServer(sshHost?: string): Promise<AppServerConnection> {
-  const transport = await chooseTransport(sshHost);
+export async function connectAppServer(sshHost?: string, requiredTransportKind?: "proxy"): Promise<AppServerConnection> {
+  const transport = requiredTransportKind === "proxy"
+    ? new ProxyTransport(sshHost)
+    : await chooseTransport(sshHost);
   try {
     await transport.start();
     const client = new JsonRpcClient(transport);

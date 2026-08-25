@@ -100,7 +100,10 @@ export class JsonRpcClient {
         this.pending.clear();
     }
     disconnectedError(cause) {
-        return new RouterError("app_server_disconnected", "The Codex app-server connection closed before the command completed.", {
+        const detail = cause instanceof Error && cause.message
+            ? ` ${cause.message}`
+            : "";
+        return new RouterError("app_server_disconnected", `The Codex app-server connection closed before the command completed.${detail}`, {
             ambiguous: this.acceptedTurn,
             cause,
         });

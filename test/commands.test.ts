@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { waitForTurn, type SemanticMessage } from "../src/commands.js";
+import { findCorrelatedTurn, waitForTurn, type SemanticMessage } from "../src/commands.js";
 import { JsonRpcClient } from "../src/json-rpc.js";
 import type { MessageTransport, TransportKind } from "../src/transport.js";
 
@@ -64,4 +64,47 @@ test("waitForTurn drains terminal notifications buffered before subscription", a
     { method: "turn/completed", params: { threadId: "thread", turn: { id: "fast-turn", status: "completed" } } },
   ]);
   assert.deepEqual(await result, { type: "completed", text: "Immediate" });
+});
+
+test("waitForTurn does not re-emit items restored after reconnect", async () => {
+  const transport = new EventTransport();
+  const client = new JsonRpcClient(transport);
+  const emitted: SemanticMessage[] = [];
+  const state = { seenItemIds: new Set<string>(), seenSemanticUnits: new Set<string>() };
+  const result = waitForTurn(client, "thread", "turn", (message) => emitted.push(message), undefined, [
+    { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "reason", type: "reasoning", summary: ["Once"] } } },
+    { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "reason", type: "reasoning", summary: ["Once"] } } },
+    { method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed", items: [{ id: "final", type: "agentMessage", phase: "final_answer", text: "Done" }] } } },
+  ], state);
+  assert.deepEqual(await result, { type: "completed", text: "Done" });
+  assert.deepEqual(emitted, [{ type: "reasoning", text: "Once" }]);
+});
+
+test("waitForTurn deduplicates replayed semantic content even when persisted item ids change", async () => {
+  const transport = new EventTransport();
+  const client = new JsonRpcClient(transport);
+  const emitted: SemanticMessage[] = [];
+  const state = { seenItemIds: new Set<string>(), seenSemanticUnits: new Set<string>() };
+  const result = waitForTurn(client, "thread", "turn", (message) => emitted.push(message), undefined, [
+    { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "live", type: "agentMessage", phase: "commentary", text: "Same progress" } } },
+    { method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed", items: [
+      { id: "persisted", type: "agentMessage", phase: "commentary", text: "Same progress" },
+      { id: "final", type: "agentMessage", phase: "final_answer", text: "Done" },
+    ] } } },
+  ], state);
+  assert.deepEqual(await result, { type: "completed", text: "Done" });
+  assert.deepEqual(emitted, [{ type: "commentary", text: "Same progress" }]);
+});
+
+test("findCorrelatedTurn uses the stable client user message id when turn/start response is lost", () => {
+  const expected = {
+    id: "accepted-turn",
+    status: "inProgress",
+    items: [{ id: "user", type: "userMessage", clientId: "client-message" }],
+  };
+  assert.equal(findCorrelatedTurn({ thread: { turns: [
+    { id: "older", status: "completed", items: [] },
+    expected,
+  ] } }, undefined, "client-message"), expected);
+  assert.equal(findCorrelatedTurn({ thread: { turns: [expected] } }, "accepted-turn", "irrelevant"), expected);
 });
