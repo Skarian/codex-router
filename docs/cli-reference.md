@@ -6,6 +6,7 @@
 codex-router [--config PATH] agents list [--json]
 codex-router [--config PATH] doctor [--json]
 codex-router [--config PATH] send AGENT_ID --stdin [--json | --stream]
+codex-router [--config PATH] cancel AGENT_ID [--json]
 ```
 
 `--config PATH` selects a TOML file. The default is
@@ -118,8 +119,9 @@ JSON mode returns every check:
 
 ## `send`
 
-Reads one message from stdin, resumes the selected task, starts a turn, and
-waits for its final response.
+Reads one message from stdin and resumes the selected task. When the task is
+idle, the router starts a turn. When it is active, the router steers that turn.
+In both cases it waits for the resulting shared turn's final response.
 
 ```sh
 echo 'Turn off the living room light.' |
@@ -157,11 +159,40 @@ The terminal event is `completed` or `failed`.
 Input is limited to 64 KiB of UTF-8 text. Each emitted semantic message is
 limited to 256 KiB.
 
+When `send` steers an active turn, it does not replay commentary that completed
+before this invocation attached. Multiple senders steering the same turn can
+receive the same final answer.
+
+## `cancel`
+
+Requests interruption of the selected task's active turn. It does not read
+stdin, accept stream mode, or wait for the terminal interruption event.
+
+```sh
+codex-router cancel home
+codex-router cancel home --json
+```
+
+An active task returns after Codex acknowledges the request:
+
+```json
+{"type":"interrupt_requested","agent":"home","turn_id":"019..."}
+```
+
+Cancelling an idle task is a successful no-op:
+
+```json
+{"type":"already_idle","agent":"home"}
+```
+
+A disconnect before the interrupt acknowledgment is ambiguous. The router does
+not automatically repeat the interrupt request.
+
 ## Task handling
 
-The router serializes sends for each configured agent. A busy task returns
-`agent_busy` immediately. Clients can submit another send after the active turn
-finishes.
+The app-server owns turn concurrency. An idle send uses `turn/start`; an active
+send uses `turn/steer` with the exact active turn ID. The router does not queue,
+interrupt, restart, or automatically resend ordinary input.
 
 When native Codex remote control is running locally or on an agent's SSH host,
 the router connects through `codex app-server proxy` and shares that app-server.
@@ -175,7 +206,7 @@ proxy.
 JSON and stream modes use this shape:
 
 ```json
-{"type":"failed","code":"agent_busy","text":"Home Assistant is already working. Try again after the current turn finishes."}
+{"type":"failed","code":"app_server_disconnected","text":"The Codex app-server connection closed before the command completed.","ambiguous":true}
 ```
 
 An uncertain delivery also includes `"ambiguous": true`. Treat that result as
@@ -183,7 +214,6 @@ potentially accepted and inspect the task before sending the same text again.
 
 | Code | Meaning |
 | --- | --- |
-| `agent_busy` | The configured agent already has an active turn |
 | `app_server_connect_failed` | The native app-server connection failed |
 | `app_server_disconnected` | The app-server connection closed during the command |
 | `app_server_protocol_failed` | The app-server handshake or response was invalid |

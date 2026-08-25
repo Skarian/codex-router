@@ -36,3 +36,16 @@ test("invalid command usage exits 2", async () => {
     (error: unknown) => (error as { code?: number }).code === 2,
   );
 });
+
+test("cancel rejects stdin and stream modes before connecting", async () => {
+  const path = await configFile(`[[agents]]\nid = "one"\nlabel = "One"\ncwd = "/tmp"\nthread_id = "019-test"\nmodel = "gpt-test"\n`);
+  for (const flag of ["--stdin", "--stream"]) {
+    await assert.rejects(
+      execFileAsync(process.execPath, [CLI, "--config", path, "cancel", "one", flag]),
+      (error: unknown) => {
+        const failure = error as { code?: number; stderr?: string };
+        return failure.code === 2 && failure.stderr?.includes("cancel AGENT_ID [--json]") === true;
+      },
+    );
+  }
+});

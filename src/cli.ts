@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
-import { acquireAgentLock } from "./lock.js";
 import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
-import { formatAgentTable, listAgents, runDoctor, sendTurn, type SemanticMessage } from "./commands.js";
+import { cancelTurn, formatAgentTable, listAgents, runDoctor, sendTurn, type SemanticMessage } from "./commands.js";
 
 interface ParsedArgs {
   configPath: string;
@@ -19,6 +18,7 @@ function usage(): string {
     "  codex-router [--config PATH] agents list [--json]",
     "  codex-router [--config PATH] doctor [--json]",
     "  codex-router [--config PATH] send AGENT_ID --stdin [--json | --stream]",
+    "  codex-router [--config PATH] cancel AGENT_ID [--json]",
   ].join("\n");
 }
 
@@ -88,7 +88,6 @@ async function main(): Promise<void> {
     if (first === "send" && second && third === undefined && parsed.stdin) {
       const agent = findAgent(config, second);
       const text = await readStdin();
-      const lock = await acquireAgentLock(parsed.configPath, agent.id);
       const abortController = new AbortController();
       const onSignal = () => {
         process.exitCode = 1;
@@ -106,8 +105,15 @@ async function main(): Promise<void> {
       } finally {
         process.removeListener("SIGINT", onSignal);
         process.removeListener("SIGTERM", onSignal);
-        await lock.release();
       }
+      return;
+    }
+    if (first === "cancel" && second && third === undefined && !parsed.stdin && !parsed.stream) {
+      const agent = findAgent(config, second);
+      const result = await cancelTurn(agent);
+      if (parsed.json) printJson(result);
+      else if (result.type === "interrupt_requested") process.stdout.write(`Interrupt requested for ${agent.label}.\n`);
+      else process.stdout.write(`${agent.label} is already idle.\n`);
       return;
     }
     throw new RouterError("input_invalid", "Invalid command usage.");

@@ -1,5 +1,4 @@
 export type FailureCode =
-  | "agent_busy"
   | "app_server_connect_failed"
   | "app_server_disconnected"
   | "app_server_protocol_failed"

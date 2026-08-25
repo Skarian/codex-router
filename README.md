@@ -67,10 +67,16 @@ codex-router doctor
 
 echo 'What is the thermostat set to?' |
   codex-router send home --stdin
+
+codex-router cancel home
 ```
 
 Use `--json` for one final JSON object. Use `--stream` for completed reasoning,
 commentary, and final messages as JSON Lines.
+
+When the task is idle, `send` starts a turn. When it is already active, `send`
+steers that turn and waits for its shared final response. `cancel` explicitly
+requests interruption of the active turn and is a successful no-op when idle.
 
 Locally, Codex Router connects to an existing control socket when available and
 otherwise owns an app-server for the command. For SSH agents, the router always
