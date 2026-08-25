@@ -23,43 +23,89 @@ export class JsonRpcClient {
         this.closeListeners.add(listener);
         return () => this.closeListeners.delete(listener);
     }
-    async initialize() {
+    async initialize(timeoutMs = 10_000) {
         await this.request("initialize", {
             clientInfo: { name: "codex-router", title: "Codex Router", version: "0.1.0" },
             capabilities: null,
-        }, 10_000);
-        await this.notify("initialized");
+        }, timeoutMs);
+        await this.notify("initialized", undefined, timeoutMs);
     }
-    async request(method, params, timeoutMs = 15_000) {
+    async request(method, params, timeoutMs = 15_000, signal) {
         if (this.closed)
             throw this.disconnectedError();
+        if (signal?.aborted) {
+            throw new RouterError("interrupted", "The Codex request was interrupted by the caller.", { ambiguous: this.acceptedTurn });
+        }
         const id = this.nextId++;
         const response = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
+                const pending = this.pending.get(id);
+                if (!pending)
+                    return;
                 this.pending.delete(id);
+                this.clearPending(pending);
                 reject(new RouterError("timeout", `Codex app-server timed out while handling ${method}.`, { ambiguous: this.acceptedTurn }));
             }, timeoutMs);
             timer.unref();
-            this.pending.set(id, { resolve, reject, timer });
-        });
-        try {
-            await this.transport.send({ id, method, ...(params === undefined ? {} : { params }) });
-        }
-        catch (error) {
-            const pending = this.pending.get(id);
-            if (pending) {
-                clearTimeout(pending.timer);
-                this.pending.delete(id);
+            const pending = { resolve, reject, timer, ...(signal ? { signal } : {}) };
+            if (signal) {
+                pending.onAbort = () => {
+                    if (this.pending.get(id) !== pending)
+                        return;
+                    this.pending.delete(id);
+                    this.clearPending(pending);
+                    reject(new RouterError("interrupted", "The Codex request was interrupted by the caller.", { ambiguous: this.acceptedTurn }));
+                };
+                signal.addEventListener("abort", pending.onAbort, { once: true });
             }
-            throw new RouterError("app_server_disconnected", `Could not send ${method} to Codex app-server.`, {
+            this.pending.set(id, pending);
+        });
+        const failSend = (error) => {
+            const pending = this.pending.get(id);
+            if (!pending)
+                return;
+            this.pending.delete(id);
+            this.clearPending(pending);
+            pending.reject(new RouterError("app_server_disconnected", `Could not send ${method} to Codex app-server.`, {
                 ambiguous: this.acceptedTurn,
                 cause: error,
-            });
+            }));
+        };
+        try {
+            void this.transport.send({ id, method, ...(params === undefined ? {} : { params }) }).catch(failSend);
+        }
+        catch (error) {
+            failSend(error);
         }
         return response;
     }
-    async notify(method, params) {
-        await this.transport.send({ method, ...(params === undefined ? {} : { params }) });
+    async notify(method, params, timeoutMs = 15_000, signal) {
+        if (this.closed)
+            throw this.disconnectedError();
+        if (signal?.aborted) {
+            throw new RouterError("interrupted", "The Codex request was interrupted by the caller.", { ambiguous: this.acceptedTurn });
+        }
+        await new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (callback) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                callback();
+            };
+            const timer = setTimeout(() => finish(() => reject(new RouterError("timeout", `Codex app-server timed out while handling ${method}.`, { ambiguous: this.acceptedTurn }))), timeoutMs);
+            timer.unref();
+            const onAbort = () => finish(() => reject(new RouterError("interrupted", "The Codex request was interrupted by the caller.", { ambiguous: this.acceptedTurn })));
+            signal?.addEventListener("abort", onAbort, { once: true });
+            try {
+                void this.transport.send({ method, ...(params === undefined ? {} : { params }) }).then(() => finish(resolve), (error) => finish(() => reject(new RouterError("app_server_disconnected", `Could not send ${method} to Codex app-server.`, { ambiguous: this.acceptedTurn, cause: error }))));
+            }
+            catch (error) {
+                finish(() => reject(new RouterError("app_server_disconnected", `Could not send ${method} to Codex app-server.`, { ambiguous: this.acceptedTurn, cause: error })));
+            }
+        });
     }
     handleMessage(value) {
         if (value === null || typeof value !== "object" || Array.isArray(value))
@@ -69,8 +115,8 @@ export class JsonRpcClient {
             const pending = this.pending.get(message.id);
             if (!pending)
                 return;
-            clearTimeout(pending.timer);
             this.pending.delete(message.id);
+            this.clearPending(pending);
             if (message.error !== undefined) {
                 const payload = message.error;
                 const detail = typeof payload?.message === "string" ? payload.message : "Unknown app-server error.";
@@ -94,7 +140,7 @@ export class JsonRpcClient {
         for (const listener of this.closeListeners)
             listener(disconnected);
         for (const pending of this.pending.values()) {
-            clearTimeout(pending.timer);
+            this.clearPending(pending);
             pending.reject(disconnected);
         }
         this.pending.clear();
@@ -107,6 +153,11 @@ export class JsonRpcClient {
             ambiguous: this.acceptedTurn,
             cause,
         });
+    }
+    clearPending(pending) {
+        clearTimeout(pending.timer);
+        if (pending.signal && pending.onAbort)
+            pending.signal.removeEventListener("abort", pending.onAbort);
     }
 }
 //# sourceMappingURL=json-rpc.js.map

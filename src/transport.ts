@@ -203,7 +203,7 @@ export class ProxyTransport extends BaseTransport {
       createConnection: () => duplex as unknown as import("node:net").Socket,
       closeTimeout: 500,
       perMessageDeflate: false,
-      handshakeTimeout: 5_000,
+      handshakeTimeout: 15_000,
       maxPayload: 4 * 1024 * 1024,
     } as unknown as ClientOptions;
     const socket = new WebSocket("ws://localhost/rpc", websocketOptions);

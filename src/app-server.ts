@@ -8,7 +8,7 @@ import { JsonRpcClient } from "./json-rpc.js";
 import { ProxyTransport, sshProcessSpec, StdioTransport, type MessageTransport } from "./transport.js";
 
 const execFileAsync = promisify(execFile);
-const REMOTE_PROBE_TIMEOUT_MS = 10_000;
+const REMOTE_PROBE_TIMEOUT_MS = 15_000;
 const REMOTE_DAEMON_START_TIMEOUT_MS = 30_000;
 const REMOTE_COMMAND_MAX_BUFFER = 64 * 1024;
 
@@ -140,7 +140,7 @@ async function connectTransport(transport: MessageTransport): Promise<AppServerC
     } catch (error) {
       if (error instanceof RouterError && error.code === "app_server_disconnected") {
         throw new RouterError(
-          transport.kind === "stdio" ? "app_server_start_failed" : "app_server_protocol_failed",
+          transport.kind === "stdio" ? "app_server_start_failed" : "app_server_connect_failed",
           transport.kind === "stdio"
             ? "The owned Codex app-server exited before initialization completed."
             : "The Codex app-server connection closed during initialization.",

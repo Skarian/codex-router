@@ -7,8 +7,9 @@ import { connectAppServer, connectExistingProxy, connectExistingRemoteProxy, rem
 import { codexProcessSpec, sshProcessSpec } from "./transport.js";
 const execFileAsync = promisify(execFile);
 const MAX_OUTPUT_BYTES = 256 * 1024;
-const DEFAULT_TURN_TIMEOUT_MS = 30 * 60 * 1000;
-const CORRELATION_TIMEOUT_MS = 15_000;
+const EFFECT_ACK_TIMEOUT_MS = 15_000;
+const THREAD_RESUME_TIMEOUT_MS = 60_000;
+const REMOTE_COMMAND_TIMEOUT_MS = 15_000;
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000];
 const defaultTurnCommandOperations = {
     checkDirectory,
@@ -89,7 +90,7 @@ async function checkDirectory(agent) {
     if (agent.sshHost !== undefined) {
         try {
             const spec = sshProcessSpec(agent.sshHost, ["test", "-d", agent.cwd]);
-            await execFileAsync(spec.command, spec.args, { timeout: 10_000 });
+            await execFileAsync(spec.command, spec.args, { timeout: REMOTE_COMMAND_TIMEOUT_MS });
             return { name: `agent:${agent.id}:cwd`, ok: true, text: "Working directory is accessible." };
         }
         catch {
@@ -123,7 +124,7 @@ export async function runDoctor(config) {
     for (const agent of remoteAgents) {
         try {
             const spec = codexProcessSpec(["--version"], agent.sshHost);
-            const { stdout } = await execFileAsync(spec.command, spec.args, { timeout: 10_000 });
+            const { stdout } = await execFileAsync(spec.command, spec.args, { timeout: REMOTE_COMMAND_TIMEOUT_MS });
             checks.push({ name: `agent:${agent.id}:codex`, ok: true, text: stdout.trim() || "Codex executable is available." });
         }
         catch {
@@ -170,16 +171,9 @@ export async function runDoctor(config) {
     }
     return checks;
 }
-export function waitForTurn(client, threadId, turnId, emit, signal, initialNotifications = [], state = { seenItemIds: new Set(), seenSemanticUnits: new Set() }, deadlineMs = Date.now() + (Number.parseInt(process.env.CODEX_ROUTER_TURN_TIMEOUT_MS ?? "", 10) || DEFAULT_TURN_TIMEOUT_MS)) {
+export function waitForTurn(client, threadId, turnId, emit, signal, initialNotifications = [], state = { seenItemIds: new Set(), seenSemanticUnits: new Set() }) {
     return new Promise((resolve, reject) => {
-        const timeoutMs = Math.max(0, deadlineMs - Date.now());
-        const timer = setTimeout(() => {
-            unsubscribe();
-            reject(new RouterError("timeout", "The Codex turn did not finish before the router timeout.", { ambiguous: true }));
-        }, timeoutMs);
-        timer.unref();
         const finish = (callback) => {
-            clearTimeout(timer);
             unsubscribe();
             unsubscribeClose();
             signal?.removeEventListener("abort", onAbort);
@@ -282,44 +276,85 @@ function baselineTurnItems(turn, state) {
         }
     }
 }
-function correlatedNotificationTurnId(notifications, clientUserMessageId) {
-    for (let index = notifications.length - 1; index >= 0; index -= 1) {
-        const notification = notifications[index];
-        if (notification?.method !== "item/started" && notification?.method !== "item/completed")
-            continue;
-        const params = object(notification.params);
-        const item = object(params?.item);
-        if (item?.type === "userMessage" && item.clientId === clientUserMessageId && typeof params?.turnId === "string") {
-            return params.turnId;
-        }
+function validateCorrelatedTurn(turn, expectedTurnId) {
+    if (expectedTurnId !== undefined && turn.id !== expectedTurnId) {
+        throw new RouterError("app_server_protocol_failed", "Codex persisted the input on a different turn than the one the router steered.", { ambiguous: true });
     }
-    return undefined;
+    return turn;
 }
-async function correlateAdmission(client, threadId, clientUserMessageId, notifications, deadlineMs, signal) {
-    const correlationDeadline = Math.min(deadlineMs, Date.now() + CORRELATION_TIMEOUT_MS);
-    let attempt = 0;
-    while (Date.now() < correlationDeadline) {
-        const resumed = await client.request("thread/resume", { threadId });
-        const correlated = findCorrelatedTurn(resumed, undefined, clientUserMessageId);
-        if (correlated)
-            return correlated;
-        const notificationTurnId = correlatedNotificationTurnId(notifications, clientUserMessageId);
-        if (notificationTurnId !== undefined) {
-            const byNotification = findCorrelatedTurn(resumed, notificationTurnId, clientUserMessageId);
-            if (byNotification)
-                return byNotification;
+function correlatedNotificationTurn(method, rawParams, threadId, clientUserMessageId) {
+    if (method !== "item/started" && method !== "item/completed")
+        return undefined;
+    const params = object(rawParams);
+    const item = object(params?.item);
+    if (params?.threadId !== threadId
+        || item?.type !== "userMessage"
+        || item.clientId !== clientUserMessageId
+        || typeof params.turnId !== "string")
+        return undefined;
+    return { id: params.turnId, status: "inProgress", items: [item] };
+}
+function correlateAdmission(client, threadId, clientUserMessageId, notifications, signal, expectedTurnId, resumeTimeoutMs = THREAD_RESUME_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let unsubscribeNotification = () => undefined;
+        let unsubscribeClose = () => undefined;
+        const finish = (callback) => {
+            if (settled)
+                return;
+            settled = true;
+            unsubscribeNotification();
+            unsubscribeClose();
+            signal?.removeEventListener("abort", onAbort);
+            callback();
+        };
+        const accept = (turn) => {
+            try {
+                const validated = validateCorrelatedTurn(turn, expectedTurnId);
+                finish(() => resolve(validated));
+            }
+            catch (error) {
+                finish(() => reject(error));
+            }
+        };
+        const handleNotification = (method, params) => {
+            const turn = correlatedNotificationTurn(method, params, threadId, clientUserMessageId);
+            if (turn)
+                accept(turn);
+        };
+        const onAbort = () => finish(() => reject(new RouterError("interrupted", "The Codex turn was interrupted by the caller.", { ambiguous: true })));
+        unsubscribeNotification = client.onNotification(handleNotification);
+        unsubscribeClose = client.onClose((error) => finish(() => reject(error)));
+        for (const notification of notifications) {
+            handleNotification(notification.method, notification.params);
+            if (settled)
+                return;
         }
-        try {
-            await reconnectDelay(attempt, correlationDeadline, signal);
+        if (signal?.aborted) {
+            onAbort();
+            return;
         }
-        catch (error) {
-            if (error instanceof RouterError && error.code === "timeout")
-                break;
-            throw error;
-        }
-        attempt += 1;
-    }
-    throw new RouterError("app_server_disconnected", "Codex accepted the input, but the router could not identify its active turn safely.", { ambiguous: true });
+        signal?.addEventListener("abort", onAbort, { once: true });
+        void (async () => {
+            while (!settled) {
+                try {
+                    const resumed = await client.request("thread/resume", { threadId }, resumeTimeoutMs, signal);
+                    if (settled)
+                        return;
+                    const correlated = findCorrelatedTurn(resumed, undefined, clientUserMessageId);
+                    if (correlated)
+                        accept(correlated);
+                    return;
+                }
+                catch (error) {
+                    if (settled)
+                        return;
+                    if (!(error instanceof RouterError) || error.code !== "timeout")
+                        throw error;
+                }
+            }
+        })().catch((error) => finish(() => reject(error)));
+    });
 }
 export function findCorrelatedTurn(resumeResult, turnId, clientUserMessageId) {
     const thread = object(object(resumeResult)?.thread);
@@ -355,9 +390,7 @@ export function isReconnectable(error) {
     return error instanceof RouterError && [
         "app_server_connect_failed",
         "app_server_disconnected",
-        "app_server_protocol_failed",
         "app_server_start_failed",
-        "codex_unavailable",
         "timeout",
     ].includes(error.code);
 }
@@ -385,16 +418,16 @@ export async function connectRecoveryAppServer(agent, operations = {
         ? operations.connectLocalProxy()
         : operations.connectRemote(agent.sshHost);
 }
-function timeoutError() {
-    return new RouterError("timeout", "The Codex turn did not finish before the router timeout.", { ambiguous: true });
+function isRequestTimeout(error) {
+    return error instanceof RouterError && error.code === "timeout";
 }
-async function reconnectDelay(attempt, deadlineMs, signal) {
+function throwIfAborted(signal, ambiguous) {
     if (signal?.aborted)
-        throw new RouterError("interrupted", "The Codex turn was interrupted by the caller.", { ambiguous: true });
-    const remaining = deadlineMs - Date.now();
-    if (remaining <= 0)
-        throw timeoutError();
-    const delay = Math.min(RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)] ?? 5_000, remaining);
+        throw new RouterError("interrupted", "The Codex turn was interrupted by the caller.", { ambiguous });
+}
+async function reconnectDelay(attempt, signal, delaysMs = RECONNECT_DELAYS_MS) {
+    throwIfAborted(signal, true);
+    const delay = delaysMs[Math.min(attempt, delaysMs.length - 1)] ?? 5_000;
     await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
             signal?.removeEventListener("abort", onAbort);
@@ -416,30 +449,30 @@ function notificationBuffer(client) {
     });
     return { notifications, stop };
 }
-async function recoverProxyTurn(agent, turnId, clientUserMessageId, state, emit, deadlineMs, signal) {
-    const correlationDeadline = turnId === undefined ? Math.min(deadlineMs, Date.now() + CORRELATION_TIMEOUT_MS) : deadlineMs;
+async function recoverProxyTurn(agent, turnId, clientUserMessageId, state, emit, signal, expectedCorrelatedTurnId, recoveryOperations, reconnectDelaysMs) {
     let attempt = 0;
     let lastError;
-    while (Date.now() < deadlineMs) {
-        await reconnectDelay(attempt, deadlineMs, signal);
+    while (true) {
+        await reconnectDelay(attempt, signal, reconnectDelaysMs);
         let connection;
+        let buffered;
         let phase = "connect";
         try {
-            connection = await connectRecoveryAppServer(agent);
+            connection = await connectRecoveryAppServer(agent, recoveryOperations);
             connection.client.markTurnAccepted();
-            const buffered = notificationBuffer(connection.client);
+            buffered = notificationBuffer(connection.client);
             phase = "resume";
-            const resumed = await connection.client.request("thread/resume", { threadId: agent.threadId });
-            const turn = findCorrelatedTurn(resumed, turnId, clientUserMessageId);
-            if (!turn) {
-                buffered.stop();
-                if (Date.now() >= correlationDeadline) {
-                    throw new RouterError("app_server_disconnected", "The SSH connection was restored, but the accepted turn could not be identified safely.", { ambiguous: true, cause: lastError });
+            let turn;
+            if (turnId === undefined) {
+                turn = await correlateAdmission(connection.client, agent.threadId, clientUserMessageId, buffered.notifications, signal, expectedCorrelatedTurnId, THREAD_RESUME_TIMEOUT_MS);
+            }
+            else {
+                const resumed = await connection.client.request("thread/resume", { threadId: agent.threadId }, THREAD_RESUME_TIMEOUT_MS, signal);
+                const correlated = findCorrelatedTurn(resumed, turnId, clientUserMessageId);
+                if (!correlated) {
+                    throw new RouterError("app_server_protocol_failed", "The SSH connection was restored, but the accepted Codex turn was absent.", { ambiguous: true, cause: lastError });
                 }
-                await connection.close().catch(() => undefined);
-                connection = undefined;
-                attempt += 1;
-                continue;
+                turn = correlated;
             }
             turnId = acceptedTurnId(turn, "thread/resume");
             if (turn.status !== "inProgress")
@@ -449,7 +482,7 @@ async function recoverProxyTurn(agent, turnId, clientUserMessageId, state, emit,
                 buffered.stop();
                 return completed;
             }
-            const observation = waitForTurn(connection.client, agent.threadId, turnId, emit, signal, buffered.notifications, state, deadlineMs);
+            const observation = waitForTurn(connection.client, agent.threadId, turnId, emit, signal, buffered.notifications, state);
             buffered.stop();
             phase = "observe";
             try {
@@ -470,20 +503,20 @@ async function recoverProxyTurn(agent, turnId, clientUserMessageId, state, emit,
             lastError = error;
         }
         finally {
+            buffered?.stop();
             await connection?.close().catch(() => undefined);
         }
         attempt += 1;
     }
-    throw timeoutError();
 }
-async function observeAcceptedTurn(connection, agent, turn, clientUserMessageId, buffered, state, emit, deadlineMs, signal) {
+async function observeAcceptedTurn(connection, agent, turn, clientUserMessageId, buffered, state, emit, signal, recoveryOperations, reconnectDelaysMs) {
     const turnId = acceptedTurnId(turn, "thread/resume");
     if (turn.status !== "inProgress")
         applyTurnItems(turn, state, emit);
     const completed = terminalResult(turn, state);
     if (completed)
         return completed;
-    const resultPromise = waitForTurn(connection.client, agent.threadId, turnId, emit, signal, buffered.notifications, state, deadlineMs);
+    const resultPromise = waitForTurn(connection.client, agent.threadId, turnId, emit, signal, buffered.notifications, state);
     buffered.stop();
     try {
         return await resultPromise;
@@ -491,30 +524,35 @@ async function observeAcceptedTurn(connection, agent, turn, clientUserMessageId,
     catch (error) {
         if (connection.transportKind === "proxy" && isDisconnect(error)) {
             await connection.close().catch(() => undefined);
-            return recoverProxyTurn(agent, turnId, clientUserMessageId, state, emit, deadlineMs, signal);
+            return recoverProxyTurn(agent, turnId, clientUserMessageId, state, emit, signal, undefined, recoveryOperations, reconnectDelaysMs);
         }
         throw error;
     }
 }
 export async function sendTurn(agent, text, emit, signal, operations = defaultTurnCommandOperations) {
+    throwIfAborted(signal, false);
     const directory = await operations.checkDirectory(agent);
     if (!directory.ok)
         throw new RouterError("working_directory_invalid", `${agent.label}'s working directory is unavailable.`);
+    throwIfAborted(signal, false);
     const connection = await operations.connect(agent);
-    const timeoutMs = Number.parseInt(process.env.CODEX_ROUTER_TURN_TIMEOUT_MS ?? "", 10) || DEFAULT_TURN_TIMEOUT_MS;
-    const deadlineMs = Date.now() + timeoutMs;
+    const effectAckTimeoutMs = operations.effectAckTimeoutMs ?? EFFECT_ACK_TIMEOUT_MS;
+    const threadResumeTimeoutMs = operations.threadResumeTimeoutMs ?? THREAD_RESUME_TIMEOUT_MS;
     const clientUserMessageId = operations.clientUserMessageId();
     const state = { seenItemIds: new Set(), seenSemanticUnits: new Set() };
     const buffered = notificationBuffer(connection.client);
     try {
         let resumeResult;
         try {
-            resumeResult = await connection.client.request("thread/resume", { threadId: agent.threadId });
+            resumeResult = await connection.client.request("thread/resume", { threadId: agent.threadId }, threadResumeTimeoutMs, signal);
         }
         catch (error) {
+            if (error instanceof RouterError && error.code === "interrupted")
+                throw error;
             throw new RouterError("thread_unavailable", `${agent.label}'s Codex task could not be resumed.`, { cause: error });
         }
         const resumed = resumedThreadState(resumeResult);
+        throwIfAborted(signal, false);
         connection.client.markTurnAccepted();
         let turn;
         if (resumed.activeTurn) {
@@ -527,14 +565,33 @@ export async function sendTurn(agent, text, emit, signal, operations = defaultTu
                     input: [{ type: "text", text, text_elements: [] }],
                     clientUserMessageId,
                     expectedTurnId,
-                });
+                }, effectAckTimeoutMs, signal);
             }
             catch (error) {
                 if (connection.transportKind === "proxy" && isDisconnect(error)) {
                     await connection.close().catch(() => undefined);
                     return {
-                        result: await recoverProxyTurn(agent, undefined, clientUserMessageId, state, emit, deadlineMs, signal),
+                        result: await recoverProxyTurn(agent, undefined, clientUserMessageId, state, emit, signal, expectedTurnId, operations.recovery, operations.reconnectDelaysMs),
                         transportKind: "proxy",
+                    };
+                }
+                if (isRequestTimeout(error)) {
+                    try {
+                        turn = await correlateAdmission(connection.client, agent.threadId, clientUserMessageId, buffered.notifications, signal, expectedTurnId, threadResumeTimeoutMs);
+                    }
+                    catch (correlationError) {
+                        if (connection.transportKind === "proxy" && isDisconnect(correlationError)) {
+                            await connection.close().catch(() => undefined);
+                            return {
+                                result: await recoverProxyTurn(agent, undefined, clientUserMessageId, state, emit, signal, expectedTurnId, operations.recovery, operations.reconnectDelaysMs),
+                                transportKind: "proxy",
+                            };
+                        }
+                        throw correlationError;
+                    }
+                    return {
+                        result: await observeAcceptedTurn(connection, agent, turn, clientUserMessageId, buffered, state, emit, signal, operations.recovery, operations.reconnectDelaysMs),
+                        transportKind: connection.transportKind,
                     };
                 }
                 throw error;
@@ -544,24 +601,30 @@ export async function sendTurn(agent, text, emit, signal, operations = defaultTu
         }
         else {
             try {
-                await connection.client.request("turn/start", {
-                    threadId: agent.threadId,
-                    input: [{ type: "text", text, text_elements: [] }],
-                    clientUserMessageId,
-                    cwd: agent.cwd,
-                    approvalPolicy: "never",
-                    sandboxPolicy: { type: "dangerFullAccess" },
-                    model: agent.model,
-                    ...(agent.reasoning === undefined ? {} : { effort: agent.reasoning }),
-                    summary: "auto",
-                });
-                turn = await correlateAdmission(connection.client, agent.threadId, clientUserMessageId, buffered.notifications, deadlineMs, signal);
+                try {
+                    await connection.client.request("turn/start", {
+                        threadId: agent.threadId,
+                        input: [{ type: "text", text, text_elements: [] }],
+                        clientUserMessageId,
+                        cwd: agent.cwd,
+                        approvalPolicy: "never",
+                        sandboxPolicy: { type: "dangerFullAccess" },
+                        model: agent.model,
+                        ...(agent.reasoning === undefined ? {} : { effort: agent.reasoning }),
+                        summary: "auto",
+                    }, effectAckTimeoutMs, signal);
+                }
+                catch (error) {
+                    if (!isRequestTimeout(error))
+                        throw error;
+                }
+                turn = await correlateAdmission(connection.client, agent.threadId, clientUserMessageId, buffered.notifications, signal, undefined, threadResumeTimeoutMs);
             }
             catch (error) {
                 if (connection.transportKind === "proxy" && isDisconnect(error)) {
                     await connection.close().catch(() => undefined);
                     return {
-                        result: await recoverProxyTurn(agent, undefined, clientUserMessageId, state, emit, deadlineMs, signal),
+                        result: await recoverProxyTurn(agent, undefined, clientUserMessageId, state, emit, signal, undefined, operations.recovery, operations.reconnectDelaysMs),
                         transportKind: "proxy",
                     };
                 }
@@ -569,7 +632,7 @@ export async function sendTurn(agent, text, emit, signal, operations = defaultTu
             }
         }
         return {
-            result: await observeAcceptedTurn(connection, agent, turn, clientUserMessageId, buffered, state, emit, deadlineMs, signal),
+            result: await observeAcceptedTurn(connection, agent, turn, clientUserMessageId, buffered, state, emit, signal, operations.recovery, operations.reconnectDelaysMs),
             transportKind: connection.transportKind,
         };
     }
@@ -578,12 +641,12 @@ export async function sendTurn(agent, text, emit, signal, operations = defaultTu
         await connection.close().catch(() => undefined);
     }
 }
-export async function cancelTurn(agent, connect = defaultTurnCommandOperations.connect) {
+export async function cancelTurn(agent, connect = defaultTurnCommandOperations.connect, effectAckTimeoutMs = EFFECT_ACK_TIMEOUT_MS) {
     const connection = await connect(agent);
     try {
         let resumeResult;
         try {
-            resumeResult = await connection.client.request("thread/resume", { threadId: agent.threadId });
+            resumeResult = await connection.client.request("thread/resume", { threadId: agent.threadId }, THREAD_RESUME_TIMEOUT_MS);
         }
         catch (error) {
             throw new RouterError("thread_unavailable", `${agent.label}'s Codex task could not be resumed.`, { cause: error });
@@ -593,7 +656,7 @@ export async function cancelTurn(agent, connect = defaultTurnCommandOperations.c
             return { type: "already_idle", agent: agent.id };
         const turnId = acceptedTurnId(resumed.activeTurn, "thread/resume");
         connection.client.markTurnAccepted();
-        const result = await connection.client.request("turn/interrupt", { threadId: agent.threadId, turnId });
+        const result = await connection.client.request("turn/interrupt", { threadId: agent.threadId, turnId }, effectAckTimeoutMs);
         const response = object(result);
         if (!response || Object.keys(response).length !== 0) {
             throw new RouterError("app_server_protocol_failed", "Codex app-server returned an invalid turn/interrupt response.", { ambiguous: true });

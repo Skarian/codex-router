@@ -86,7 +86,9 @@ does not install or update Codex, enable remote control, or stop the daemon.
 
 SSH proxy connections use protocol keepalives. If a proxy connection drops
 during a turn, the router reconnects to the same running app-server, resumes
-the task, and continues waiting for that exact turn.
+the task, and continues waiting for that exact turn. The router does not impose
+a maximum turn duration; it waits and reconnects until Codex finishes or the
+caller interrupts the command.
 
 See [CLI reference](docs/cli-reference.md) for commands, output shapes, exit
 codes, and failure codes.

@@ -59,9 +59,14 @@ curl -fsSL https://chatgpt.com/codex/install.sh | sh
 ```
 The router adds encrypted SSH keepalives (`ServerAliveInterval=15` and
 `ServerAliveCountMax=4`). If an SSH proxy disconnects after a turn is accepted,
-the router reconnects within the original turn timeout, resumes the task, and
-correlates the same turn before continuing. It never blindly submits the input
-again.
+the router keeps reconnecting, resumes the task, and correlates the same turn
+before continuing. It waits until Codex finishes or the caller interrupts the
+command, and it never blindly submits the input again.
+
+The router has no turn-duration or inactivity timeout. Short connection,
+handshake, and control-request timeouts only detect a stuck attempt. Read-only
+operations may retry; a timed-out `turn/start` or `turn/steer` acknowledgment is
+correlated by its client message ID without resending the input.
 
 ## `agents list`
 
@@ -224,7 +229,7 @@ potentially accepted and inspect the task before sending the same text again.
 | `interrupted` | The caller interrupted the turn |
 | `output_too_large` | A semantic message exceeded 256 KiB |
 | `thread_unavailable` | The configured task could not be resumed |
-| `timeout` | The turn exceeded the router timeout |
+| `timeout` | A connection, handshake, or control request did not acknowledge in time |
 | `turn_failed` | Codex ended the turn without a final response |
 | `unknown_agent` | The requested agent ID is absent from the configuration |
 | `working_directory_invalid` | The configured working directory is unavailable |

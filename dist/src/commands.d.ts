@@ -35,6 +35,10 @@ export interface TurnCommandOperations {
     checkDirectory(agent: AgentConfig): Promise<DoctorCheck>;
     connect(agent: AgentConfig): Promise<AppServerConnection>;
     clientUserMessageId(): string;
+    effectAckTimeoutMs?: number;
+    threadResumeTimeoutMs?: number;
+    recovery?: RecoveryConnectionOperations;
+    reconnectDelaysMs?: readonly number[];
 }
 export interface RemoteDoctorOperations {
     probe(): Promise<"absent" | "socket">;
@@ -49,7 +53,7 @@ export declare function listAgents(config: RouterConfig): Array<{
 export declare function formatAgentTable(config: RouterConfig): string;
 export declare function inspectRemoteAppServer(agent: AgentConfig, operations: RemoteDoctorOperations): Promise<DoctorCheck[]>;
 export declare function runDoctor(config: RouterConfig): Promise<DoctorCheck[]>;
-export declare function waitForTurn(client: JsonRpcClient, threadId: string, turnId: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal, initialNotifications?: ReadonlyArray<Notification>, state?: TurnState, deadlineMs?: number): Promise<SemanticMessage>;
+export declare function waitForTurn(client: JsonRpcClient, threadId: string, turnId: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal, initialNotifications?: ReadonlyArray<Notification>, state?: TurnState): Promise<SemanticMessage>;
 export declare function findCorrelatedTurn(resumeResult: unknown, turnId: string | undefined, clientUserMessageId: string): Record<string, unknown> | undefined;
 export declare function isReconnectable(error: unknown): boolean;
 export declare function acceptedTurnId(result: unknown, operation: "turn/start" | "thread/resume"): string;
@@ -63,5 +67,5 @@ export declare function sendTurn(agent: AgentConfig, text: string, emit: (messag
     result: SemanticMessage;
     transportKind: "proxy" | "stdio";
 }>;
-export declare function cancelTurn(agent: AgentConfig, connect?: (agent: AgentConfig) => Promise<AppServerConnection>): Promise<CancelResult>;
+export declare function cancelTurn(agent: AgentConfig, connect?: (agent: AgentConfig) => Promise<AppServerConnection>, effectAckTimeoutMs?: number): Promise<CancelResult>;
 export {};

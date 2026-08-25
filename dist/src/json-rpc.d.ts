@@ -14,11 +14,12 @@ export declare class JsonRpcClient {
     markTurnAccepted(): void;
     onNotification(listener: NotificationListener): () => void;
     onClose(listener: ClientCloseListener): () => void;
-    initialize(): Promise<void>;
-    request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>;
-    notify(method: string, params?: unknown): Promise<void>;
+    initialize(timeoutMs?: number): Promise<void>;
+    request(method: string, params?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<unknown>;
+    notify(method: string, params?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<void>;
     private handleMessage;
     private handleClose;
     private disconnectedError;
+    private clearPending;
 }
 export {};
