@@ -4,7 +4,14 @@ import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { AgentConfig, RouterConfig } from "./config.js";
 import { RouterError } from "./errors.js";
-import { connectAppServer, type AppServerConnection } from "./app-server.js";
+import {
+  connectAppServer,
+  connectExistingProxy,
+  connectExistingRemoteProxy,
+  remoteControlSocketState,
+  remoteDaemonAvailable,
+  type AppServerConnection,
+} from "./app-server.js";
 import type { JsonRpcClient } from "./json-rpc.js";
 import { codexProcessSpec, sshProcessSpec } from "./transport.js";
 
@@ -36,6 +43,12 @@ export interface DoctorCheck {
   text: string;
 }
 
+export interface RemoteDoctorOperations {
+  probe(): Promise<"absent" | "socket">;
+  daemonAvailable(): Promise<boolean>;
+  connectProxy(): Promise<AppServerConnection>;
+}
+
 function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -57,6 +70,42 @@ export function formatAgentTable(config: RouterConfig): string {
   const rows = [["ID", "LABEL"], ...config.agents.map(({ id, label }) => [id, label])];
   const width = Math.max(...rows.map(([id]) => id?.length ?? 0));
   return rows.map(([id, label]) => `${id?.padEnd(width)}  ${label}`).join("\n");
+}
+
+export async function inspectRemoteAppServer(agent: AgentConfig, operations: RemoteDoctorOperations): Promise<DoctorCheck[]> {
+  const state = await operations.probe();
+  if (state === "absent") {
+    const daemonAvailable = await operations.daemonAvailable();
+    return [
+      {
+        name: `agent:${agent.id}:app-server`,
+        ok: daemonAvailable,
+        text: daemonAvailable
+          ? "Persistent app-server is not running; the first send will start it."
+          : "Persistent app-server is not running, and this Codex installation does not support durable daemon startup.",
+      },
+      { name: `agent:${agent.id}:thread`, ok: false, text: "Task was not checked." },
+    ];
+  }
+
+  let connection: AppServerConnection | undefined;
+  try {
+    connection = await operations.connectProxy();
+    const checks: DoctorCheck[] = [{
+      name: `agent:${agent.id}:app-server`,
+      ok: true,
+      text: "Persistent app-server initialized over SSH proxy.",
+    }];
+    try {
+      await connection.client.request("thread/read", { threadId: agent.threadId, includeTurns: false });
+      checks.push({ name: `agent:${agent.id}:thread`, ok: true, text: "Task exists." });
+    } catch {
+      checks.push({ name: `agent:${agent.id}:thread`, ok: false, text: "Task is unavailable." });
+    }
+    return checks;
+  } finally {
+    await connection?.close().catch(() => undefined);
+  }
 }
 
 async function checkDirectory(agent: AgentConfig): Promise<DoctorCheck> {
@@ -127,25 +176,15 @@ export async function runDoctor(config: RouterConfig): Promise<DoctorCheck[]> {
   }
 
   for (const agent of remoteAgents) {
-    let remoteConnection: Awaited<ReturnType<typeof connectAppServer>> | undefined;
     try {
-      remoteConnection = await connectAppServer(agent.sshHost);
-      checks.push({
-        name: `agent:${agent.id}:app-server`,
-        ok: true,
-        text: `App-server initialized over SSH ${remoteConnection.transportKind}.`,
-      });
-      try {
-        await remoteConnection.client.request("thread/read", { threadId: agent.threadId, includeTurns: false });
-        checks.push({ name: `agent:${agent.id}:thread`, ok: true, text: "Task exists." });
-      } catch {
-        checks.push({ name: `agent:${agent.id}:thread`, ok: false, text: "Task is unavailable." });
-      }
+      checks.push(...await inspectRemoteAppServer(agent, {
+        probe: () => remoteControlSocketState(agent.sshHost!),
+        daemonAvailable: () => remoteDaemonAvailable(agent.sshHost!),
+        connectProxy: () => connectExistingRemoteProxy(agent.sshHost!),
+      }));
     } catch {
       checks.push({ name: `agent:${agent.id}:app-server`, ok: false, text: "App-server is unavailable over SSH." });
       checks.push({ name: `agent:${agent.id}:thread`, ok: false, text: "Task was not checked." });
-    } finally {
-      await remoteConnection?.close().catch(() => undefined);
     }
   }
   return checks;
@@ -272,14 +311,42 @@ function isDisconnect(error: unknown): error is RouterError {
   return error instanceof RouterError && error.code === "app_server_disconnected";
 }
 
-function isReconnectable(error: unknown): boolean {
+export function isReconnectable(error: unknown): boolean {
   return error instanceof RouterError && [
     "app_server_connect_failed",
     "app_server_disconnected",
     "app_server_protocol_failed",
+    "app_server_start_failed",
     "codex_unavailable",
     "timeout",
   ].includes(error.code);
+}
+
+export function acceptedTurnId(result: unknown, operation: "turn/start" | "thread/resume"): string {
+  const turn = operation === "turn/start"
+    ? object(object(result)?.turn)
+    : object(result);
+  if (typeof turn?.id !== "string" || turn.id.length === 0) {
+    throw new RouterError("app_server_protocol_failed", `Codex app-server returned an invalid ${operation} turn.`, { ambiguous: true });
+  }
+  return turn.id;
+}
+
+export interface RecoveryConnectionOperations {
+  connectLocalProxy(): Promise<AppServerConnection>;
+  connectRemote(sshHost: string): Promise<AppServerConnection>;
+}
+
+export async function connectRecoveryAppServer(
+  agent: AgentConfig,
+  operations: RecoveryConnectionOperations = {
+    connectLocalProxy: () => connectExistingProxy(),
+    connectRemote: (sshHost) => connectAppServer(sshHost),
+  },
+): Promise<AppServerConnection> {
+  return agent.sshHost === undefined
+    ? operations.connectLocalProxy()
+    : operations.connectRemote(agent.sshHost);
 }
 
 function timeoutError(): RouterError {
@@ -330,7 +397,7 @@ async function recoverProxyTurn(
     let connection: AppServerConnection | undefined;
     let phase: "connect" | "resume" | "observe" = "connect";
     try {
-      connection = await connectAppServer(agent.sshHost, "proxy");
+      connection = await connectRecoveryAppServer(agent);
       connection.client.markTurnAccepted();
       const buffered = notificationBuffer(connection.client);
       phase = "resume";
@@ -346,8 +413,7 @@ async function recoverProxyTurn(
         attempt += 1;
         continue;
       }
-      if (typeof turn.id !== "string") throw new RouterError("app_server_protocol_failed", "Codex app-server returned an invalid resumed turn.");
-      turnId = turn.id;
+      turnId = acceptedTurnId(turn, "thread/resume");
       applyTurnItems(turn, state, emit);
       const completed = terminalResult(turn, state);
       if (completed) {
@@ -426,18 +492,15 @@ export async function sendTurn(
       }
       throw error;
     }
-    const turn = object(object(started)?.turn);
-    if (typeof turn?.id !== "string") {
-      throw new RouterError("app_server_protocol_failed", "Codex app-server returned an invalid turn/start response.");
-    }
-    const resultPromise = waitForTurn(connection.client, agent.threadId, turn.id, emit, signal, buffered.notifications, state, deadlineMs);
+    const turnId = acceptedTurnId(started, "turn/start");
+    const resultPromise = waitForTurn(connection.client, agent.threadId, turnId, emit, signal, buffered.notifications, state, deadlineMs);
     buffered.stop();
     try {
       return { result: await resultPromise, transportKind: connection.transportKind };
     } catch (error) {
       if (connection.transportKind === "proxy" && isDisconnect(error)) {
         await connection.close().catch(() => undefined);
-        return { result: await recoverProxyTurn(agent, turn.id, clientUserMessageId, state, emit, deadlineMs, signal), transportKind: "proxy" };
+        return { result: await recoverProxyTurn(agent, turnId, clientUserMessageId, state, emit, deadlineMs, signal), transportKind: "proxy" };
       }
       throw error;
     }

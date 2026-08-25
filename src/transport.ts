@@ -148,12 +148,8 @@ export class StdioTransport extends BaseTransport {
   private child?: ChildProcessWithoutNullStreams;
   private closing = false;
 
-  constructor(private readonly sshHost?: string) {
-    super();
-  }
-
   async start(): Promise<void> {
-    const child = spawnCodex(["app-server", "--listen", "stdio://"], this.sshHost);
+    const child = spawnCodex(["app-server", "--listen", "stdio://"]);
     this.child = child;
     await waitForSpawn(child, "app_server_start_failed");
     const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -165,7 +161,7 @@ export class StdioTransport extends BaseTransport {
       }
     });
     child.once("exit", (code, signal) => {
-      if (!this.closing) this.emitClose(processExitError("Owned app-server", child, code, signal, this.sshHost));
+      if (!this.closing) this.emitClose(processExitError("Owned app-server", child, code, signal));
     });
   }
 

@@ -36,18 +36,31 @@ reasoning = "medium"
 Agent IDs are lowercase slugs that begin with a letter. IDs and labels are
 unique within the file. Agents appear in file order.
 
-When `ssh_host` is present, the router checks the remote Codex control socket.
-It connects with `ssh -T HOST codex app-server proxy` when native remote control
-is running; otherwise it starts
-`ssh -T HOST codex app-server --listen stdio://`. All other agent fields remain
-in this local configuration; `cwd` and `thread_id` identify resources on the
-remote machine. SSH credentials and connection options come from OpenSSH.
+When `ssh_host` is present, the router always uses a persistent remote
+app-server. It connects with `ssh -T HOST codex app-server proxy` when the
+control socket is running. When it is absent, the first send runs
+`ssh -T HOST codex app-server daemon start`, waits for the control socket, and
+then connects through the proxy. All other agent fields remain in this local
+configuration; `cwd` and `thread_id` identify resources on the remote machine.
+SSH credentials and connection options come from OpenSSH.
+
+Durable daemon startup requires Codex installed through the official standalone
+installer. Package-manager-only installations that previously worked through
+remote stdio now fail before a turn is sent. The router never installs or
+updates Codex, bootstraps an updater, enables remote control, restarts an
+existing app-server, or stops the daemon it starts. Plain daemon startup does
+not make the host available from signed-in mobile devices.
+
+Install or update standalone Codex manually on an SSH target with:
+
+```sh
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+```
 The router adds encrypted SSH keepalives (`ServerAliveInterval=15` and
 `ServerAliveCountMax=4`). If an SSH proxy disconnects after a turn is accepted,
 the router reconnects within the original turn timeout, resumes the task, and
 correlates the same turn before continuing. It never blindly submits the input
-again. This recovery is limited to proxy mode; an SSH disconnect can terminate
-the fallback command-owned stdio app-server.
+again.
 
 ## `agents list`
 
@@ -79,7 +92,9 @@ Checks the configuration, Codex executable, configured directories, app-server
 connection, and task IDs.
 
 For remote agents, the Codex, directory, app-server, and task checks run through
-SSH.
+SSH. Doctor is read-only: when the persistent app-server is absent, it reports
+whether durable startup is available and does not start the daemon. In that
+case the task is not checked; the first `send` performs startup.
 
 ```sh
 codex-router doctor
@@ -150,8 +165,10 @@ finishes.
 
 When native Codex remote control is running locally or on an agent's SSH host,
 the router connects through `codex app-server proxy` and shares that app-server.
-When the relevant control socket is absent, it starts
-`codex app-server --listen stdio://` for the command.
+When the local control socket is absent, it owns
+`codex app-server --listen stdio://` for the command. SSH agents never use
+remote stdio; they start or reuse the persistent Codex daemon and connect by
+proxy.
 
 ## Failures
 
@@ -170,7 +187,7 @@ potentially accepted and inspect the task before sending the same text again.
 | `app_server_connect_failed` | The native app-server connection failed |
 | `app_server_disconnected` | The app-server connection closed during the command |
 | `app_server_protocol_failed` | The app-server handshake or response was invalid |
-| `app_server_start_failed` | The command-owned app-server failed to start |
+| `app_server_start_failed` | The local owned app-server or persistent remote daemon failed to start |
 | `codex_unavailable` | Codex or its configured home directory is unavailable |
 | `config_invalid` | The TOML file or one of its agent entries is invalid |
 | `input_invalid` | The command arguments or stdin input are invalid |

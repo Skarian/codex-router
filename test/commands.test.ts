@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { findCorrelatedTurn, waitForTurn, type SemanticMessage } from "../src/commands.js";
+import {
+  acceptedTurnId,
+  connectRecoveryAppServer,
+  findCorrelatedTurn,
+  inspectRemoteAppServer,
+  isReconnectable,
+  waitForTurn,
+  type SemanticMessage,
+} from "../src/commands.js";
+import type { AppServerConnection } from "../src/app-server.js";
+import type { AgentConfig } from "../src/config.js";
+import { RouterError, failedMessage } from "../src/errors.js";
 import { JsonRpcClient } from "../src/json-rpc.js";
 import type { MessageTransport, TransportKind } from "../src/transport.js";
 
@@ -17,6 +28,69 @@ class EventTransport implements MessageTransport {
   onClose(): () => void { return () => undefined; }
   receive(method: string, params: unknown): void { this.messageListener?.({ method, params }); }
 }
+
+const REMOTE_AGENT: AgentConfig = {
+  id: "remote",
+  label: "Remote",
+  sshHost: "server",
+  cwd: "/work",
+  threadId: "thread",
+  model: "model",
+};
+
+const LOCAL_AGENT: AgentConfig = {
+  id: "local",
+  label: "Local",
+  cwd: "/work",
+  threadId: "thread",
+  model: "model",
+};
+
+function proxyConnection(): AppServerConnection {
+  return { client: {} as JsonRpcClient, transportKind: "proxy", close: async () => undefined };
+}
+
+test("accepted turn responses preserve ambiguity when the turn id is invalid", () => {
+  for (const [result, operation] of [
+    [{ turn: {} }, "turn/start"],
+    [{ id: "", status: "inProgress" }, "thread/resume"],
+  ] as const) {
+    assert.throws(
+      () => acceptedTurnId(result, operation),
+      (error: unknown) => error instanceof RouterError
+        && error.code === "app_server_protocol_failed"
+        && failedMessage(error).ambiguous === true,
+    );
+  }
+});
+
+test("daemon start failures remain reconnectable after turn acceptance", () => {
+  assert.equal(isReconnectable(new RouterError("app_server_start_failed", "not ready")), true);
+});
+
+test("recovery keeps local agents on proxy and uses daemon-aware connection for SSH", async () => {
+  const calls: string[] = [];
+  const operations = {
+    connectLocalProxy: async () => { calls.push("local-proxy"); return proxyConnection(); },
+    connectRemote: async (sshHost: string) => { calls.push(`remote:${sshHost}`); return proxyConnection(); },
+  };
+  await connectRecoveryAppServer(LOCAL_AGENT, operations);
+  await connectRecoveryAppServer(REMOTE_AGENT, operations);
+  assert.deepEqual(calls, ["local-proxy", "remote:server"]);
+});
+
+test("remote doctor reports startup readiness without starting or connecting", async () => {
+  const calls: string[] = [];
+  const checks = await inspectRemoteAppServer(REMOTE_AGENT, {
+    probe: async () => { calls.push("probe"); return "absent"; },
+    daemonAvailable: async () => { calls.push("capability"); return true; },
+    connectProxy: async () => { calls.push("connect"); throw new Error("must not connect"); },
+  });
+  assert.deepEqual(calls, ["probe", "capability"]);
+  assert.equal(checks[0]?.ok, true);
+  assert.match(checks[0]?.text ?? "", /first send will start it/);
+  assert.deepEqual(checks[1], { name: "agent:remote:thread", ok: false, text: "Task was not checked." });
+});
 
 test("waitForTurn emits only completed semantic units and the terminal final answer", async () => {
   const transport = new EventTransport();

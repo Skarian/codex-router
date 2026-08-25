@@ -18,12 +18,12 @@ test("local Codex commands spawn Codex directly", () => {
 });
 
 test("remote Codex commands are wrapped with SSH", () => {
-  assert.deepEqual(codexProcessSpec(["app-server", "--listen", "stdio://"], "doordash.exe.xyz"), {
+  assert.deepEqual(codexProcessSpec(["--version"], "doordash.exe.xyz"), {
     command: "ssh",
     args: [
       ...SSH_OPTIONS,
       "doordash.exe.xyz",
-      "'codex' 'app-server' '--listen' 'stdio://'",
+      "'codex' '--version'",
     ],
   });
 });
