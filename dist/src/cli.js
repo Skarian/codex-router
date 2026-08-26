@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
+import { runDoctor } from "./doctor.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
-import { cancelTurn, formatAgentTable, listAgents, runDoctor, sendTurn } from "./commands.js";
+import { cancelTurn, sendTurn } from "./turn-session.js";
 let stdoutClosed = false;
 let activeAbortController;
 function handleStdoutError(error) {
@@ -63,6 +64,14 @@ function writeStdout(text) {
     catch (error) {
         handleStdoutError(error);
     }
+}
+function listAgents(config) {
+    return config.agents.map(({ id, label }) => ({ id, label }));
+}
+function formatAgentTable(config) {
+    const rows = [["ID", "LABEL"], ...config.agents.map(({ id, label }) => [id, label])];
+    const width = Math.max(...rows.map(([id]) => id?.length ?? 0));
+    return rows.map(([id, label]) => `${id?.padEnd(width)}  ${label}`).join("\n");
 }
 async function readStdin() {
     process.stdin.setEncoding("utf8");

@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
+import type { RouterConfig } from "./config.js";
+import { runDoctor } from "./doctor.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
-import { cancelTurn, formatAgentTable, listAgents, runDoctor, sendTurn, type SemanticMessage } from "./commands.js";
+import { cancelTurn, sendTurn } from "./turn-session.js";
+import type { SemanticMessage } from "./turn-state.js";
 
 interface ParsedArgs {
   configPath: string;
@@ -67,6 +70,16 @@ function writeStdout(text: string): void {
   } catch (error) {
     handleStdoutError(error as NodeJS.ErrnoException);
   }
+}
+
+function listAgents(config: RouterConfig): Array<{ id: string; label: string }> {
+  return config.agents.map(({ id, label }) => ({ id, label }));
+}
+
+function formatAgentTable(config: RouterConfig): string {
+  const rows = [["ID", "LABEL"], ...config.agents.map(({ id, label }) => [id, label])];
+  const width = Math.max(...rows.map(([id]) => id?.length ?? 0));
+  return rows.map(([id, label]) => `${id?.padEnd(width)}  ${label}`).join("\n");
 }
 
 async function readStdin(): Promise<string> {
