@@ -84,6 +84,14 @@ export async function checkAgentDirectory(agent: AgentConfig): Promise<DoctorChe
 
 export async function runDoctor(config: RouterConfig): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [{ name: "config", ok: true, text: "Configuration is valid." }];
+  if (config.gateway) {
+    checks.push({ name: "gateway:config", ok: true, text: "Gateway routes and connector references are valid." });
+    for (const account of config.gateway.sendblue) {
+      const present = [account.apiKeyIdEnv, account.apiSecretKeyEnv, account.webhookSecretEnv].every((name) => Boolean(process.env[name]));
+      checks.push({ name: `gateway:${account.id}:environment`, ok: present,
+        text: present ? "Gateway secret variables are present. Credentials were not tested." : "One or more gateway secret variables are missing." });
+    }
+  }
   const localAgents = config.agents.filter(({ sshHost }) => sshHost === undefined);
   const remoteAgents = config.agents.filter(({ sshHost }) => sshHost !== undefined);
   if (localAgents.length > 0 || config.agents.length === 0) {

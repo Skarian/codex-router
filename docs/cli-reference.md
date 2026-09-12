@@ -7,6 +7,10 @@ codex-router [--config PATH] agents list [--json]
 codex-router [--config PATH] doctor [--json]
 codex-router [--config PATH] send AGENT_ID --stdin [--json | --stream]
 codex-router [--config PATH] cancel AGENT_ID [--json]
+codex-router [--config PATH] gateway
+codex-router [--config PATH] gateway status [--json]
+codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID failed [--json]
+codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE [--json]
 ```
 
 `--config PATH` selects a TOML file. The default is
@@ -34,7 +38,7 @@ reasoning = "medium"
 | `reasoning` | no | Reasoning effort override; omission uses the model default |
 | `ssh_host` | no | OpenSSH host or alias on which Codex runs |
 
-Agent IDs are lowercase slugs that begin with a letter. IDs and labels are
+Agent IDs are lowercase slugs that begin with a letter. IDs, labels, and task IDs are
 unique within the file. Agents appear in file order.
 
 When `ssh_host` is present, the router always uses a persistent remote
@@ -209,6 +213,78 @@ proxy.
 If a local control socket exists but cannot be connected, the router falls back
 once to owned stdio. It does not delete the socket or start a local daemon.
 
+## Gateway commands
+
+See [Gateway setup and recovery](gateway.md) for the ordinary message flow and deployment steps.
+
+`gateway` runs in the foreground. It does not accept `--json`, `--stream`, or `--stdin`.
+Secret values are read at gateway startup. Other commands validate the gateway tables without requiring credentials.
+Doctor reports whether secret variables are present, without contacting Sendblue or printing their values.
+
+`gateway status` and `gateway resolve` require the gateway to be stopped. Both commands acquire the state lock.
+They fail with `gateway_running` while another process owns it.
+
+Status JSON contains one `unresolved` array. Each entry contains `routeId`, `effectId`, and `kind`.
+The `kind` value is `codex_admission` or `send`. An empty array means there are no unresolved effects.
+Plain output contains one route, kind, and effect ID per line.
+
+Resolution JSON has this shape:
+
+```json
+{"type":"resolved","routeId":"home-messages","effectId":"part-uuid","resolution":"failed"}
+```
+
+An accepted send resolution also contains `providerHandle`. Codex admissions permit only `failed`.
+Unknown or already resolved identities fail with `effect_not_found`. No retry command exists.
+
+### Gateway configuration contract
+
+| Table | Fields |
+| --- | --- |
+| `gateway` | Required `listen_port`, `public_url`; optional `state_dir` |
+| `gateway.sendblue` | Required `id`, `api_key_id_env`, `api_secret_key_env`, `webhook_secret_env` |
+| `gateway.routes` | Required `id`, `sendblue`, `sender`, `sendblue_number`, `agent` |
+
+At least one account and route are required. Unknown gateway fields are rejected.
+IDs use lowercase slugs that start with a letter. Environment-variable names use letters, digits, and underscores, without an initial digit.
+
+`listen_port` is an integer from 1 to 65535. `public_url` is an HTTPS origin without credentials, a path, query, or fragment.
+`state_dir` must be absolute. Its default is `~/.codex-router/gateway`.
+Phone numbers contain `+`, a nonzero country-code digit, and 6 to 14 additional digits.
+
+Routes reference existing accounts and agents. Each account/sender/line combination and each route target must be unique.
+Pending work prevents changes to its account, numbers, SSH host, task ID, or working directory.
+
+### Gateway HTTP contract
+
+| Endpoint | Result |
+| --- | --- |
+| `GET /healthz` | 200 with `{"ok":true}` |
+| `GET /readyz` | 200 with `{"ready":true}`, or 503 with `{"ready":false}` |
+| `POST /webhooks/sendblue/ACCOUNT` | 204 after durable acceptance, deduplication, or intentional ignoring |
+| `POST /callbacks/sendblue/ACCOUNT/PART/TOKEN` | 204 after settlement or an ignored callback |
+
+POST requests require `application/json` and the configured `sb-signing-secret` header.
+Authentication precedes JSON parsing. POST responses have empty bodies.
+Authenticated outbound, group, and unmatched inbound events make no state changes.
+A current callback also requires its random token. An authenticated stale callback returns 204.
+
+| Status | Meaning |
+| --- | --- |
+| 400 | Invalid authenticated JSON or event fields |
+| 401 | Missing or incorrect signing secret, or incorrect current callback token |
+| 404 | Unknown account or path |
+| 405 | Wrong HTTP method |
+| 408 | Request body inactivity timeout |
+| 413 | Body exceeds 256 KiB |
+| 415 | Content type is not JSON |
+| 503 | Intake is unavailable or a required durable write failed |
+
+Request headers have a 30-second deadline. Request bodies have a 60-second inactivity deadline.
+Send and typing requests have 60-second deadlines. Upload attempts have ten-minute deadlines.
+Downloads have separate 60-second header and body-inactivity deadlines. Codex turns have no overall deadline.
+Message requests share ten starts per rolling second for each sending number.
+
 ## Failures
 
 JSON and stream modes use this shape:
@@ -228,6 +304,10 @@ potentially accepted and inspect the task before sending the same text again.
 | `app_server_start_failed` | The local owned app-server or persistent remote daemon failed to start |
 | `codex_unavailable` | Codex or its configured home directory is unavailable |
 | `config_invalid` | The TOML file or one of its agent entries is invalid |
+| `gateway_running` | Another process owns the gateway state lock |
+| `effect_not_found` | The requested unresolved effect is absent |
+| `state_invalid` | The durable state or a pending route binding is invalid |
+| `storage_failed` | The gateway cannot read or write its durable files |
 | `input_invalid` | The command arguments or stdin input are invalid |
 | `interrupted` | The caller interrupted the turn |
 | `output_too_large` | A semantic message exceeded 256 KiB |

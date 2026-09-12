@@ -95,6 +95,14 @@ caller interrupts the command.
 See [CLI reference](docs/cli-reference.md) for commands, output shapes, exit
 codes, and failure codes.
 
+## Messaging gateway
+
+Use the Sendblue gateway to message a configured task with text, images, and files.
+The gateway saves accepted input and pending responses across restarts.
+
+See [Gateway setup and recovery](docs/gateway.md) for configuration and operation.
+Live provider validation remains required before release.
+
 ## Develop
 
 ```sh
