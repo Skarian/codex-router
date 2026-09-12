@@ -16,6 +16,7 @@ export interface AgentConfig {
 
 export interface RouterConfig {
   agents: AgentConfig[];
+  gateway?: GatewayConfig;
 }
 
 const ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
@@ -56,6 +57,7 @@ export function parseConfig(source: string): RouterConfig {
 
   const ids = new Set<string>();
   const labels = new Set<string>();
+  const threads = new Set<string>();
   const agents = rawAgents.map((value, index): AgentConfig => {
     const agentName = `Agent ${index + 1}`;
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -85,6 +87,8 @@ export function parseConfig(source: string): RouterConfig {
     if (labels.has(label)) {
       throw new RouterError("config_invalid", `Agent label ${JSON.stringify(label)} is duplicated.`);
     }
+    if (threads.has(threadId)) throw new RouterError("config_invalid", "An agent thread_id is duplicated.");
+    threads.add(threadId);
     ids.add(id);
     labels.add(label);
     return {
@@ -98,7 +102,7 @@ export function parseConfig(source: string): RouterConfig {
     };
   });
 
-  return { agents };
+  return { agents, ...(document.gateway === undefined ? {} : { gateway: parseGateway(document.gateway, agents) }) };
 }
 
 export async function loadConfig(path: string): Promise<RouterConfig> {
@@ -115,4 +119,92 @@ export function findAgent(config: RouterConfig, id: string): AgentConfig {
   const agent = config.agents.find((candidate) => candidate.id === id);
   if (!agent) throw new RouterError("unknown_agent", `No configured agent has id ${JSON.stringify(id)}.`);
   return agent;
+}
+
+export interface SendblueConfig {
+  id: string;
+  apiKeyIdEnv: string;
+  apiSecretKeyEnv: string;
+  webhookSecretEnv: string;
+}
+
+export interface GatewayRoute {
+  id: string;
+  sendblueId: string;
+  sender: string;
+  sendblueNumber: string;
+  agent: AgentConfig;
+}
+
+export interface GatewayConfig {
+  listenPort: number;
+  publicUrl: string;
+  stateDir: string;
+  sendblue: SendblueConfig[];
+  routes: GatewayRoute[];
+}
+
+function parseGateway(value: unknown, agents: AgentConfig[]): GatewayConfig {
+  const invalid = (): never => { throw new RouterError("config_invalid", "The gateway configuration is invalid."); };
+  const table = (raw: unknown): Record<string, unknown> => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid();
+    return raw as Record<string, unknown>;
+  };
+  const fields = (record: Record<string, unknown>, allowed: string[]) => {
+    if (Object.keys(record).some((key) => !allowed.includes(key))) invalid();
+  };
+  const entries = (raw: unknown): Record<string, unknown>[] => {
+    if (!Array.isArray(raw) || !raw.length) return invalid();
+    return raw.map(table);
+  };
+  const id = (record: Record<string, unknown>, key: string): string => {
+    const value = requiredString(record, key, "Gateway");
+    if (!ID_PATTERN.test(value)) invalid();
+    return value;
+  };
+  const env = (record: Record<string, unknown>, key: string): string => {
+    const value = requiredString(record, key, "Gateway");
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) invalid();
+    return value;
+  };
+  const phone = (record: Record<string, unknown>, key: string): string => {
+    const value = requiredString(record, key, "Gateway");
+    if (!/^\+[1-9][0-9]{6,14}$/.test(value)) invalid();
+    return value;
+  };
+  const record = table(value);
+  fields(record, ["listen_port", "public_url", "state_dir", "sendblue", "routes"]);
+  if (!Number.isInteger(record.listen_port) || Number(record.listen_port) < 1 || Number(record.listen_port) > 65535) invalid();
+  const publicUrl = requiredString(record, "public_url", "Gateway");
+  try {
+    const url = new URL(publicUrl);
+    if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) invalid();
+  } catch { invalid(); }
+  const stateDir = optionalString(record, "state_dir", "Gateway") ?? resolve(homedir(), ".codex-router/gateway");
+  if (!isAbsolute(stateDir)) invalid();
+  const accounts = new Set<string>();
+  const sendblue = entries(record.sendblue).map((entry) => {
+    fields(entry, ["id", "api_key_id_env", "api_secret_key_env", "webhook_secret_env"]);
+    const accountId = id(entry, "id");
+    if (accounts.has(accountId)) invalid();
+    accounts.add(accountId);
+    return { id: accountId, apiKeyIdEnv: env(entry, "api_key_id_env"), apiSecretKeyEnv: env(entry, "api_secret_key_env"), webhookSecretEnv: env(entry, "webhook_secret_env") };
+  });
+  const routeIds = new Set<string>();
+  const conversations = new Set<string>();
+  const targets = new Set<string>();
+  const routes = entries(record.routes).map((entry) => {
+    fields(entry, ["id", "sendblue", "sender", "sendblue_number", "agent"]);
+    const routeId = id(entry, "id");
+    const sendblueId = id(entry, "sendblue");
+    const agent = agents.find((agent) => agent.id === entry.agent);
+    if (!agent || !accounts.has(sendblueId) || routeIds.has(routeId) || targets.has(agent.id)) return invalid();
+    const sender = phone(entry, "sender");
+    const sendblueNumber = phone(entry, "sendblue_number");
+    const conversation = JSON.stringify([sendblueId, sender, sendblueNumber]);
+    if (conversations.has(conversation)) invalid();
+    conversations.add(conversation); targets.add(agent.id); routeIds.add(routeId);
+    return { id: routeId, sendblueId, sender, sendblueNumber, agent };
+  });
+  return { listenPort: Number(record.listen_port), publicUrl: new URL(publicUrl).origin, stateDir, sendblue, routes };
 }

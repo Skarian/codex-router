@@ -147,6 +147,9 @@ async function connectRecoveryAppServer(agent, operations = {
         ? operations.connectLocalProxy()
         : operations.connectRemote(agent.sshHost);
 }
+export class TurnEndedError extends RouterError {
+    constructor() { super("turn_failed", "The owned Codex turn has ended."); }
+}
 /** One connection owner for concurrent observation and serialized admissions. */
 export class TurnSession {
     agent;
@@ -240,7 +243,7 @@ export class TurnSession {
         const resumed = await this.resume();
         this.checkOpen();
         if (this.terminal)
-            throw new RouterError("turn_failed", "The owned Codex turn has ended.");
+            throw new TurnEndedError();
         const active = this.owned ?? resumed.activeTurn;
         const expected = active ? acceptedTurnId(active, "thread/resume") : undefined;
         if (expected !== intent.expectedTurnId) {

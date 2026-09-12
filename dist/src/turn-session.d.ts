@@ -1,5 +1,6 @@
 import { type AppServerConnection } from "./app-server.js";
 import type { AgentConfig } from "./config.js";
+import { RouterError } from "./errors.js";
 import { resumedThreadState, type TurnOutcome, type SemanticMessage } from "./turn-state.js";
 export type CancelResult = {
     type: "interrupt_requested";
@@ -23,6 +24,9 @@ export interface TurnCommandOperations {
     threadResumeTimeoutMs?: number;
     recovery?: RecoveryConnectionOperations;
     reconnectDelaysMs?: readonly number[];
+}
+export declare class TurnEndedError extends RouterError {
+    constructor();
 }
 export interface AdmissionIntent {
     clientUserMessageId: string;

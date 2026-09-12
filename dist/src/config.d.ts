@@ -9,8 +9,29 @@ export interface AgentConfig {
 }
 export interface RouterConfig {
     agents: AgentConfig[];
+    gateway?: GatewayConfig;
 }
 export declare function defaultConfigPath(): string;
 export declare function parseConfig(source: string): RouterConfig;
 export declare function loadConfig(path: string): Promise<RouterConfig>;
 export declare function findAgent(config: RouterConfig, id: string): AgentConfig;
+export interface SendblueConfig {
+    id: string;
+    apiKeyIdEnv: string;
+    apiSecretKeyEnv: string;
+    webhookSecretEnv: string;
+}
+export interface GatewayRoute {
+    id: string;
+    sendblueId: string;
+    sender: string;
+    sendblueNumber: string;
+    agent: AgentConfig;
+}
+export interface GatewayConfig {
+    listenPort: number;
+    publicUrl: string;
+    stateDir: string;
+    sendblue: SendblueConfig[];
+    routes: GatewayRoute[];
+}

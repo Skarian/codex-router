@@ -4,6 +4,7 @@ import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
 import { runDoctor } from "./doctor.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
 import { cancelTurn, sendTurn } from "./turn-session.js";
+import { GatewayStore, bindRoutes, unresolved, resolveEffect } from "./gateway-state.js";
 let stdoutClosed = false;
 let activeAbortController;
 function handleStdoutError(error) {
@@ -21,6 +22,10 @@ function usage() {
         "  codex-router [--config PATH] doctor [--json]",
         "  codex-router [--config PATH] send AGENT_ID --stdin [--json | --stream]",
         "  codex-router [--config PATH] cancel AGENT_ID [--json]",
+        "  codex-router [--config PATH] gateway",
+        "  codex-router [--config PATH] gateway status [--json]",
+        "  codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID failed [--json]",
+        "  codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE [--json]",
     ].join("\n");
 }
 function parseArgs(argv) {
@@ -98,6 +103,41 @@ async function main() {
     const [first, second, third] = parsed.command;
     try {
         const config = await loadConfig(parsed.configPath);
+        if (first === "gateway" && (second === "status" || second === "resolve") && !parsed.stdin && !parsed.stream) {
+            const [, , routeId, effectId, resolution, handle, extra] = parsed.command;
+            if ((second === "status" && third !== undefined) || (second === "resolve" &&
+                (!routeId || !effectId || extra !== undefined || (resolution !== "failed" && resolution !== "accepted")
+                    || (resolution === "failed" && handle !== undefined) || (resolution === "accepted" && !handle)))) {
+                throw new RouterError("input_invalid", "Invalid gateway command usage.");
+            }
+            if (!config.gateway)
+                throw new RouterError("config_invalid", "The gateway configuration is missing.");
+            const store = await GatewayStore.open(config.gateway.stateDir);
+            try {
+                bindRoutes(store.snapshot(), config.gateway);
+                if (second === "status") {
+                    const status = unresolved(store.snapshot());
+                    if (parsed.json)
+                        printJson(status);
+                    else if (!status.unresolved.length)
+                        writeStdout("No unresolved effects.\n");
+                    else
+                        for (const effect of status.unresolved)
+                            writeStdout(`${effect.routeId}  ${effect.kind}  ${effect.effectId}\n`);
+                }
+                else {
+                    const result = await store.transaction((state) => resolveEffect(state, routeId, effectId, resolution, handle));
+                    if (parsed.json)
+                        printJson(result);
+                    else
+                        writeStdout(`Resolved ${effectId} as ${resolution}.\n`);
+                }
+            }
+            finally {
+                await store.close();
+            }
+            return;
+        }
         if (first === "agents" && second === "list" && third === undefined && !parsed.stdin && !parsed.stream) {
             if (parsed.json)
                 printJson(listAgents(config));

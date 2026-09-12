@@ -213,6 +213,10 @@ async function connectRecoveryAppServer(
     : operations.connectRemote(agent.sshHost);
 }
 
+export class TurnEndedError extends RouterError {
+  constructor() { super("turn_failed", "The owned Codex turn has ended."); }
+}
+
 export interface AdmissionIntent {
   clientUserMessageId: string;
   expectedTurnId?: string;
@@ -318,7 +322,7 @@ export class TurnSession {
     if (this.recoveryFlight) await this.recoveryFlight;
     const resumed = await this.resume();
     this.checkOpen();
-    if (this.terminal) throw new RouterError("turn_failed", "The owned Codex turn has ended.");
+    if (this.terminal) throw new TurnEndedError();
     const active = this.owned ?? resumed.activeTurn;
     const expected = active ? acceptedTurnId(active, "thread/resume") : undefined;
     if (expected !== intent.expectedTurnId) {
