@@ -279,6 +279,13 @@ export class TurnSession {
   get serverInfo() { return this.connection.client.serverInfo; }
   get artifactBaseline(): string[] { return [...(this.state.artifactBaseline ?? [])]; }
 
+  async filesystem(method: "fs/getMetadata" | "fs/readDirectory" | "fs/createDirectory" | "fs/remove", params: unknown): Promise<unknown> {
+    this.checkOpen();
+    if (this.recoveryFlight) await this.recoveryFlight;
+    return this.connection.client.request(method, params, THREAD_RESUME_TIMEOUT_MS, this.abort.signal);
+  }
+
+
   private checkOpen(): void {
     if (this.closing) throw new RouterError("interrupted", "The Codex session is closed.", { ambiguous: !!this.pending });
     throwIfAborted(this.abort.signal, !!this.pending || !!this.owned);

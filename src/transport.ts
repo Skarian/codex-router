@@ -255,7 +255,7 @@ export class ProxyTransport extends BaseTransport {
       closeTimeout: 500,
       perMessageDeflate: false,
       handshakeTimeout: 15_000,
-      maxPayload: 4 * 1024 * 1024,
+      maxPayload: 100 * 1024 * 1024,
     } as unknown as ClientOptions;
     const socket = new WebSocket("ws://localhost/rpc", websocketOptions);
     this.socket = socket;
@@ -269,6 +269,11 @@ export class ProxyTransport extends BaseTransport {
       } catch (error) {
         this.emitClose(new RouterError("app_server_protocol_failed", "The app-server emitted invalid JSON.", { cause: error }));
       }
+    });
+    socket.on("error", (error: Error & { code?: string }) => {
+      if (error.code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH") {
+        this.emitClose(new RouterError("output_too_large", "The app-server output exceeds the 100 MiB envelope."));
+      } else if (!this.closing) this.emitClose(error);
     });
     socket.on("close", () => {
       if (!this.closing) {

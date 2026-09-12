@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { beforeEach, afterEach } from "node:test";
 import {
   cancelTurn,
   sendTurn,
@@ -10,6 +10,11 @@ import type { AgentConfig } from "../src/config.js";
 import { RouterError } from "../src/errors.js";
 import { JsonRpcClient } from "../src/json-rpc.js";
 import type { MessageTransport, TransportKind } from "../src/transport.js";
+
+// Fake transports have no socket to keep unreferenced deadline timers alive on Node 20.
+let transportLifetime: NodeJS.Timeout;
+beforeEach(() => { transportLifetime = setInterval(() => undefined, 1000); });
+afterEach(() => { clearInterval(transportLifetime); });
 
 const NO_RESPONSE = Symbol("no response");
 

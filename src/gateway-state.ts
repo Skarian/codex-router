@@ -56,6 +56,7 @@ export function validateState(value: unknown): GatewayState {
   const parsed = v.safeParse(stateSchema, value);
   if (!parsed.success) throw new RouterError("state_invalid", "The canonical gateway state is invalid.");
   const state = parsed.output;
+  const partIds = new Set<string>();
   for (const route of Object.values(state.routes)) {
     const work = route.active;
     const batchIds = new Set<string>();
@@ -80,11 +81,11 @@ export function validateState(value: unknown): GatewayState {
       let unfinished = false;
       let blocked = false;
       for (const part of work.parts) {
-        if (ids.has(part.id) || (part.status === "sending" ? !part.callbackToken || !!part.providerHandle
+        if (partIds.has(part.id) || ids.has(part.id) || (part.status === "sending" ? !part.callbackToken || !!part.providerHandle
           : part.status === "accepted" ? !part.providerHandle || !!part.callbackToken : !!part.callbackToken || !!part.providerHandle)
           || (unfinished && (part.status === "accepted" || part.status === "sending"))
           || (blocked && part.status !== "skipped")) throw new RouterError("state_invalid", "The gateway delivery order is invalid.");
-        ids.add(part.id);
+        ids.add(part.id); partIds.add(part.id);
         unfinished ||= part.status !== "accepted";
         blocked ||= part.status === "failed";
       }
@@ -192,6 +193,7 @@ export class GatewayStore {
       if (this.closed || this.poisoned) throw new RouterError("storage_failed", "The gateway state writer is unavailable.");
       const draft = structuredClone(this.state);
       const result = change(draft);
+      if (result instanceof Promise) throw new RouterError("state_invalid", "A gateway state transaction must be synchronous.");
       const cutoff = Date.now() - SEEN_RETENTION_MS;
       for (const route of Object.values(draft.routes)) route.seenMessages = route.seenMessages.filter((seen) => seen.receivedAtMs >= cutoff);
       validateState(draft);

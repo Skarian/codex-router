@@ -196,6 +196,12 @@ export class TurnSession {
     get transportKind() { return this.connection.transportKind; }
     get serverInfo() { return this.connection.client.serverInfo; }
     get artifactBaseline() { return [...(this.state.artifactBaseline ?? [])]; }
+    async filesystem(method, params) {
+        this.checkOpen();
+        if (this.recoveryFlight)
+            await this.recoveryFlight;
+        return this.connection.client.request(method, params, THREAD_RESUME_TIMEOUT_MS, this.abort.signal);
+    }
     checkOpen() {
         if (this.closing)
             throw new RouterError("interrupted", "The Codex session is closed.", { ambiguous: !!this.pending });

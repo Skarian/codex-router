@@ -1,7 +1,7 @@
 import type { GatewayConfig, GatewayRoute } from "./config.js";
 import { TurnSession } from "./turn-session.js";
 import type { TurnOutcome } from "./turn-state.js";
-import { GatewayStore, type Batch, type CodexWork, type DeliveryPart, type GatewayState } from "./gateway-state.js";
+import { GatewayStore, type Batch, type CodexWork, type Delivery, type DeliveryPart, type GatewayState } from "./gateway-state.js";
 export type SendOutcome = {
     status: "accepted";
     providerHandle: string;
@@ -33,9 +33,10 @@ export interface GatewayConnector {
     upload(path: string, name: string, mediaType: string, signal: AbortSignal): Promise<string>;
     typing(route: GatewayRoute, state: "start" | "stop", signal: AbortSignal): Promise<void>;
 }
-export type GatewaySession = Pick<TurnSession, "resume" | "admit" | "steer" | "observe" | "restore" | "close" | "artifactBaseline" | "serverInfo">;
+export type GatewaySession = Pick<TurnSession, "resume" | "admit" | "steer" | "observe" | "restore" | "close" | "artifactBaseline" | "serverInfo" | "filesystem">;
 export interface GatewayFiles {
     cleanup(state: GatewayState): Promise<void>;
+    release?(route: GatewayRoute, active: CodexWork | Delivery, session?: GatewaySession): Promise<void>;
     reconcile(route: GatewayRoute, state: GatewayState, session: GatewaySession, signal: AbortSignal): Promise<void>;
     prepareBatch(route: GatewayRoute, batch: Batch, session: GatewaySession, signal: AbortSignal): Promise<Batch>;
     publication(route: GatewayRoute, publicationId: string, session: GatewaySession, signal: AbortSignal): Promise<string>;
@@ -56,6 +57,7 @@ export declare class Gateway {
     private readonly abort;
     private readonly workers;
     private readonly live;
+    private readonly cleanups;
     private readonly lineStarts;
     private readonly now;
     constructor(config: GatewayConfig, store: GatewayStore, operations: GatewayOperations);
@@ -67,7 +69,9 @@ export declare class Gateway {
     private observe;
     private step;
     private freeze;
+    private release;
     private currentPart;
+    callbackState(account: string, partId: string, token: string): "stale" | "unauthorized" | "current";
     callback(account: string, partId: string, token: string, callback: StatusCallback): Promise<boolean>;
     private settle;
     private lineSlot;

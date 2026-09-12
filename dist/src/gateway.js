@@ -7,7 +7,19 @@ export function delay(ms, signal) {
     return new Promise((resolve, reject) => {
         const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); };
         const abort = () => { finish(); reject(new RouterError("interrupted", "The gateway operation stopped.")); };
-        const timer = setTimeout(() => { finish(); resolve(); }, Math.max(0, ms));
+        const deadline = Date.now() + Math.max(0, ms);
+        const tick = () => {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) {
+                finish();
+                resolve();
+            }
+            else {
+                timer = setTimeout(tick, Math.min(remaining, 2147483647));
+                timer.unref();
+            }
+        };
+        let timer = setTimeout(tick, Math.min(Math.max(0, ms), 2147483647));
         timer.unref();
         if (signal.aborted)
             abort();
@@ -45,6 +57,7 @@ export class Gateway {
     abort = new AbortController();
     workers = new Map();
     live = new Map();
+    cleanups = new Set();
     lineStarts = new Map();
     now;
     constructor(config, store, operations) {
@@ -92,6 +105,8 @@ export class Gateway {
     }
     typing(route, active) {
         const worker = this.workers.get(route.id);
+        if (!active && !worker.typingTimer)
+            return;
         if (worker.typingTimer) {
             if (active)
                 return;
@@ -176,6 +191,7 @@ export class Gateway {
             }
             else {
                 await this.store.transaction((state) => { delete state.routes[route.id].active; });
+                this.release(route, active, worker.session);
                 await worker.session?.close();
                 delete worker.session;
                 delete worker.observation;
@@ -292,6 +308,14 @@ export class Gateway {
                 throw new RouterError("state_invalid", "The response still has an unresolved admission.");
             state.routes[route.id].active = { kind: "delivery", id: randomUUID(), batchIds: work.batches.map((batch) => batch.id), parts };
         });
+        this.release(route, work, this.workers.get(route.id).session);
+    }
+    release(route, active, session) {
+        const operation = this.operations.files.release?.(route, active, session);
+        if (!operation)
+            return;
+        const cleanup = operation.catch(() => undefined).finally(() => { this.cleanups.delete(cleanup); });
+        this.cleanups.add(cleanup);
     }
     currentPart(partId) {
         const state = this.store.snapshot();
@@ -304,6 +328,12 @@ export class Gateway {
                 return { route, delivery, part };
         }
         return undefined;
+    }
+    callbackState(account, partId, token) {
+        const current = this.currentPart(partId);
+        if (!current || current.route.sendblueId !== account || current.part.status !== "sending")
+            return "stale";
+        return secretEqual(current.part.callbackToken, token) ? "current" : "unauthorized";
     }
     async callback(account, partId, token, callback) {
         const current = this.currentPart(partId);
@@ -362,7 +392,10 @@ export class Gateway {
         const live = { attemptsStarted: 0, abort: new AbortController(), durable: false, running: true };
         this.live.set(partId, live);
         const onAbort = () => live.abort.abort();
-        this.abort.signal.addEventListener("abort", onAbort, { once: true });
+        if (this.abort.signal.aborted)
+            onAbort();
+        else
+            this.abort.signal.addEventListener("abort", onAbort, { once: true });
         let uncertain = false;
         try {
             for (let attempt = 0; attempt < 3; attempt++) {
@@ -425,6 +458,7 @@ export class Gateway {
         }
         await Promise.all([...this.workers.values()].map((worker) => worker.session?.close()));
         await this.idle();
+        await Promise.all(this.cleanups);
     }
 }
 export function secretEqual(left, right) {

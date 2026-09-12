@@ -64,6 +64,7 @@ export declare class TurnSession {
     get transportKind(): "proxy" | "stdio";
     get serverInfo(): import("./json-rpc.js").AppServerInfo;
     get artifactBaseline(): string[];
+    filesystem(method: "fs/getMetadata" | "fs/readDirectory" | "fs/createDirectory" | "fs/remove", params: unknown): Promise<unknown>;
     private checkOpen;
     resume(): Promise<ReturnType<typeof resumedThreadState>>;
     admit(input: readonly TurnInput[], intent: AdmissionIntent): Promise<string>;

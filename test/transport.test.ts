@@ -93,3 +93,37 @@ test("transport close is idempotent for concurrent callers", async () => {
     await Promise.all([first, second]);
   }
 });
+
+test("proxy accepts large native envelopes and reports an oversized frame before reading its payload", async () => {
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os"); const { join } = await import("node:path");
+  const directory = await mkdtemp(join(tmpdir(), "gateway-envelope-"));
+  const previousPath = process.env.PATH;
+  await writeFile(join(directory, "codex"), `#!${process.execPath}
+const {createHash}=require('node:crypto');
+let headers='';
+const handshake=(chunk)=>{
+ headers+=chunk.toString();if(!headers.includes('\\r\\n\\r\\n'))return;
+ process.stdin.removeListener('data',handshake);
+ const key=/Sec-WebSocket-Key: ([^\\r]+)/i.exec(headers)[1];
+ const accept=createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+ process.stdout.write('HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\nSec-WebSocket-Accept: '+accept+'\\r\\n\\r\\n');
+ const body=Buffer.from(JSON.stringify({large:'x'.repeat(5*1024*1024)}));
+ const frame=Buffer.alloc(10);frame[0]=129;frame[1]=127;frame.writeBigUInt64BE(BigInt(body.length),2);
+ process.stdout.write(frame);process.stdout.write(body,()=>{
+  const oversized=Buffer.alloc(10);oversized[0]=129;oversized[1]=127;oversized.writeBigUInt64BE(100n*1024n*1024n+1n,2);
+  setTimeout(()=>process.stdout.write(oversized),20);
+ });
+};
+process.stdin.on('data',handshake);process.stdin.on('end',()=>process.exit(0));
+`, { mode: 0o700 });
+  process.env.PATH = `${directory}:${previousPath ?? ""}`;
+  const transport = new ProxyTransport();
+  try {
+    const message = new Promise<unknown>((resolve) => transport.onMessage(resolve));
+    const closed = new Promise<Error | undefined>((resolve) => transport.onClose(resolve));
+    await transport.start();
+    assert.equal(((await message) as { large: string }).large.length, 5 * 1024 * 1024);
+    assert.equal(((await closed) as { code?: string }).code, "output_too_large");
+  } finally { await transport.close(); if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; await rm(directory, { recursive: true, force: true }); }
+});
