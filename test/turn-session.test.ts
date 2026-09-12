@@ -578,3 +578,260 @@ test("indefinite recovery stops on caller abort without resending", async () => 
   assert.equal(starts, 1);
   assert.ok(recoveryAttempts > 1);
 });
+
+test("shared session steers twice while one observation waits", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  let steers = 0;
+  const transport = new ScriptedTransport((method) => {
+    if (method === "thread/resume") return { thread: { status: { type: "active" }, turns: [
+      { id: "shared", status: "inProgress", items: [] },
+    ] } };
+    if (method === "turn/steer") { steers++; return { turnId: "shared" }; }
+    throw new Error(`unexpected ${method}`);
+  });
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(scriptedConnection(transport)));
+  try {
+    const input = [{ type: "text" as const, text: "hello", text_elements: [] }];
+    await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
+    const observed = session.observe("shared");
+    await Promise.all([
+      session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" }),
+      session.steer(input, { clientUserMessageId: "third", expectedTurnId: "shared" }),
+    ]);
+    transport.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed", items: [] } });
+    assert.deepEqual(await observed, { turnId: "shared", status: "completed", imageGenerations: [] });
+    assert.equal(steers, 3);
+    await assert.rejects(session.steer(input, { clientUserMessageId: "fourth", expectedTurnId: "shared" }));
+    assert.equal(steers, 3);
+  } finally { await session.close(); }
+});
+
+test("recovery during a later steer publishes one replacement for observation and the next steer", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  let initialSteers = 0;
+  let recoveredSteers = 0;
+  let recoveryCount = 0;
+  let initial: ScriptedTransport;
+  initial = new ScriptedTransport((method) => {
+    if (method === "thread/resume") return { thread: { status: { type: "active" }, turns: [
+      { id: "shared", status: "inProgress", items: [] },
+    ] } };
+    if (method === "turn/steer") {
+      if (++initialSteers === 1) return { turnId: "shared" };
+      initial.disconnect();
+      return NO_RESPONSE;
+    }
+    throw new Error(`unexpected ${method}`);
+  }, "proxy");
+  const recovered = new ScriptedTransport((method) => {
+    if (method === "thread/resume") return { thread: { status: { type: "active" }, turns: [
+      { id: "shared", status: "inProgress", items: [{ type: "userMessage", clientId: "second" }] },
+    ] } };
+    if (method === "turn/steer") { recoveredSteers++; return { turnId: "shared" }; }
+    throw new Error(`unexpected ${method}`);
+  }, "proxy");
+  const session = await TurnSession.open(LOCAL_AGENT, {
+    ...fastTimeoutOperations(scriptedConnection(initial)),
+    recovery: {
+      connectLocalProxy: async () => { recoveryCount++; return scriptedConnection(recovered); },
+      connectRemote: async () => { throw new Error("unexpected remote"); },
+    },
+  });
+  try {
+    const input = [{ type: "text" as const, text: "hello", text_elements: [] }];
+    await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
+    const observed = session.observe("shared");
+    await session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" });
+    await session.steer(input, { clientUserMessageId: "third", expectedTurnId: "shared" });
+    recovered.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed", items: [] } });
+    assert.equal((await observed).status, "completed");
+    assert.equal(recoveryCount, 1);
+    assert.equal(initialSteers, 2);
+    assert.equal(recoveredSteers, 1);
+  } finally { await session.close(); }
+});
+
+test("completed turn cannot prove that an unacknowledged later steer was accepted", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  let steers = 0;
+  let resumes = 0;
+  let transport: ScriptedTransport;
+  transport = new ScriptedTransport((method) => {
+    if (method === "thread/resume") {
+      resumes++;
+      return { thread: { status: { type: resumes === 1 ? "active" : "idle" }, turns: [{
+        id: "shared", status: resumes === 1 ? "inProgress" : "completed",
+        items: [{ type: "userMessage", clientId: "first" }],
+      }] } };
+    }
+    if (method === "turn/steer") {
+      if (++steers === 1) return { turnId: "shared" };
+      transport.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed", items: [] } });
+      return NO_RESPONSE;
+    }
+    throw new Error(`unexpected ${method}`);
+  });
+  const session = await TurnSession.open(LOCAL_AGENT, fastTimeoutOperations(scriptedConnection(transport)));
+  const input = [{ type: "text" as const, text: "hello", text_elements: [] }];
+  await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
+  const observed = session.observe("shared");
+  let settled = false;
+  const steer = session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" });
+  const checked = assert.rejects(steer, (error: unknown) => error instanceof RouterError && error.ambiguous);
+  void steer.finally(() => { settled = true; }).catch(() => undefined);
+  assert.equal((await observed).status, "completed");
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(settled, false);
+  assert.equal(resumes, 2);
+  await session.close();
+  await checked;
+  assert.equal(steers, 2);
+});
+
+test("session restoration requires pending client identity even on a completed known turn", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  const transport = new ScriptedTransport(() => ({ thread: { status: { type: "idle" }, turns: [{
+    id: "shared", status: "completed", items: [{ type: "userMessage", clientId: "old" }],
+  }] } }));
+  const session = await TurnSession.open(LOCAL_AGENT, fastTimeoutOperations(scriptedConnection(transport)));
+  let settled = false;
+  const restored = session.restore("shared", { clientUserMessageId: "pending", expectedTurnId: "shared" }, []);
+  const checked = assert.rejects(restored, (error: unknown) => error instanceof RouterError && error.ambiguous);
+  void restored.finally(() => { settled = true; }).catch(() => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(settled, false);
+  await session.close();
+  await checked;
+});
+
+test("completion racing a definite rejection preserves the owned observation", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  const { RpcRequestError } = await import("../src/json-rpc.js");
+  let steers = 0;
+  let transport: ScriptedTransport;
+  transport = new ScriptedTransport((method) => {
+    if (method === "thread/resume") return { thread: { status: { type: "active" }, turns: [{ id: "shared", status: "inProgress" }] } };
+    if (++steers === 1) return { turnId: "shared" };
+    transport.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed" } });
+    throw new Error("no active turn");
+  });
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(scriptedConnection(transport)));
+  try {
+    const input = [{ type: "text" as const, text: "hello", text_elements: [] }];
+    await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
+    const observed = session.observe("shared");
+    await assert.rejects(session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" }),
+      (error: unknown) => error instanceof RpcRequestError && !error.ambiguous && error.payload.message === "no active turn");
+    assert.equal((await observed).status, "completed");
+  } finally { await session.close(); }
+});
+
+test("close during shared recovery rejects queued admissions and closes the late connection", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  let release!: (connection: AppServerConnection) => void;
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  let laterCloses = 0;
+  let mutations = 0;
+  const initial = new ScriptedTransport((method) => {
+    if (method === "thread/resume") return { thread: { status: { type: "active" }, turns: [{ id: "shared", status: "inProgress" }] } };
+    mutations++;
+    return { turnId: "shared" };
+  }, "proxy");
+  const session = await TurnSession.open(LOCAL_AGENT, {
+    ...fastTimeoutOperations(scriptedConnection(initial)),
+    recovery: {
+      connectLocalProxy: () => { entered(); return new Promise((resolve) => { release = resolve; }); },
+      connectRemote: async () => { throw new Error("unexpected remote"); },
+    },
+  });
+  const input = [{ type: "text" as const, text: "hello", text_elements: [] }];
+  await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
+  const observed = assert.rejects(session.observe("shared"), (error: unknown) => error instanceof RouterError && error.code === "interrupted");
+  initial.disconnect();
+  await started;
+  const queued = assert.rejects(session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" }));
+  const closed = session.close();
+  release({ ...scriptedConnection(new ScriptedTransport(() => ({}))), close: async () => { laterCloses++; } });
+  await Promise.all([closed, observed, queued]);
+  assert.equal(laterCloses, 1);
+  assert.equal(mutations, 1);
+});
+
+test("resume is single-flight and shutdown never interrupts Codex", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  let resumes = 0;
+  let closes = 0;
+  const calls: string[] = [];
+  const transport = new ScriptedTransport(async (method) => {
+    calls.push(method);
+    if (method === "thread/resume") {
+      resumes++;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { thread: { status: { type: "idle" }, turns: [] } };
+    }
+    throw new Error(`unexpected ${method}`);
+  });
+  const connection = { ...scriptedConnection(transport), close: async () => { closes++; } };
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(connection));
+  const [a, b] = await Promise.all([session.resume(), session.resume()]);
+  assert.equal(a, b);
+  assert.equal(resumes, 1);
+  await Promise.all([session.close(), session.close()]);
+  await assert.rejects(session.admit([], { clientUserMessageId: "closed" }));
+  assert.equal(closes, 1);
+  assert.deepEqual(calls, ["thread/resume"]);
+});
+
+test("terminal events buffered before admission are not lost behind unrelated notifications", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  let transport: ScriptedTransport;
+  transport = new ScriptedTransport((method) => {
+    if (method === "thread/resume") return { thread: { status: { type: "active" }, turns: [{ id: "shared", status: "inProgress" }] } };
+    transport.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed", items: [
+      { type: "agentMessage", phase: "final_answer", text: "done" },
+    ] } });
+    for (let i = 0; i < 300; i++) transport.receive("item/agentMessage/delta", { threadId: "other", turnId: "other", delta: "ignored" });
+    return { turnId: "shared" };
+  });
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(scriptedConnection(transport)));
+  try {
+    await session.admit([{ type: "text", text: "hello", text_elements: [] }], { clientUserMessageId: "first", expectedTurnId: "shared" });
+    assert.equal((await session.observe("shared")).finalText, "done");
+  } finally { await session.close(); }
+});
+
+test("restored active work preserves completed native images without accepting partial final text", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  const transport = new ScriptedTransport(() => ({ thread: { status: { type: "active" }, turns: [{
+    id: "shared", status: "inProgress", items: [
+      { id: "baseline", type: "imageGeneration", status: "completed", savedPath: "/old.png" },
+      { id: "image", type: "imageGeneration", status: "completed", savedPath: "/new.png" },
+      { id: "partial", type: "agentMessage", phase: "final_answer", text: "partial" },
+    ],
+  }] } }));
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(scriptedConnection(transport)));
+  try {
+    await session.restore("shared", undefined, ["baseline"]);
+    const observed = session.observe("shared");
+    transport.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed" } });
+    assert.deepEqual(await observed, { turnId: "shared", status: "completed", imageGenerations: [{ id: "image", savedPath: "/new.png" }] });
+    assert.deepEqual(session.artifactBaseline, ["baseline"]);
+  } finally { await session.close(); }
+});
+
+test("terminal resume retains completed native events buffered before its response", async () => {
+  const { TurnSession } = await import("../src/turn-session.js");
+  let transport: ScriptedTransport;
+  transport = new ScriptedTransport(() => {
+    transport.receive("item/completed", { threadId: "thread", turnId: "shared", item: {
+      id: "image", type: "imageGeneration", status: "completed", savedPath: "/new.png",
+    } });
+    return { thread: { status: { type: "idle" }, turns: [{ id: "shared", status: "completed", items: [] }] } };
+  });
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(scriptedConnection(transport)));
+  try {
+    await session.restore("shared", undefined, []);
+    assert.deepEqual((await session.observe("shared")).imageGenerations, [{ id: "image", savedPath: "/new.png" }]);
+  } finally { await session.close(); }
+});

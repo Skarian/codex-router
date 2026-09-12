@@ -1,9 +1,23 @@
 import { RouterError } from "./errors.js";
 import type { MessageTransport } from "./transport.js";
 
-interface RpcErrorPayload {
+export interface RpcErrorPayload {
   code?: number;
   message?: string;
+  data?: unknown;
+}
+
+export class RpcRequestError extends RouterError {
+  constructor(readonly payload: RpcErrorPayload) {
+    super("app_server_protocol_failed", `Codex app-server rejected the request: ${payload.message ?? "Unknown app-server error."}`);
+  }
+}
+
+export interface AppServerInfo {
+  codexHome?: string;
+  platformFamily?: string;
+  platformOs?: string;
+  userAgent?: string;
 }
 
 interface PendingRequest {
@@ -19,6 +33,9 @@ type ClientCloseListener = (error: RouterError) => void;
 
 export class JsonRpcClient {
   private nextId = 1;
+  readonly serverInfo: AppServerInfo = {};
+
+  get isClosed(): boolean { return this.closed; }
   private readonly pending = new Map<number, PendingRequest>();
   private readonly listeners = new Set<NotificationListener>();
   private readonly closeListeners = new Set<ClientCloseListener>();
@@ -41,14 +58,23 @@ export class JsonRpcClient {
 
   onClose(listener: ClientCloseListener): () => void {
     this.closeListeners.add(listener);
+    if (this.closed) queueMicrotask(() => {
+      if (this.closeListeners.has(listener)) listener(this.disconnectedError());
+    });
     return () => this.closeListeners.delete(listener);
   }
 
   async initialize(timeoutMs = 10_000): Promise<void> {
-    await this.request("initialize", {
+    const result = await this.request("initialize", {
       clientInfo: { name: "codex-router", title: "Codex Router", version: "0.1.0" },
       capabilities: null,
     }, timeoutMs);
+    if (result && typeof result === "object") {
+      for (const key of ["codexHome", "platformFamily", "platformOs", "userAgent"] as const) {
+        const value = (result as Record<string, unknown>)[key];
+        if (typeof value === "string") this.serverInfo[key] = value;
+      }
+    }
     await this.notify("initialized", undefined, timeoutMs);
   }
 
@@ -152,8 +178,11 @@ export class JsonRpcClient {
       this.clearPending(pending);
       if (message.error !== undefined) {
         const payload = message.error as RpcErrorPayload;
-        const detail = typeof payload?.message === "string" ? payload.message : "Unknown app-server error.";
-        pending.reject(new RouterError("app_server_protocol_failed", `Codex app-server rejected the request: ${detail}`));
+        pending.reject(new RpcRequestError({
+          ...(typeof payload?.code === "number" ? { code: payload.code } : {}),
+          ...(typeof payload?.message === "string" ? { message: payload.message } : {}),
+          ...(payload?.data === undefined ? {} : { data: payload.data }),
+        }));
       } else {
         pending.resolve(message.result);
       }
@@ -177,6 +206,7 @@ export class JsonRpcClient {
   }
 
   private disconnectedError(cause?: unknown): RouterError {
+    if (cause instanceof RouterError && cause.code === "output_too_large") return cause;
     const detail = cause instanceof Error && cause.message
       ? ` ${cause.message}`
       : "";

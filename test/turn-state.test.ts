@@ -168,3 +168,29 @@ test("findCorrelatedTurn uses the stable client user message id when turn/start 
   ] } }, undefined, "client-message"), expected);
   assert.equal(findCorrelatedTurn({ thread: { turns: [expected] } }, "accepted-turn", "irrelevant"), expected);
 });
+
+test("native images survive terminal reconstruction while the original baseline stays excluded", async () => {
+  const { waitForOutcome } = await import("../src/turn-state.js");
+  const transport = new EventTransport();
+  const state = { seenItemIds: new Set<string>(), seenSemanticUnits: new Set<string>(), artifactBaseline: new Set(["old"]) };
+  const result = waitForOutcome(new JsonRpcClient(transport), "thread", "turn", () => undefined, undefined, [], state);
+  transport.receive("item/started", { threadId: "thread", turnId: "turn", item: { id: "incomplete", type: "imageGeneration", status: "inProgress" } });
+  transport.receive("turn/completed", { threadId: "thread", turn: { id: "turn", status: "completed", items: [
+    { id: "old", type: "imageGeneration", status: "completed", savedPath: "/old.png" },
+    { id: "new", type: "imageGeneration", status: "completed", savedPath: "/new.png", result: "aGVsbG8=" },
+    { id: "incomplete", type: "imageGeneration", status: "inProgress" },
+  ] } });
+  assert.deepEqual(await result, { turnId: "turn", status: "completed", imageGenerations: [
+    { id: "new", savedPath: "/new.png", result: "aGVsbG8=" },
+  ] });
+});
+
+test("terminal statuses without final text remain outcomes but preserve one-shot failures", async () => {
+  const { terminalOutcome, textResult } = await import("../src/turn-state.js");
+  for (const status of ["completed", "failed", "interrupted"] as const) {
+    const outcome = terminalOutcome({ id: "turn", status }, { seenItemIds: new Set(), seenSemanticUnits: new Set() })!;
+    assert.equal(outcome.status, status);
+    assert.throws(() => textResult(outcome), (error: unknown) => error instanceof RouterError
+      && error.code === (status === "interrupted" ? "interrupted" : "turn_failed"));
+  }
+});

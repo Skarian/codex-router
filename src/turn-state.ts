@@ -5,8 +5,17 @@ const MAX_OUTPUT_BYTES = 256 * 1024;
 
 export interface TurnState {
   finalText?: string;
+  imageGenerations?: Map<string, TurnOutcome["imageGenerations"][number]>;
+  artifactBaseline?: ReadonlySet<string>;
   readonly seenItemIds: Set<string>;
   readonly seenSemanticUnits: Set<string>;
+}
+
+export interface TurnOutcome {
+  turnId: string;
+  status: "completed" | "failed" | "interrupted";
+  finalText?: string;
+  imageGenerations: Array<{ id: string; savedPath?: string; result?: string }>;
 }
 
 export interface Notification {
@@ -51,7 +60,7 @@ export function resumedThreadState(resumeResult: unknown): ResumedThreadState {
   throw new RouterError("app_server_protocol_failed", "Codex app-server returned inconsistent active-turn state.");
 }
 
-export function waitForTurn(
+export function waitForOutcome(
   client: JsonRpcClient,
   threadId: string,
   turnId: string,
@@ -59,9 +68,12 @@ export function waitForTurn(
   signal?: AbortSignal,
   initialNotifications: ReadonlyArray<Notification> = [],
   state: TurnState = { seenItemIds: new Set(), seenSemanticUnits: new Set() },
-): Promise<SemanticMessage> {
+): Promise<TurnOutcome> {
   return new Promise((resolve, reject) => {
+    let settled = false;
     const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
       unsubscribe();
       unsubscribeClose();
       signal?.removeEventListener("abort", onAbort);
@@ -70,6 +82,7 @@ export function waitForTurn(
     const onAbort = () => finish(() => reject(new RouterError("interrupted", "The Codex turn was interrupted by the caller.", { ambiguous: true })));
     const unsubscribeClose = client.onClose((error) => finish(() => reject(error)));
     const handleNotification = (method: string, rawParams: unknown) => {
+      if (settled) return;
       try {
         const params = object(rawParams);
         if (!params || params.threadId !== threadId) return;
@@ -82,13 +95,8 @@ export function waitForTurn(
         const turn = object(params.turn);
         if (!turn || turn.id !== turnId) return;
         applyTurnItems(turn, state, emit);
-        if (turn.status === "completed" && state.finalText !== undefined) {
-          finish(() => resolve({ type: "completed", text: state.finalText! }));
-        } else if (turn.status === "interrupted") {
-          finish(() => reject(new RouterError("interrupted", "The Codex turn was interrupted.")));
-        } else {
-          finish(() => reject(new RouterError("turn_failed", "The Codex turn failed before producing a final response.")));
-        }
+        const outcome = terminalOutcome(turn, state);
+        if (outcome) finish(() => resolve(outcome));
       } catch (error) {
         finish(() => reject(error instanceof RouterError
           ? error
@@ -97,9 +105,43 @@ export function waitForTurn(
     };
     const unsubscribe = client.onNotification(handleNotification);
     for (const notification of initialNotifications) handleNotification(notification.method, notification.params);
+    if (settled) return;
     if (signal?.aborted) onAbort();
     else signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+export async function waitForTurn(
+  client: JsonRpcClient,
+  threadId: string,
+  turnId: string,
+  emit: (message: SemanticMessage) => void,
+  signal?: AbortSignal,
+  initialNotifications: ReadonlyArray<Notification> = [],
+  state: TurnState = { seenItemIds: new Set(), seenSemanticUnits: new Set() },
+): Promise<SemanticMessage> {
+  return textResult(await waitForOutcome(client, threadId, turnId, emit, signal, initialNotifications, state));
+}
+
+export function textResult(outcome: TurnOutcome): SemanticMessage {
+  if (outcome.status === "completed" && outcome.finalText !== undefined) {
+    return { type: "completed", text: outcome.finalText };
+  }
+  if (outcome.status === "interrupted") throw new RouterError("interrupted", "The Codex turn was interrupted.");
+  throw new RouterError("turn_failed", "The Codex turn failed before producing a final response.");
+}
+
+export function terminalOutcome(turn: Record<string, unknown>, state: TurnState): TurnOutcome | undefined {
+  if (turn.status === "inProgress") return undefined;
+  if (turn.status !== "completed" && turn.status !== "failed" && turn.status !== "interrupted") {
+    throw new RouterError("app_server_protocol_failed", "Codex returned an invalid terminal status.");
+  }
+  return {
+    turnId: acceptedTurnId(turn, "thread/resume"),
+    status: turn.status,
+    ...(state.finalText === undefined ? {} : { finalText: state.finalText }),
+    imageGenerations: [...(state.imageGenerations?.values() ?? [])],
+  };
 }
 
 function applyCompletedItem(item: Record<string, unknown>, state: TurnState, emit: (message: SemanticMessage) => void): void {
@@ -107,6 +149,15 @@ function applyCompletedItem(item: Record<string, unknown>, state: TurnState, emi
   if (itemId !== undefined) {
     if (state.seenItemIds.has(itemId)) return;
     state.seenItemIds.add(itemId);
+  }
+  if (item.type === "imageGeneration" && itemId && item.status === "completed"
+    && !state.artifactBaseline?.has(itemId)) {
+    state.imageGenerations ??= new Map();
+    state.imageGenerations.set(itemId, {
+      id: itemId,
+      ...(typeof item.savedPath === "string" ? { savedPath: item.savedPath } : {}),
+      ...(typeof item.result === "string" ? { result: item.result } : {}),
+    });
   }
   if (item.type === "reasoning" && Array.isArray(item.summary)) {
     const text = bounded(item.summary.filter((part): part is string => typeof part === "string").join("\n\n"));
@@ -134,6 +185,17 @@ export function applyTurnItems(turn: Record<string, unknown>, state: TurnState, 
   for (const rawItem of turn.items) {
     const item = object(rawItem);
     if (item) applyCompletedItem(item, state, emit);
+  }
+}
+
+/** Active resumes can contain partial text, but completed native images are stable items. */
+export function applyResumedImages(turn: Record<string, unknown>, state: TurnState): void {
+  if (!Array.isArray(turn.items)) return;
+  for (const raw of turn.items) {
+    const item = object(raw);
+    if (item?.type === "imageGeneration" && item.status === "completed") {
+      applyCompletedItem(item, state, () => undefined);
+    }
   }
 }
 
@@ -167,10 +229,8 @@ export function findCorrelatedTurn(resumeResult: unknown, turnId: string | undef
 }
 
 export function terminalResult(turn: Record<string, unknown>, state: TurnState): SemanticMessage | undefined {
-  if (turn.status === "inProgress") return undefined;
-  if (turn.status === "completed" && state.finalText !== undefined) return { type: "completed", text: state.finalText };
-  if (turn.status === "interrupted") throw new RouterError("interrupted", "The Codex turn was interrupted.");
-  throw new RouterError("turn_failed", "The Codex turn failed before producing a final response.");
+  const outcome = terminalOutcome(turn, state);
+  return outcome ? textResult(outcome) : undefined;
 }
 
 export function acceptedTurnId(result: unknown, operation: "turn/start" | "thread/resume"): string {

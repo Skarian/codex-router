@@ -140,3 +140,23 @@ test("JsonRpcClient bounds the initialized notification write", async () => {
     ["initialize", "initialized"],
   );
 });
+
+test("initialization retains host metadata without exposing unrelated fields", async () => {
+  const transport = new FakeTransport();
+  const client = new JsonRpcClient(transport);
+  const pending = client.initialize();
+  transport.receive({ id: 1, result: { codexHome: "/codex", platformFamily: "unix", platformOs: "linux", userAgent: "codex/test", ignored: "value" } });
+  await pending;
+  assert.deepEqual(client.serverInfo, { codexHome: "/codex", platformFamily: "unix", platformOs: "linux", userAgent: "codex/test" });
+});
+
+test("RPC rejection preserves code and structured data without marking rejection ambiguous", async () => {
+  const { RpcRequestError } = await import("../src/json-rpc.js");
+  const transport = new FakeTransport();
+  const client = new JsonRpcClient(transport);
+  client.markTurnAccepted();
+  const pending = client.request("turn/steer", {});
+  transport.receive({ id: 1, error: { code: -32602, message: "no active turn", data: { expectedTurnId: "old" } } });
+  await assert.rejects(pending, (error: unknown) => error instanceof RpcRequestError && !error.ambiguous
+    && error.payload.code === -32602 && (error.payload.data as { expectedTurnId: string }).expectedTurnId === "old");
+});
