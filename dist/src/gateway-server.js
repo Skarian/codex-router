@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { secretEqual } from "./gateway.js";
+import { Gateway, secretEqual } from "./gateway.js";
 const BODY_LIMIT = 256 * 1024;
 class HttpFailure extends Error {
     status;
@@ -34,7 +34,7 @@ async function body(request) {
         const end = () => {
             cleanup();
             try {
-                resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+                resolve(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
             }
             catch {
                 reject(new HttpFailure(400));
@@ -87,7 +87,24 @@ async function handle(gateway, request, response) {
         throw new HttpFailure(413);
     if (webhook && !gateway.ready)
         throw new HttpFailure(503);
-    const value = await body(request);
+    const raw = await body(request);
+    if (callback) {
+        const state = gateway.callbackState(account, callback[2], callback[3]);
+        if (state === "stale") {
+            response.writeHead(204);
+            response.end();
+            return;
+        }
+        if (state === "unauthorized")
+            throw new HttpFailure(401);
+    }
+    let value;
+    try {
+        value = JSON.parse(raw);
+    }
+    catch {
+        throw new HttpFailure(400);
+    }
     if (webhook) {
         let message;
         try {
@@ -124,5 +141,37 @@ export async function closeGatewayServer(server) {
         server.close((error) => error ? reject(error) : resolve());
         server.closeAllConnections();
     });
+}
+export async function runGateway(config, signal) {
+    const { sendblueConnectors } = await import("./sendblue.js");
+    const { GatewayStore } = await import("./gateway-state.js");
+    const { GatewayFilePlane } = await import("./gateway-files.js");
+    const connectors = sendblueConnectors(config);
+    const store = await GatewayStore.open(config.stateDir);
+    const gateway = new Gateway(config, store, { connector: (id) => connectors.get(id), files: new GatewayFilePlane(config.stateDir) });
+    const server = createGatewayServer(gateway);
+    try {
+        signal.throwIfAborted();
+        await listenGateway(server, config.listenPort);
+        await gateway.start();
+        await new Promise((resolve, reject) => {
+            const stop = () => { server.removeListener("error", fail); resolve(); };
+            const fail = (error) => { signal.removeEventListener("abort", stop); reject(error); };
+            server.once("error", fail);
+            if (signal.aborted)
+                stop();
+            else
+                signal.addEventListener("abort", stop, { once: true });
+        });
+    }
+    finally {
+        gateway.ready = false;
+        try {
+            await Promise.all([server.listening ? closeGatewayServer(server) : undefined, gateway.close()]);
+        }
+        finally {
+            await store.close();
+        }
+    }
 }
 //# sourceMappingURL=gateway-server.js.map

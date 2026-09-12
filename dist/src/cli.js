@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
 import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
+import { runGateway } from "./gateway-server.js";
 import { runDoctor } from "./doctor.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
 import { cancelTurn, sendTurn } from "./turn-session.js";
@@ -103,6 +104,24 @@ async function main() {
     const [first, second, third] = parsed.command;
     try {
         const config = await loadConfig(parsed.configPath);
+        if (first === "gateway" && second === undefined && !parsed.stdin && !parsed.stream && !parsed.json) {
+            if (!config.gateway)
+                throw new RouterError("config_invalid", "The gateway configuration is missing.");
+            const abort = new AbortController();
+            activeAbortController = abort;
+            const stop = () => abort.abort();
+            process.once("SIGINT", stop);
+            process.once("SIGTERM", stop);
+            try {
+                await runGateway(config.gateway, abort.signal);
+            }
+            finally {
+                process.removeListener("SIGINT", stop);
+                process.removeListener("SIGTERM", stop);
+                activeAbortController = undefined;
+            }
+            return;
+        }
         if (first === "gateway" && (second === "status" || second === "resolve") && !parsed.stdin && !parsed.stream) {
             const [, , routeId, effectId, resolution, handle, extra] = parsed.command;
             if ((second === "status" && third !== undefined) || (second === "resolve" &&

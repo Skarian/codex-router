@@ -4,7 +4,7 @@ import { Gateway, secretEqual } from "./gateway.js";
 const BODY_LIMIT = 256 * 1024;
 class HttpFailure extends Error { constructor(readonly status: number) { super(); } }
 
-async function body(request: IncomingMessage): Promise<unknown> {
+async function body(request: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let bytes = 0;
@@ -22,7 +22,7 @@ async function body(request: IncomingMessage): Promise<unknown> {
     };
     const end = () => {
       cleanup();
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
+      try { resolve(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))); }
       catch { reject(new HttpFailure(400)); }
     };
     request.on("data", data); request.once("end", end); request.once("error", error); request.once("aborted", aborted);
@@ -63,7 +63,14 @@ async function handle(gateway: Gateway, request: IncomingMessage, response: Serv
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers["content-type"] ?? "")) throw new HttpFailure(415);
   if (Number(request.headers["content-length"] ?? 0) > BODY_LIMIT) throw new HttpFailure(413);
   if (webhook && !gateway.ready) throw new HttpFailure(503);
-  const value = await body(request);
+  const raw = await body(request);
+  if (callback) {
+    const state = gateway.callbackState(account, callback[2]!, callback[3]!);
+    if (state === "stale") { response.writeHead(204); response.end(); return; }
+    if (state === "unauthorized") throw new HttpFailure(401);
+  }
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new HttpFailure(400); }
   if (webhook) {
     let message;
     try { message = connector.inbound(value); } catch { throw new HttpFailure(400); }
@@ -88,4 +95,29 @@ export async function closeGatewayServer(server: Server): Promise<void> {
     server.close((error) => error ? reject(error) : resolve());
     server.closeAllConnections();
   });
+}
+
+export async function runGateway(config: import("./config.js").GatewayConfig, signal: AbortSignal): Promise<void> {
+  const { sendblueConnectors } = await import("./sendblue.js");
+  const { GatewayStore } = await import("./gateway-state.js");
+  const { GatewayFilePlane } = await import("./gateway-files.js");
+  const connectors = sendblueConnectors(config);
+  const store = await GatewayStore.open(config.stateDir);
+  const gateway = new Gateway(config, store, { connector: (id) => connectors.get(id)!, files: new GatewayFilePlane(config.stateDir) });
+  const server = createGatewayServer(gateway);
+  try {
+    signal.throwIfAborted();
+    await listenGateway(server, config.listenPort);
+    await gateway.start();
+    await new Promise<void>((resolve, reject) => {
+      const stop = () => { server.removeListener("error", fail); resolve(); };
+      const fail = (error: Error) => { signal.removeEventListener("abort", stop); reject(error); };
+      server.once("error", fail);
+      if (signal.aborted) stop(); else signal.addEventListener("abort", stop, { once: true });
+    });
+  } finally {
+    gateway.ready = false;
+    try { await Promise.all([server.listening ? closeGatewayServer(server) : undefined, gateway.close()]); }
+    finally { await store.close(); }
+  }
 }

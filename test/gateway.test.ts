@@ -44,6 +44,7 @@ class FakeSession implements GatewaySession {
   restores: unknown[] = [];
   finish!: (outcome: TurnOutcome) => void;
   private done = new Promise<TurnOutcome>((resolve) => { this.finish = resolve; });
+  async filesystem() { return {}; }
   async resume() { return { thread: { status: { type: "idle" }, turns: [] } }; }
   async admit(input: unknown, intent: unknown) { this.admissions.push({ input, intent }); return "owned"; }
   steer(input: unknown, intent: unknown) { return this.admit(input, intent); }
@@ -292,6 +293,7 @@ test("HTTP authenticates before parsing and provides exact status and health res
     assert.equal((await fetch(`${url}/webhooks/sendblue/account`)).status, 405);
     assert.equal((await post("/webhooks/sendblue/account", "x".repeat(256 * 1024 + 1), auth)).status, 413);
     assert.equal((await fetch(`${url}/readyz`)).status, 200);
+    assert.equal((await post("/callbacks/sendblue/account/stale/token", "broken", auth)).status, 204);
   } finally { await closeGatewayServer(server); await f.close(); }
 });
 
@@ -422,4 +424,67 @@ test("a negative callback selects settlement before a delayed snapshot and preve
     await new Promise((resolve) => setTimeout(resolve, 70)); assert.equal(calls, 1);
     block = false; release(); await callback; await f.gateway.idle(); assert.equal(calls, 1);
   } finally { block = false; release?.(); await f.close(); }
+});
+
+test("remote cleanup cannot delay a response after its delivery snapshot is durable", async () => {
+  const f = await fixture(); let finishCleanup!: () => void;
+  const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
+  f.files.release = async (_route, active) => { if (active.kind === "codex") await cleanup; };
+  try {
+    await f.gateway.start(); await f.receive("one"); f.advance(5000); await f.gateway.idle();
+    f.session.finish({ turnId: "owned", status: "completed", finalText: "ready", imageGenerations: [] });
+    await until(() => f.sends.length === 1); await f.gateway.idle();
+    assert.equal(f.store.snapshot().routes.route!.active, undefined);
+    assert.equal(f.gateway.ready, true);
+  } finally { finishCleanup(); await f.close(); }
+});
+
+test("foreground gateway serves health, ignores unmatched traffic, and releases its lock on shutdown", async () => {
+  const { runGateway } = await import("../src/gateway-server.js");
+  const { createServer } = await import("node:net");
+  const directory = await mkdtemp(join(tmpdir(), "gateway-runner-"));
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const port = (probe.address() as { port: number }).port;
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const config = configuration(directory); config.listenPort = port;
+  const previous = [process.env.KEY, process.env.SECRET, process.env.SIGNING];
+  process.env.KEY = "fixture-key"; process.env.SECRET = "fixture-secret"; process.env.SIGNING = "fixture-signing";
+  const abort = new AbortController();
+  const running = runGateway(config, abort.signal);
+  let failure: unknown;
+  void running.catch((error) => { failure = error; });
+  try {
+    let ready = false;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (failure) throw failure;
+      try { ready = (await fetch(`http://127.0.0.1:${port}/readyz`)).ok; } catch { /* Wait for bind. */ }
+      if (ready) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(ready, true);
+    assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/healthz`)).json(), { ok: true });
+    await assert.rejects(GatewayStore.open(directory), (error: unknown) => error instanceof RouterError && error.code === "gateway_running");
+    const response = await fetch(`http://127.0.0.1:${port}/webhooks/sendblue/account`, { method: "POST", headers: { "content-type": "application/json", "sb-signing-secret": "fixture-signing" }, body: JSON.stringify({ is_outbound: true }) });
+    assert.equal(response.status, 204);
+  } finally {
+    abort.abort(); await running;
+    for (const [index, name] of ["KEY", "SECRET", "SIGNING"].entries()) { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; }
+    const store = await GatewayStore.open(directory); await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("shutdown during the sending snapshot starts no provider request", async () => {
+  let hold = false; let release!: () => void; let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  const f = await fixture(async () => { if (hold) { hold = false; entered(); await new Promise<void>((resolve) => { release = resolve; }); } });
+  try {
+    await f.gateway.start(); await f.gateway.idle();
+    await f.store.transaction((state) => { state.routes.route!.active = delivery(); });
+    hold = true; f.gateway.wake("route"); await enteredPromise;
+    const closing = f.gateway.close(); release(); await closing;
+    assert.equal(f.sends.length, 0);
+    assert.equal(unresolved(f.store.snapshot()).unresolved.length, 1);
+  } finally { await f.close(); }
 });
