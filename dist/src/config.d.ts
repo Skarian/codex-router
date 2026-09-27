@@ -17,9 +17,12 @@ export declare function loadConfig(path: string): Promise<RouterConfig>;
 export declare function findAgent(config: RouterConfig, id: string): AgentConfig;
 export interface SendblueConfig {
     id: string;
-    apiKeyIdEnv: string;
-    apiSecretKeyEnv: string;
-    webhookSecretEnv: string;
+    apiKeyId?: string | undefined;
+    apiSecretKey?: string | undefined;
+    webhookSecret?: string | undefined;
+    apiKeyIdEnv?: string | undefined;
+    apiSecretKeyEnv?: string | undefined;
+    webhookSecretEnv?: string | undefined;
 }
 export interface GatewayRoute {
     id: string;

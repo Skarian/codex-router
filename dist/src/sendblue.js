@@ -178,15 +178,21 @@ export class Sendblue {
             ...(state === "start" ? { max_duration_ms: 300000 } : {}) }), signal, this.operations.requestTimeoutMs ?? 60000);
     }
 }
-export function sendblueConnectors(config, env = process.env) {
-    const secret = (name) => {
-        const value = env[name];
-        if (!value || /[\r\n]/.test(value))
-            throw new RouterError("config_invalid", `The gateway secret variable ${name} is missing or invalid.`);
-        return value;
+export function sendblueCredentials(account, env = process.env) {
+    const secret = (value, name) => {
+        const resolved = value ?? (name === undefined ? undefined : env[name]);
+        if (!resolved?.trim() || /[\r\n]/.test(resolved)) {
+            throw new RouterError("config_invalid", "A gateway credential is missing or invalid.");
+        }
+        return resolved;
     };
-    return new Map(config.sendblue.map((account) => [account.id, new Sendblue({
-            apiKeyId: secret(account.apiKeyIdEnv), apiSecretKey: secret(account.apiSecretKeyEnv), signingSecret: secret(account.webhookSecretEnv),
-        })]));
+    return {
+        apiKeyId: secret(account.apiKeyId, account.apiKeyIdEnv),
+        apiSecretKey: secret(account.apiSecretKey, account.apiSecretKeyEnv),
+        signingSecret: secret(account.webhookSecret, account.webhookSecretEnv),
+    };
+}
+export function sendblueConnectors(config, env = process.env) {
+    return new Map(config.sendblue.map((account) => [account.id, new Sendblue(sendblueCredentials(account, env))]));
 }
 //# sourceMappingURL=sendblue.js.map

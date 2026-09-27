@@ -123,9 +123,12 @@ export function findAgent(config: RouterConfig, id: string): AgentConfig {
 
 export interface SendblueConfig {
   id: string;
-  apiKeyIdEnv: string;
-  apiSecretKeyEnv: string;
-  webhookSecretEnv: string;
+  apiKeyId?: string | undefined;
+  apiSecretKey?: string | undefined;
+  webhookSecret?: string | undefined;
+  apiKeyIdEnv?: string | undefined;
+  apiSecretKeyEnv?: string | undefined;
+  webhookSecretEnv?: string | undefined;
 }
 
 export interface GatewayRoute {
@@ -184,11 +187,22 @@ function parseGateway(value: unknown, agents: AgentConfig[]): GatewayConfig {
   if (!isAbsolute(stateDir)) invalid();
   const accounts = new Set<string>();
   const sendblue = entries(record.sendblue).map((entry) => {
-    fields(entry, ["id", "api_key_id_env", "api_secret_key_env", "webhook_secret_env"]);
+    fields(entry, ["id", "api_key_id", "api_secret_key", "webhook_secret", "api_key_id_env", "api_secret_key_env", "webhook_secret_env"]);
+    for (const key of ["api_key_id", "api_secret_key", "webhook_secret"]) {
+      if ((entry[key] !== undefined) === (entry[`${key}_env`] !== undefined)) invalid();
+      if (entry[key] !== undefined && /[\r\n]/.test(requiredString(entry, key, "Gateway"))) invalid();
+    }
     const accountId = id(entry, "id");
     if (accounts.has(accountId)) invalid();
     accounts.add(accountId);
-    return { id: accountId, apiKeyIdEnv: env(entry, "api_key_id_env"), apiSecretKeyEnv: env(entry, "api_secret_key_env"), webhookSecretEnv: env(entry, "webhook_secret_env") };
+    return { id: accountId,
+      apiKeyId: entry.api_key_id as string | undefined,
+      apiSecretKey: entry.api_secret_key as string | undefined,
+      webhookSecret: entry.webhook_secret as string | undefined,
+      apiKeyIdEnv: entry.api_key_id_env === undefined ? undefined : env(entry, "api_key_id_env"),
+      apiSecretKeyEnv: entry.api_secret_key_env === undefined ? undefined : env(entry, "api_secret_key_env"),
+      webhookSecretEnv: entry.webhook_secret_env === undefined ? undefined : env(entry, "webhook_secret_env"),
+    };
   });
   const routeIds = new Set<string>();
   const conversations = new Set<string>();

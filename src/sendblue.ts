@@ -1,5 +1,5 @@
 import { openAsBlob } from "node:fs";
-import type { GatewayConfig, GatewayRoute } from "./config.js";
+import type { GatewayConfig, GatewayRoute, SendblueConfig } from "./config.js";
 import { delay, type GatewayConnector, type IncomingMessage, type SendOutcome, type StatusCallback } from "./gateway.js";
 import type { DeliveryPart } from "./gateway-state.js";
 import { RouterError } from "./errors.js";
@@ -132,13 +132,21 @@ export class Sendblue implements GatewayConnector {
   }
 }
 
-export function sendblueConnectors(config: GatewayConfig, env: NodeJS.ProcessEnv = process.env): Map<string, Sendblue> {
-  const secret = (name: string) => {
-    const value = env[name];
-    if (!value || /[\r\n]/.test(value)) throw new RouterError("config_invalid", `The gateway secret variable ${name} is missing or invalid.`);
-    return value;
+export function sendblueCredentials(account: SendblueConfig, env: NodeJS.ProcessEnv = process.env): Credentials {
+  const secret = (value: string | undefined, name: string | undefined): string => {
+    const resolved = value ?? (name === undefined ? undefined : env[name]);
+    if (!resolved?.trim() || /[\r\n]/.test(resolved)) {
+      throw new RouterError("config_invalid", "A gateway credential is missing or invalid.");
+    }
+    return resolved;
   };
-  return new Map(config.sendblue.map((account) => [account.id, new Sendblue({
-    apiKeyId: secret(account.apiKeyIdEnv), apiSecretKey: secret(account.apiSecretKeyEnv), signingSecret: secret(account.webhookSecretEnv),
-  })]));
+  return {
+    apiKeyId: secret(account.apiKeyId, account.apiKeyIdEnv),
+    apiSecretKey: secret(account.apiSecretKey, account.apiSecretKeyEnv),
+    signingSecret: secret(account.webhookSecret, account.webhookSecretEnv),
+  };
+}
+
+export function sendblueConnectors(config: GatewayConfig, env: NodeJS.ProcessEnv = process.env): Map<string, Sendblue> {
+  return new Map(config.sendblue.map((account) => [account.id, new Sendblue(sendblueCredentials(account, env))]));
 }

@@ -17,9 +17,9 @@ state_dir = "/home/user/.codex-router/gateway"
 
 [[gateway.sendblue]]
 id = "personal"
-api_key_id_env = "SENDBLUE_API_KEY_ID"
-api_secret_key_env = "SENDBLUE_API_SECRET_KEY"
-webhook_secret_env = "SENDBLUE_WEBHOOK_SECRET"
+api_key_id = "REPLACE_WITH_SENDBLUE_API_KEY_ID"
+api_secret_key = "REPLACE_WITH_SENDBLUE_API_SECRET_KEY"
+webhook_secret = "REPLACE_WITH_SENDBLUE_WEBHOOK_SIGNING_SECRET"
 
 [[gateway.routes]]
 id = "home-messages"
@@ -31,7 +31,11 @@ agent = "home"
 
 Use your registered Sendblue line for `sendblue_number`. Use your own messaging number for `sender`. Both numbers must use E.164 format, including `+` and the country code.
 
-Set the three secret variables in the gateway process environment. Store variable names in TOML, never secret values. Use the signing secret configured in your Sendblue account.
+Replace the three credential placeholders with your Sendblue values. Use the signing secret configured in your Sendblue account.
+Set owner-only permissions with `chmod 600 ~/.codex-router.toml`.
+
+Environment variables remain supported. To use one, replace its direct field with the corresponding `_env` field, such as `api_key_id_env = "SENDBLUE_API_KEY_ID"`.
+Set exactly one source for each credential. The router does not load a separate credentials file.
 
 Run the gateway:
 

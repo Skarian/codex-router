@@ -218,8 +218,9 @@ once to owned stdio. It does not delete the socket or start a local daemon.
 See [Gateway setup and recovery](gateway.md) for the ordinary message flow and deployment steps.
 
 `gateway` runs in the foreground. It does not accept `--json`, `--stream`, or `--stdin`.
-Secret values are read at gateway startup. Other commands validate the gateway tables without requiring credentials.
-Doctor reports whether secret variables are present, without contacting Sendblue or printing their values.
+Direct credentials are read from TOML. Environment references are resolved at gateway startup.
+Other commands validate the gateway tables without resolving environment references.
+Doctor reports whether credentials are present, without contacting Sendblue or printing their values.
 
 `gateway status` and `gateway resolve` require the gateway to be stopped. Both commands acquire the state lock.
 They fail with `gateway_running` while another process owns it.
@@ -242,8 +243,11 @@ Unknown or already resolved identities fail with `effect_not_found`. No retry co
 | Table | Fields |
 | --- | --- |
 | `gateway` | Required `listen_port`, `public_url`; optional `state_dir` |
-| `gateway.sendblue` | Required `id`, `api_key_id_env`, `api_secret_key_env`, `webhook_secret_env` |
+| `gateway.sendblue` | Required `id`; each credential uses `api_key_id`, `api_secret_key`, or `webhook_secret`, or its corresponding `_env` field |
 | `gateway.routes` | Required `id`, `sendblue`, `sender`, `sendblue_number`, `agent` |
+
+Set exactly one direct value or environment reference for each credential. Empty values and line breaks are rejected.
+Keep configs with direct credentials owner-only (`chmod 600`).
 
 At least one account and route are required. Unknown gateway fields are rejected.
 IDs use lowercase slugs that start with a letter. Environment-variable names use letters, digits, and underscores, without an initial digit.

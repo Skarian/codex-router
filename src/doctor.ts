@@ -1,3 +1,4 @@
+import { sendblueCredentials } from "./sendblue.js";
 import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { promisify } from "node:util";
@@ -87,9 +88,10 @@ export async function runDoctor(config: RouterConfig): Promise<DoctorCheck[]> {
   if (config.gateway) {
     checks.push({ name: "gateway:config", ok: true, text: "Gateway routes and connector references are valid." });
     for (const account of config.gateway.sendblue) {
-      const present = [account.apiKeyIdEnv, account.apiSecretKeyEnv, account.webhookSecretEnv].every((name) => Boolean(process.env[name]));
-      checks.push({ name: `gateway:${account.id}:environment`, ok: present,
-        text: present ? "Gateway secret variables are present. Credentials were not tested." : "One or more gateway secret variables are missing." });
+      let present = true;
+      try { sendblueCredentials(account); } catch { present = false; }
+      checks.push({ name: `gateway:${account.id}:credentials`, ok: present,
+        text: present ? "Gateway credentials are present. Credentials were not tested." : "One or more gateway credentials are missing or invalid." });
     }
   }
   const localAgents = config.agents.filter(({ sshHost }) => sshHost === undefined);

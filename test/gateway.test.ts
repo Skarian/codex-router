@@ -8,6 +8,7 @@ import { Gateway, type GatewayConnector, type GatewayFiles, type GatewaySession,
 import { GatewayStore, bindRoutes, resolveEffect, unresolved, type Delivery, type GatewayState } from "../src/gateway-state.js";
 import { createGatewayServer, listenGateway, closeGatewayServer } from "../src/gateway-server.js";
 import type { TurnOutcome } from "../src/turn-state.js";
+import { sendblueCredentials, sendblueConnectors } from "../src/sendblue.js";
 import { RouterError } from "../src/errors.js";
 
 function configSource(directory: string): string {
@@ -507,4 +508,35 @@ test("a stalled request receives 408 before its socket closes", async () => {
     assert.match(response, /connection: close/i);
     assert.equal(f.store.snapshot().routes.route!.seenMessages.length, 0);
   } finally { await closeGatewayServer(server); await f.close(); }
+});
+
+
+test("Sendblue credentials support direct, environment, and mixed configuration", () => {
+  const source = configSource("/tmp/state");
+  const direct = source.replace('api_key_id_env="KEY"', 'api_key_id="direct-key"')
+    .replace('api_secret_key_env="SECRET"', 'api_secret_key="direct-secret"')
+    .replace('webhook_secret_env="SIGNING"', 'webhook_secret="direct-signing"');
+  const config = parseConfig(direct).gateway!;
+  assert.deepEqual(sendblueCredentials(config.sendblue[0]!, {}), {
+    apiKeyId: "direct-key", apiSecretKey: "direct-secret", signingSecret: "direct-signing",
+  });
+  assert.equal(sendblueConnectors(config, {}).get("account")!.signingSecret, "direct-signing");
+  const env = { KEY: "env-key", SECRET: "env-secret", SIGNING: "env-signing" };
+  assert.deepEqual(sendblueCredentials(parseConfig(source).gateway!.sendblue[0]!, env), {
+    apiKeyId: "env-key", apiSecretKey: "env-secret", signingSecret: "env-signing",
+  });
+  const mixed = parseConfig(direct.replace('api_secret_key="direct-secret"', 'api_secret_key_env="SECRET"')).gateway!;
+  assert.equal(sendblueCredentials(mixed.sendblue[0]!, env).apiSecretKey, "env-secret");
+  for (const key of ["api_key_id", "api_secret_key", "webhook_secret"]) {
+    for (const value of ['""', '42', '"secret\\nvalue"']) {
+      const invalid = direct.replace(new RegExp(key + '=\"[^\"]*\"'), key + '=' + value);
+      assert.throws(() => parseConfig(invalid), (error: unknown) =>
+        error instanceof RouterError && error.code === "config_invalid" && !error.message.includes("secret\nvalue"));
+    }
+    assert.throws(() => parseConfig(direct.replace(`${key}=`, `${key}_env="KEY"\n${key}=`)));
+    assert.throws(() => parseConfig(direct.replace(new RegExp(key + '=\"[^\"]*\"'), '')));
+  }
+  assert.throws(() => sendblueCredentials(parseConfig(source).gateway!.sendblue[0]!, {}));
+  assert.throws(() => sendblueCredentials(parseConfig(source).gateway!.sendblue[0]!, { ...env, SECRET: "private\nvalue" }),
+    (error: unknown) => error instanceof RouterError && !error.message.includes("private"));
 });
