@@ -32,7 +32,7 @@ The [npm package file rules](https://docs.npmjs.com/cli/v11/configuring-npm/pack
 Install the generated archive in a temporary global prefix:
 
 ```sh
-npm install --global --prefix /absolute/path/to/test-prefix ./skarian-codex-router-0.1.0.tgz
+npm install --global --prefix /absolute/path/to/test-prefix ./skarian-codex-router-0.0.1.tgz
 ```
 
 Use the archive name for the selected version.
@@ -68,13 +68,26 @@ GitHub Actions use exact commit hashes. Node and npm use exact versions.
 
 ## Release a version
 
-Start from a clean main checkout:
+Publish only when the repository owner explicitly requests a versioned release.
+Do not create or push release tags as part of routine commits, fixes, or merges.
+Main pushes, pull requests, and manual workflow runs only verify the package.
+
+Use [Semantic Versioning](https://semver.org/). During `0.x` development, use patch releases for compatible fixes and additions.
+Use a minor release for breaking changes. At `1.0.0`, commit to a stable public interface.
+After that, use patch for compatible fixes, minor for compatible features, and major for breaking changes.
+The public interface includes CLI commands, configuration, and connector API contracts.
+
+The original manual publication was `0.1.0`. The owner requested `0.0.1` as the release baseline.
+The existing `0.1.0` remains published. Future releases must use unused versions.
+
+After release approval, start from a clean main checkout:
 
 ```sh
 git switch main
 git pull --ff-only
 npm version patch
-git push origin main --follow-tags
+git push origin main
+git push origin "v$(node -p 'require("./package.json").version')"
 ```
 
 Use `minor` or `major` for a larger release.
@@ -93,7 +106,7 @@ npm view @skarian/codex-router version
 Users can pin a release explicitly:
 
 ```sh
-npm install --global @skarian/codex-router@0.1.0
+npm install --global @skarian/codex-router@0.0.1
 ```
 
 Do not move a published release tag or reuse an npm version.

@@ -1,6 +1,6 @@
 {
   "name": "@skarian/codex-router",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Route messages to Codex chats through the CLI, SendBlue, or HTTPS with SSE.",
   "type": "module",
   "bin": {
