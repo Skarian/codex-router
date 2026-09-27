@@ -1,111 +1,126 @@
 # Codex Router
 
-Codex Router sends text to existing Codex tasks from the command line. Add a
-short local name for each task, then send instructions from shells, scripts,
-voice workflows, or other clients.
+Codex Router connects shells, messaging apps, and HTTPS clients to existing Codex chats.
+Give each chat a local name, then send messages through the CLI or the gateway.
 
-```sh
-echo 'Turn off the living room light.' |
-  codex-router send home --stdin --json
-```
+| Interface | Input and output |
+| --- | --- |
+| CLI | Text input, final replies, or completed messages as JSON Lines |
+| SendBlue | Text, images, and files through a configured messaging line |
+| HTTPS | Text requests, retained results, and completed commentary through SSE |
 
-```json
-{"type":"completed","text":"The living room light is off."}
-```
+Follow-ups steer an active turn. Idle chats start a new turn.
+The gateway saves accepted input and pending responses across restarts.
 
 ## Install
 
-Codex Router requires Node.js 20.17–20.x or 22.9 and newer and an authenticated Codex CLI.
+Requires Node.js 20.17–20.x or 22.9 and newer.
 
 ```sh
-npm install --global git+https://github.com/Skarian/codex-router.git
+npm install --global @skarian/codex-router
 ```
 
-## Configure
+The command name is `codex-router`. The unscoped npm package `codex-router` is a different project.
 
-Create the `~/.codex-router` directory, then create `~/.codex-router/config.toml`:
+Use an authenticated Codex installation on each execution host.
+Local chats can use the Codex Desktop app on macOS or Windows.
+Without a Desktop owner, the router needs an authenticated `codex` executable on `PATH`.
+Linux servers use the CLI and app-server path.
+
+For SSH agents, install standalone Codex on the remote host. Its daemon commands must work through noninteractive SSH.
+See [SSH configuration](docs/cli-reference.md#configuration) for the installation and connection requirements.
+
+## Configure a chat
+
+Create `~/.codex-router/config.toml`. On Windows, this is `%USERPROFILE%\.codex-router\config.toml`.
 
 ```toml
 [[agents]]
 id = "home"
 label = "Home Assistant"
-cwd = "/home/user/projects/home-assistant"
-thread_id = "019..."
-model = "gpt-5.3-codex-spark"
-reasoning = "medium"
+cwd = "/absolute/path/to/project"
+thread_id = "REPLACE_WITH_EXISTING_CHAT_ID"
+model = "REPLACE_WITH_AVAILABLE_MODEL"
 ```
 
-`id`, `label`, `cwd`, `thread_id`, and `model` are required. `reasoning` is
-optional; Codex uses the model's default effort when you leave it out.
+Replace the directory, chat ID, and model with values from your Codex host.
+For a Desktop chat link such as `codex://threads/019...`, use only the ID after `/threads/`.
+On Windows, use a TOML literal string for paths, such as `cwd = 'C:\projects\home'`.
 
-To run an assistant on another machine, keep its complete configuration in
-this file and add an SSH host:
+The router uses existing chats. It does not create a chat from an agent name.
+`id` and `label` are your local names. Optional `reasoning` sets the model effort.
+Add `ssh_host = "my-server"` to an agent table to execute on an SSH host.
 
-```toml
-[[agents]]
-id = "server"
-label = "Server Assistant"
-ssh_host = "my-server"
-cwd = "/home/user/projects/server"
-thread_id = "019..."
-model = "gpt-5.3-codex-spark"
-```
-
-The SSH host uses your existing OpenSSH configuration. The remote machine must
-have an authenticated Codex standalone installation available as `codex` to
-noninteractive SSH sessions. Package-manager-only Codex installations do not
-provide the durable app-server lifecycle required by SSH agents.
-
-Each send resumes the configured task in its configured directory. Turns run
-with full access and approvals disabled.
-
-## Use
+## Use the CLI
 
 ```sh
 codex-router agents list
 codex-router doctor
 
 echo 'What is the thermostat set to?' |
-  codex-router send home --stdin
+  codex-router send home --stdin --json
 
 codex-router cancel home
 ```
 
-Use `--json` for one final JSON object. Use `--stream` for completed reasoning,
-commentary, and final messages as JSON Lines.
+`--json` returns one final JSON object. `--stream` returns completed reasoning, commentary, and final messages as JSON Lines.
+It does not stream individual tokens.
 
-When the task is idle, `send` starts a turn. When it is already active, `send`
-steers that turn and waits for its shared final response. `cancel` explicitly
-requests interruption of the active turn and is a successful no-op when idle.
+Local requests first look for the Desktop owner, then use an app-server connection.
+SSH requests use a persistent remote app-server. Recovery follows the accepted turn without resending uncertain input.
 
-Locally, Codex Router connects to an existing control socket when available and
-otherwise owns an app-server for the command. If a local socket is stale and
-cannot be connected, it falls back once to an owned app-server without deleting
-the socket or starting a local daemon. For SSH agents, the router always
-uses a persistent remote app-server: the first send starts the supported Codex
-daemon when needed, then connects through `codex app-server proxy`. The router
-does not install or update Codex, enable remote control, or stop the daemon.
+Desktop-owned turns retain Desktop tools and permissions. Direct app-server turns use full access with approvals disabled.
+`doctor` checks the CLI/app-server path and credential presence. It does not validate SendBlue credentials or fully diagnose Desktop IPC.
 
-SSH proxy connections use protocol keepalives. If a proxy connection drops
-during a turn, the router reconnects to the same running app-server, resumes
-the task, and continues waiting for that exact turn. The router does not impose
-a maximum turn duration; it waits and reconnects until Codex finishes or the
-caller interrupts the command.
+See the [CLI reference](docs/cli-reference.md) for commands, configuration, output, and errors.
 
-See [CLI reference](docs/cli-reference.md) for commands, output shapes, exit
-codes, and failure codes.
+## Run the gateway
 
-## Messaging gateway
+Choose a connector and add its configuration:
 
-Use the Sendblue gateway to message a configured task with text, images, and files.
-The gateway saves accepted input and pending responses across restarts.
+- [SendBlue setup](docs/sendblue.md): API credentials, phone numbers, polling, attachments, and troubleshooting.
+- [HTTPS setup](docs/https.md): LAN TLS, bearer tokens, requests, retained results, and SSE.
+- [ESP32 example](examples/esp32-https/README.md): an HTTPS client with bounded parsing and reconnect support.
 
-See [Gateway setup and recovery](docs/gateway.md) for configuration and operation.
-Live provider validation remains required before release.
+```sh
+codex-router gateway
+```
+
+The gateway runs in the foreground. In another terminal, inspect its state:
+
+```sh
+codex-router gateway status --json
+```
+
+SendBlue polling needs outbound HTTPS only. It requires no public tunnel or inbound webhook.
+HTTPS can remain on your local network. Both connectors are optional.
+
+A route can accept both connectors for the same chat. They share Codex context, not a synchronized client transcript.
+Each source receives responses to its own submissions. Participating requests share the final response when they steer one active turn.
+
+See [gateway operation and recovery](docs/gateway.md) for process ownership, shutdown, and unresolved operations.
+See [release qualification](docs/release-qualification.md) for platform results and known limits.
+Desktop integration uses a private protocol that can change between Desktop releases.
 
 ## Develop
 
 ```sh
+git clone https://github.com/Skarian/codex-router.git
+cd codex-router
 npm ci
 npm test
+npm link
 ```
+
+`npm ci` builds the CLI through the `prepare` script. `npm link` installs the local `codex-router` command.
+After source edits, run `npm run build` or `npm test`.
+
+Git contains the source, tests, and documentation. It does not track `dist`.
+`npm pack` and `npm publish` build the compiled files for the npm package.
+Registry installations use those files without a TypeScript build.
+
+See [publishing](docs/publishing.md) for package verification and release commands.
+
+## License
+
+[MIT](LICENSE).

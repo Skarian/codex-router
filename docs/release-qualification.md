@@ -76,4 +76,21 @@ Gateway shutdown sends no explicit cancellation. Losing an owned stdio app-serve
 
 Process-crash recovery does not establish power-loss durability. Physical ESP32 TLS and firmware behavior remain unverified.
 
-Earlier Sendblue and connector probes are recorded in [historical connector verification](connector-verification.md). They are not fresh provider tests for this correction.
+## Earlier connector and stress evidence
+
+Earlier live SendBlue probes delivered text and images and completed read-receipt and typing API calls in poll mode.
+Those probes did not require a public receiver. They are not fresh provider tests for the final cleanup.
+
+A polling stress probe recovered 1,000 messages after a page failure. Restart and overlap replay produced one receipt per message.
+Another probe recovered a row skipped by mutable offset pagination during its first sweep.
+
+A retained-state stress probe stored 1,024 records within the 8 MiB record budget.
+New admission returned `429` at capacity, while matching retries remained available.
+These measurements are not throughput or process-memory guarantees.
+
+A Linux client reached the Mac LAN endpoint with verified TLS. Wrong tokens, untrusted certificates, and incorrect hostnames were rejected.
+The retired public Quick Tunnel buffered SSE. Native LAN TLS passed commentary, heartbeat, and reconnect probes.
+
+ESP32 host parser tests passed with AddressSanitizer and UndefinedBehaviorSanitizer.
+They covered byte splits, CRLF, reconnect, reset, duplicates, bounded input, and a 256 KiB result.
+Physical-device and ESP-IDF firmware qualification remain separate.

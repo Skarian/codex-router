@@ -2,7 +2,7 @@
 
 The gateway accepts text requests through HTTPS and returns completed commentary through SSE. Each request has a durable final result.
 
-Sendblue and HTTPS can share a configured Codex chat. Each source receives its own replies. The agent shares conversation context; clients do not receive a synchronized transcript or messages submitted elsewhere.
+SendBlue and HTTPS can share a configured Codex chat. Each source receives its own replies. The agent shares conversation context; clients do not receive a synchronized transcript or messages submitted elsewhere.
 
 ## Configuration
 
@@ -30,7 +30,7 @@ https = "device"
 
 The agent must already exist in the configuration. Use either `bearer_token` or `bearer_token_env`, never both. Protect direct tokens with owner-only file permissions. Each account needs a distinct token.
 
-To share a Sendblue route, add `https = "device"` to that route. Keep its existing Sendblue fields. HTTPS-only configurations need neither Sendblue credentials nor `public_url`.
+To share a SendBlue route, add `https = "device"` to that route. Keep its existing SendBlue fields. HTTPS-only configurations need neither SendBlue credentials nor `public_url`.
 
 Replace `192.168.1.50` with the gateway computer's private IPv4 address. Reserve that address in your DHCP configuration so clients retain a stable destination.
 
@@ -40,7 +40,7 @@ Clients must trust the certificate issuer. For a private CA, copy its **certific
 
 Without `listen_host`, the listener binds to `127.0.0.1`. Loopback permits HTTP for local tools. A nonloopback listener requires TLS and a specific private IPv4 address. Wildcard and public addresses are rejected. A tunnel or proxy is not required for LAN access.
 
-Binding selects a network interface; it does not replace a firewall. Permit access only from your intended LAN clients. Do not forward the port from your internet router. Sendblue polling uses outbound connections and does not need this listener to be publicly reachable.
+Binding selects a network interface; it does not replace a firewall. Permit access only from your intended LAN clients. Do not forward the port from your internet router. SendBlue polling uses outbound connections and does not need this listener to be publicly reachable.
 
 Verify the certificate and endpoint from a LAN client:
 
@@ -110,11 +110,11 @@ Terminal results and request identities remain available for 30 days. The respon
 
 Defaults are 1024 retained requests and a 8 MiB retained-record budget. Configure these with `max_requests` and `retained_bytes`. Pending requests reserve room for their largest permitted result, so the byte limit can reject admission before the count limit.
 
-Capacity rejection returns `429`. Existing duplicate lookups remain available at capacity. Pending and unresolved work never expires automatically. These limits do not bound Sendblue records or the entire process heap.
+Capacity rejection returns `429`. Existing duplicate lookups remain available at capacity. Pending and unresolved work never expires automatically. These limits do not bound SendBlue records or the entire process heap.
 
 SSE permits 32 streams globally and four per account. The replay budget is 2 MiB or 128 messages per request, with a 16 MiB global limit.
 
-A route processes one active turn. HTTPS follow-ups steer that turn without waiting for its response. This also applies when Sendblue or another client started the turn. Each participating HTTPS request retains the shared final response. Commentary after admission streams to each participating HTTPS request. Other Desktop or CLI users can also steer the shared conversation.
+A route processes one active turn. HTTPS follow-ups steer that turn without waiting for its response. This also applies when SendBlue or another client started the turn. Each participating HTTPS request retains the shared final response. Commentary after admission streams to each participating HTTPS request. Other Desktop or CLI users can also steer the shared conversation.
 
 ## Desktop commentary
 
@@ -122,7 +122,7 @@ Desktop commentary requires both an ordered snapshot after the admitted input an
 
 A running request can report `commentary.state` and its limitation reason. Commentary observation failure does not fail an otherwise valid final response. Direct and SSH sessions use native completed-item notifications.
 
-The macOS live probe passed before release qualification. Windows Desktop and unsupported history modes are not covered by that probe. A known silent disconnect after daemon termination remains a separate transport limitation.
+See [release qualification](release-qualification.md) for the macOS, Windows, and Linux results. Those results apply to the tested Desktop versions and history modes.
 
 ## ESP32 example
 

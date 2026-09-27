@@ -1,530 +1,109 @@
 # Gateway technical contracts
 
-Read [Gateway setup and recovery](gateway.md) for the ordinary message flow. This reference defines state, HTTP, and recovery contracts.
+This reference describes the implemented boundaries. Start with [gateway operation](gateway.md) for setup and recovery procedures.
+The [state schemas](https://github.com/Skarian/codex-router/blob/main/src/gateway-state.ts) define persisted records and validation.
 
-## 1. Detailed message contract
+## Sources and routes
 
-### Inbound events
+Each route binds source identities to one execution target: host, chat ID, and working directory.
+SendBlue identities include the account, sender, and receiving line. HTTPS identities include the account and route.
+Credentials do not enter these bindings.
 
-Polling uses the bounded recovery algorithm in [the local connector plan](sendblue-local-plan.md). The following inbound HTTP rules apply only to explicit webhook mode.
+A route can accept both connectors. One execution target cannot appear in competing routes.
+Pending work prevents changes to its source identity or target.
+Credential rotation does not change identity when the account ID stays the same.
 
-For each webhook:
+SendBlue deduplicates by account and complete provider message handle across route records.
+HTTPS deduplicates by account, route, request ID, and payload identity.
+A reused HTTPS request ID with different text returns `409`.
 
-1. Enforce the 256 KiB raw-body limit.
-2. Authenticate the raw request before JSON parsing.
-3. Match exactly one static route.
-4. Deduplicate by connector account and full `message_handle`.
-5. Append the event to the open batch.
-6. Store its compact identity and receipt sequence.
-7. Store the snapshot.
-8. Return 2xx after durable success.
+## Durable intake and admission
 
-Ignore outbound events and events without inbound `RECEIVED` status. Do not infer multipart groups from numeric handle suffixes.
+Input becomes durable before intake reports success. The snapshot stores batches, receipts, source identities, and polling checkpoints.
+The current state format is version 2. Version-1 migration is not supported.
 
-Order events by provider time and then durable receipt sequence. Persist the quiet deadline and maximum deadline for each open batch.
+Idle SendBlue input uses a quiet batching interval with a maximum deadline.
+HTTPS input uses immediate batching. During an active turn, follow-ups bypass the quiet interval.
+Admissions remain serialized within the execution session.
 
-### Codex admission and response ownership
+Before a start or steer, the gateway stores the client message UUID, expected turn, execution binding, and publication references.
+After confirmed admission, it stores the turn ID and clears the pending intent.
+An existing turn ID does not prove acceptance of a later steering message.
 
-Persist the batch ID, client message ID, publication ID, and expected turn ID before each start or steer.
+An uncertain acknowledgement triggers UUID correlation, not another submission.
+Unresolved admission blocks completion until correlation or operator resolution establishes its outcome.
+A definite stale-turn rejection returns its batch for admission against fresh thread state.
+Transport failure is not a definite rejection.
 
-While the owned turn is active, steer each prepared batch immediately. Serialize admissions within the session.
+Desktop acceptance and output attribution are separate boundaries.
+An exact accepted steering record proves admission. Output still requires its matching consumption marker.
+Recovery of Desktop-admitted work waits for Desktop ownership.
 
-Move the batch from the queue into `CodexWork.batches` in the same transaction that stores its admission intent.
+## Completion and progress
 
-The first accepted batch owns the response. Add later accepted batches to `joinedBatchIds`.
+Each participating source prepares its completion plan after the shared turn ends and pending admissions resolve.
+HTTPS retains the terminal result. SendBlue prepares one ordered delivery for its participating messages.
 
-When terminal observation arrives, stop new admissions. Preserve `pendingAdmission` until its result is definite or an operator resolves it.
+The gateway stores the result before publishing a terminal SSE event.
+Commentary represents completed semantic messages, not individual tokens.
+Temporary commentary history is bounded and can disappear after restart or eviction.
+Durable HTTPS results remain retrievable for their retention period.
 
-Correlate each uncertain admission by its client message ID. An existing turn ID alone does not prove acceptance of another batch.
+See [HTTPS contracts](https.md) for authentication, reservations, SSE frames, cursors, and capacity limits.
+Connector results are not a synchronized transcript of all activity in the Codex chat.
 
-If acceptance is uncertain, keep the route blocked. Do not freeze a delivery or send the input again.
+## SendBlue output
 
-If a steer receives a definite stale-turn rejection, return its batch to the queue. Preserve the previous response owner.
+The gateway collects stable artifacts, removes duplicates by content hash, and uploads eligible files before recipient delivery.
+It adds omission notices and splits text into parts below the provider text limit.
+Then it stores the complete delivery, including uploaded media URLs.
 
-Retain structured RPC errors for rejection classification. Do not infer a stale turn from a transport failure.
-
-After the previous delivery ends, admit that batch against fresh thread state. This is a new admission after a proven rejection.
-
-If no earlier batch owns a response, remove the empty Codex work. Admit the queued batch against fresh thread state.
-
-For another definite admission rejection, clear the intent and set `admissionFailed`. Use the same failure response rules as operator resolution.
-
-After acceptance, store the owning turn ID before clearing the intent. Include the batch in the shared response.
-
-Before delivery preparation, require a terminal turn and no pending admission. Reconstruct terminal output from that exact turn after reconnect.
-
-New batches can arrive while delivery is blocked. Do not admit another Codex turn until the delivery gets a terminal state.
-
-### Recipient parts
-
-Prepare output in this order:
-
-1. Collect stable artifacts into the local spool.
-2. Remove duplicate artifacts by content hash.
-3. Upload eligible artifacts to Sendblue.
-4. Add filename-specific notices for omitted artifacts.
-5. Split the final text into parts below the 18,996-character Sendblue limit.
-6. Store the frozen delivery, including each uploaded `media_url`.
-
-Uploads are preparation requests. No recipient-message request starts before the frozen delivery snapshot succeeds.
-
-Keep Codex work and its file references until that snapshot succeeds. A restart before freezing can repeat preparation and uploads.
-
-After freezing, use the stored text and media URLs. Do not recollect output, rewrite notices, or upload again.
-
-If a stored URL later fails during message submission, apply the normal message-send rules. Do not change the frozen delivery.
-
-Send text parts first. Then send one media-only part for each artifact. Store each accepted provider handle before the next part.
-
-If one part has uncertain acceptance, stop the route. If Sendblue rejects a part, fail it and skip later ready parts.
-
-### Terminal output
-
-The shared session reports terminal status independently of final text. Native image events remain available for artifact collection.
-
-Use this terminal result inside the shared session:
-
-```ts
-interface TurnOutcome {
-  turnId: string;
-  status: "completed" | "failed" | "interrupted";
-  finalText?: string;
-  imageGenerations: Array<{
-    id: string;
-    savedPath?: string;
-    result?: string;
-  }>;
-}
-```
-
-Only completed native image items enter `imageGenerations`. Transport errors remain separate from a terminal Codex result.
-
-Use these gateway outcomes:
-
-| Codex outcome | Recipient response |
-| --- | --- |
-| Completed with text | Final text, omission notices, then available artifacts |
-| Completed with artifacts only | Available artifacts, plus text only for omission notices |
-| Completed with all artifacts omitted | Filename-specific omission notices |
-| Completed without text or artifacts | `Codex finished without a response.` |
-| Failed | `Codex could not finish this request.` |
-| Interrupted | `Codex stopped before finishing this request.` |
-
-For failed or interrupted turns, send the failure notice. If `admissionFailed` is true, also include the admission notice.
-
-Do not publish partial artifacts or intermediate text.
-
-When delivery ends, release the route. Keep the existing one-shot text and error behavior in `sendTurn()`.
-
-## 2. Route identity
-
-The [CLI reference](cli-reference.md#gateway-configuration-contract) defines the configuration fields and validation rules.
-
-### Route identity across restarts
-
-Store the resolved route binding before accepting its first event. Compare bindings after loading state and before cleanup or external requests.
-
-The binding fixes the connector ID, normalized numbers, SSH host, task ID, and working directory.
-
-Reject a changed binding or removed route while its state retains work or file references. Report `config_invalid` without changing state.
-
-An unchanged alias does not bypass this comparison. Resolve its target fields before comparison.
-
-Labels, models, reasoning effort, and secret rotation do not change the binding. A connector ID identifies the same provider account across restarts.
-
-If a connector changes accounts, use a new connector ID. Do not retain secret values or hashes in the binding.
-
-For an idle route, permit a binding change after all work and file references end. Keep unexpired deduplication identities.
-
-Each deduplication identity includes the connector ID and full message handle. Compare identities across route records within that connector.
-
-Retain removed idle route records until their identities expire. This prevents a route rename from admitting a recent webhook again.
-
-## 3. Durable state contract
-
-The [state schemas](../src/gateway-state.ts) define the versioned record and its TypeScript types.
-The record stores route bindings, deduplication identities, queued batches, active Codex work, and ordered delivery parts.
-
-Each delivery part uses these transitions:
+No recipient request starts before that snapshot succeeds.
+A restart before this point can repeat preparation or uploads. A restart afterward uses the frozen text, order, and URLs.
+Text parts precede media parts. Each accepted part stores its provider handle before the next part starts.
 
 ```text
 ready -> sending -> accepted | failed
 ready -> skipped
 ```
 
-A `sending` part contains one callback token. An `accepted` part contains one provider handle. Other states contain neither field.
+A `sending` part contains a callback token. An `accepted` part contains a provider handle.
+Other part states contain neither field.
 
-All automatic attempts in one live operation reuse the callback token. The delivery stores its complete frozen payload.
+Automatic retries require a definite retryable rejection. There are at most two retries after the first request.
+Lost responses, server errors, and unusable success responses remain uncertain.
+A stored `sending` part is never automatically resent after restart.
+A failed part skips later ready parts. An uncertain part blocks its route.
 
-After attachment preparation, replace `pending` with `ready` or `omitted`. Do not retain the source URL.
+Webhook mode can settle accepted delivery through a positive authenticated callback.
+A negative callback cannot prove rejection after multiple physical attempts.
+Polling mode sends no callback URL and exposes no callback handler.
+SDK implicit retries are disabled. The router owns retry and per-line request scheduling.
+Typing and read-receipt failures remain nonfatal.
 
-The local and host paths are state references for cleanup. The stored binding supplies recipients and the recovery target.
+## Files
 
-`CodexWork.batches` retains accepted batches and the pending batch. The first admission reserves `ownerBatchId` until acceptance or failure.
+Inbound preparation changes an attachment from `pending` to `ready` or `omitted`.
+Ready files retain local and execution-host paths. Prepared records no longer need the provider source URL.
+Download or content failures can produce omissions. Local storage failures block progress instead of admitting incomplete state.
 
-`joinedBatchIds` excludes the owner and pending batch. A stale-turn rejection returns its batch to the queue in one transaction.
+The gateway rejects symlinks, directories, and files that change during copying.
+Native images must belong to the exact turn. Native source files outside gateway directories remain unchanged.
+Cleanup preserves references from active work and pending admissions across routes on the same host.
+Frozen delivery retains its local artifacts until delivery releases them.
 
-An operator-failed batch remains referenced until Codex work ends. It is not an accepted joined batch.
+## Storage and recovery
 
-`admissionFailed` records the need for one admission notice. It covers definite rejection and operator resolution of uncertain admission.
+One process holds the [operating-system lock](gateway-lock.md). One serialized writer replaces the canonical snapshot atomically.
+State transitions precede external effects whenever recovery needs their identity.
+A failure after snapshot replacement poisons the writer instead of permitting further uncertain writes.
 
-After `admissionFailed` becomes true, stop further admissions until the owned response ends.
+Diagnostics use a separate disposable snapshot. CLI status does not acquire the writer lock.
+Manual resolution and polling reset require a stopped gateway and acquire that lock.
 
-Do not add replacement attempts, retired attempts, attempt expiry, durable retry counters, or durable diagnostic history.
+Shutdown stops intake and local work without explicitly cancelling the Codex turn.
+Loss of an owned stdio server can interrupt its turn. Recovery does not resend the input.
 
-## 4. Attachment preparation
-
-Prepare each pending attachment before Codex admission:
-
-1. Download and validate the provider response.
-2. Store and sync the local spool file.
-3. Copy the file to the app-server host.
-4. Replace `pending` with `ready` after all steps succeed.
-
-A provider download permits two live retries after connection errors, timeouts, HTTP 408, 409, 429, or 5xx.
-
-A remote SSH copy permits two live retries after transport failure. Before retrying a lost response, reconcile the exact final destination.
-
-Do not persist preparation attempt counts. A restart can begin a new preparation operation.
-
-If a provider download, media validation, or host copy fails, store the attachment as `omitted`.
-
-Add a filename-specific omission notice to the Codex input. If the event contains no text, admit the omission notice by itself.
-
-An advertised image that contains another valid file type becomes an ordinary file. It does not become an invalid-media omission.
-
-A local spool write, sync, rename, or state-snapshot failure blocks the route. Do not omit the attachment or admit the batch.
-
-Keep the durable pending state so that restart or operator repair can continue preparation.
-
-A local app-server-host write, sync, or rename failure also blocks the route.
-
-A remote destination mismatch after reconciliation blocks the route. Do not overwrite the destination or omit the attachment.
-
-### File ownership and cleanup
-
-Derive attachment destinations from the route, batch, and full message identity. Use the same destination after a lost response or restart.
-
-Before admission, retain the prepared attachment paths in the batch. After admission begins, retain them in `CodexWork.batches`.
-
-Keep publication directories referenced until the delivery snapshot succeeds. That snapshot transfers ownership to the delivery's local spool paths.
-
-Store each publication ID with its admission intent before creating the directory or sending the mutation.
-
-After a stale-turn rejection, remove that publication reference in the same transaction that restores its batch to the queue.
-
-After a delivery ends, remove its state references before deleting its spool files. Do not prune active file references by age.
-
-Before host cleanup, combine references from every route for that host. Preserve the pending admission's publication directory.
-
-If a live preparation has no final state reference yet, preserve its paths until it ends. Startup has no such live preparation.
-
-Local spool failures during output preparation block the route. Preserve Codex work so that restart can reconstruct its terminal output.
-
-### Native images
-
-Collect native images only from the exact owned turn. Exclude native artifacts present before the first gateway admission.
-
-Capture that baseline once. Do not replace it on later steers or reconnects.
-
-A correlated `imageGeneration.savedPath` permits read-only import of that exact file outside gateway directories.
-
-Require a stable regular file with no symlink traversal. Copy its bytes into the gateway spool before upload.
-
-Never modify or delete a native source outside gateway directories. Do not search its parent directory for other files.
-
-If a native item has no saved path, decode its base64 result into the spool. Apply the same validation and hashing.
-
-If a saved path fails validation or copying, add an omission notice. Do not substitute another source for that item.
-
-## 5. Restart and operator recovery
-
-Startup uses this order:
-
-1. Validate the configuration.
-2. Acquire the state lock and load the snapshot.
-3. Validate the stored route bindings against the configuration.
-4. Remove unreferenced files from local gateway directories.
-5. Bind HTTP with readiness false.
-6. Accept authenticated status callbacks.
-7. Restore batch deadlines and keep persisted `sending` parts blocked.
-8. Set readiness true and accept ordinary inbound webhooks.
-9. Start route workers independently.
-
-Readiness means that local recovery ended and durable intake is available. It does not require a reachable Codex host.
-
-Before each route resumes Codex work, reconcile its host files. An unavailable host delays only that route's Codex work.
-
-A route can accept queued input during host recovery. A frozen delivery does not require a Codex connection or host cleanup.
-
-Reconcile host files from the combined references before admitting new work on that host. Other hosts remain independent.
-
-After restart, correlate a pending admission before you evaluate its turn. Never claim an unrelated active turn.
-
-If an owned stdio turn is `interrupted`, create one recipient-visible failure delivery. Never send that Codex mutation again.
-
-Provide stopped-gateway commands for these actions:
-
-- List unresolved effects.
-- Mark an uncertain Codex admission failed.
-- Mark an uncertain Sendblue part accepted with an observed handle.
-- Mark an uncertain Sendblue part failed and release the route.
-
-Do not provide an operator retry command in V1.
-
-Shutdown stops intake. It aborts observations, file copies, retry delays, and HTTP requests. It never calls `turn/interrupt`.
-
-## 6. Sendblue request and callback rules
-
-### Request deadlines
-
-Use these limits for each physical request:
-
-- A message-send attempt has a 60-second deadline.
-- A typing request has a 60-second deadline and never blocks route progress.
-- A media-upload attempt has a ten-minute deadline.
-- An inbound download has 60 seconds to receive response headers.
-- An inbound download body has a 60-second inactivity deadline.
-
-Reset the download inactivity deadline after each body chunk. Each retry gets new request deadlines.
-
-The HTTP server permits 30 seconds for request headers. It permits 60 seconds of inactivity while reading a POST body.
-
-All webhook and callback bodies have a 256 KiB raw-body limit.
-
-Request deadline timers do not keep the process alive. Reconnection waits keep an active CLI command alive between sockets.
-Shutdown aborts each active HTTP request and reconnection wait.
-
-Do not add a total operation deadline. Do not add deadlines to Codex work, local streams, SSH streams, queued batches, or blocked routes.
-
-### Message-send retries
-
-One live message operation permits at most two retries after definite retryable rejections, such as HTTP 429. Honor valid retry headers. SDK retries are disabled.
-
-Connection loss, HTTP 408/409/5xx, and unusable success responses are ambiguous. Never automatically resend after these outcomes. Without an accepted handle, leave the part as `sending` for explicit resolution. Matching text or timestamps cannot establish send identity.
-
-Before each physical message request, acquire the shared line limiter. It permits ten request starts per rolling second for each normalized `from_number`.
-
-A 2xx response with a handle accepts the part. A definite nonretryable rejection fails it. Exhausting retries after definite rejections also fails it. A restart never resumes an uncertain send operation.
-
-Track a live send only in memory:
-
-```ts
-interface LiveSend {
-  attemptsStarted: number;
-  abort: AbortController;
-  settlement?:
-    | { status: "accepted"; providerHandle: string }
-    | { status: "failed" };
-}
-```
-
-Increment `attemptsStarted` immediately before each physical request.
-
-After each limiter wait, validate the part status, abort signal, and `settlement`. Do not start a request after settlement begins.
-
-Validate eligibility, increment the counter, and start the request without an intervening `await`.
-
-### Upload retries
-
-Media upload uses the same retry classes and permits two live retries. Do not store upload attempts.
-
-A duplicate unused CDN upload cannot duplicate a recipient message.
-
-Before upload, read the stable artifact size. If it exceeds 100,000,000 bytes, omit it with a filename-specific connector-limit notice.
-
-Do not start an upload for an oversized artifact. Exactly 100,000,000 bytes remains eligible.
-
-This limit applies only to outbound Sendblue artifacts. It does not limit inbound attachments, local transfers, or SSH transfers.
-
-### Callback settlement
-
-A positive callback with a handle accepts the current part, including after a retry.
-
-These positive statuses accept a part: `REGISTERED`, `PENDING`, `QUEUED`, `ACCEPTED`, `SENT`, and `DELIVERED`.
-
-`DECLINED` or `ERROR` fails the part only while its live operation exists and `attemptsStarted` is one.
-
-After a retry starts, a negative callback returns 204 without settling the part. It can write only a protected runtime diagnostic.
-
-If no live operation exists, a negative callback also returns 204 without settlement. This rule includes callbacks after restart.
-
-A positive callback can settle a persisted `sending` part after restart. A persisted `sending` part never starts another request automatically.
-
-Validate the account signing header before you parse the body. For a current part, require the exact header value and callback token.
-
-If the delivery or part is no longer current, return 204 without a state change. If the current token is incorrect, reject the request.
-
-Only a `sending` part requires its current token. For accepted, failed, or skipped parts, return 204 after account authentication.
-
-If a callback settles the part, store the result before you return 2xx. If storage fails, return 503.
-
-### Settlement and live request ordering
-
-Use the same settlement path for HTTP results and callbacks. Accept settlement only for the current `sending` part.
-
-Select and store `settlement` without an intervening `await`. Evaluate negative-callback eligibility in that same synchronous step.
-
-Then abort retry delays, limiter waits, and active HTTP requests. Store the selected result through the transaction queue.
-
-Before starting the next part, require durable settlement and completion of the aborted live operation.
-
-Late HTTP results cannot replace a selected result. Duplicate callbacks wait for the selected durable write before returning success.
-
-If storage fails, keep the part blocked and stop automatic requests. A subsequent callback can retry the durable settlement.
-
-Do not discard an accepted handle after a failed snapshot write. Retain it in memory until settlement succeeds or shutdown occurs.
-
-A crash leaves the persisted part as `sending`. Restart never resumes its requests.
-
-An abort cannot undo a request that already reached Sendblue. The accepted duplicate-message risk still applies.
-
-An unknown status does not settle the part. Sendblue documents three webhook retries and a 45-second response window.
-
-## 7. Operator and HTTP interfaces
-
-The [CLI reference](cli-reference.md#gateway-commands) defines status, resolution, and output contracts.
-The [HTTP reference](cli-reference.md#gateway-http-contract) defines paths, authentication, response statuses, and body limits.
-The [recovery procedure](gateway.md#recover-an-uncertain-operation) explains operator actions.
-
-Status and resolution require the stopped gateway state lock. A Codex admission permits only failed resolution.
-An operator-failed admission retains its input files until the owned turn ends. It never triggers another submission.
-An accepted send resolution continues later parts. A failed send resolution skips later parts.
-
-Readiness follows local recovery. Unavailable hosts and unresolved route effects do not change global readiness.
-Shutdown sets readiness false before it stops intake.
-
-## 8. Security and privacy rules
-
-Authenticate a webhook from its raw body before JSON parsing. Match exactly one static route after authentication.
-
-Use constant-time comparison for `sb-signing-secret`. Use an unguessable token in every status callback URL.
-
-Never log these values:
-
-- Secrets or callback tokens.
-- Request bodies or message content.
-- Phone numbers or media URLs.
-- Prompts or artifact paths.
-- Attachment bytes.
-
-Reject directories, symlinks, changing files, and unsafe names.
-
-An unavailable or unsafe publication directory adds an omission notice. Valid text and native artifacts remain eligible.
-
-Publication discovery stays inside gateway-owned directories. The exact native-image import in section 4 is the only outside-file exception.
-
-## 9. Implementation proof matrix
-
-Use deterministic tests for state transitions, timers, and injected failures. Use live probes for provider payloads and platform behavior.
-
-Release validation must prove these contracts. Historical probes provide context, not current release evidence.
-
-### Core and durable state
-
-- Crash before and after each durable admission boundary.
-- Restart with each active state and each blocked state.
-- Validate every TOML reference, identifier, URL, port, phone number, and environment-variable name.
-- Validate each gateway command, JSON result, exit code, stale identity, and running-lock rejection.
-- Validate no replay after accepted or uncertain Codex admission.
-- Validate a new admission only after a proven stale-turn rejection.
-- Validate one response owner per shared turn.
-- Validate that one blocked route does not block another route.
-- Change each binding field with pending work and validate rejection before cleanup or network requests.
-- Rename an idle route and replay a recent webhook. Validate deduplication across the retained route records.
-- Point two routes at one agent alias and validate configuration rejection.
-- Hold one SSH recovery indefinitely. Validate readiness, durable intake, and delivery on a healthy route.
-- Race completion against steer success, stale-turn rejection, acknowledgement loss, and disconnect.
-- Restart with a completed turn and pending steer. Validate client-message correlation before delivery creation.
-- Resolve a pending steer as failed while its owned turn continues. Validate one response and retained files.
-
-### Local and SSH paths
-
-- Validate local proxy, local owned stdio, and SSH proxy behavior.
-- Transfer text, images, ordinary files, zero-byte files, and large files.
-- Inject SSH disconnects, truncation, lost responses, metadata changes, and restarts.
-- Validate attachment omission after exhausted download, validation, and remote-copy errors.
-- Validate that local spool and snapshot errors block admission instead of creating omissions.
-- Validate the supported local and SSH client environments.
-- Restart during a live proxy turn with prepared input files. Validate that local and host cleanup preserve those files.
-- Share a host across routes. Validate that cleanup preserves every route's references.
-- Crash before and after the delivery snapshot. Validate publication retention and transfer of spool ownership.
-- Validate native images inside and outside publication directories. Preserve all outside source files.
-- Restart after native-image completion. Validate exact-turn reconstruction and the original artifact baseline.
-- Validate text-only, artifact-only, empty, failed, interrupted, and all-artifacts-omitted terminal output.
-- Validate streamed multipart uploads on the minimum supported Node version. Pin compatible dependency versions.
-
-### Sendblue paths
-
-- Capture authenticated text, image, file, two-photo, retry, and callback payloads.
-- Validate the configured `sb-signing-secret` on inbound and status callbacks.
-- Validate five-second quiet batching and the 30-second maximum.
-- Validate typing during batching and useful work.
-- Validate every HTTP status and body limit in the [HTTP reference](cli-reference.md#gateway-http-contract).
-- Validate message, typing, upload, header, and body-inactivity deadlines.
-- Drop a response after provider acceptance and record each physical request.
-- Race each callback status against retry delays, active requests, and late errors.
-- Validate that a negative callback cannot reject a logical send after a retry.
-- Validate that a negative callback cannot settle a persisted part after restart.
-- Validate that a positive callback can settle a persisted part after restart.
-- Validate same-number pacing across concurrent routes.
-- Settle a callback during a limiter wait. Validate that no later retry starts.
-- Race a negative callback's snapshot write against the second attempt. Validate one ordered settlement decision.
-- Fail a settlement snapshot after an accepted handle. Validate no automatic resend and successful durable settlement on callback retry.
-- Settle a callback during an active retry. Validate operation completion before the next part starts.
-- Fail the second artifact upload. Validate its notice in the frozen text before the first recipient request.
-- Restart after uploads but before freezing. Validate safe repeated uploads without recipient messages.
-- Restart after freezing. Validate reuse of stored text, part order, and media URLs.
-- Validate five-minute typing renewal and explicit stop on the release line. Record firmware-dependent failures.
-- Validate operator resolution of uncertain delivery.
-- Capture a live two-photo message and validate whether Sendblue emits two independent events.
-
-Before release, validate client-message correlation and native-image recovery on each supported Codex build.
-
-If a required capability is absent, stop release validation. Do not substitute an unsafe admission or artifact-recovery rule.
-
-### Test-resource safety
-
-Before live tests:
-
-1. Record the existing EXE.dev VM inventory and Sendblue webhook.
-2. Assign one random test nonce.
-3. Record each new VM, task, key, and gateway-owned path.
-
-After live tests:
-
-1. Restore and validate the previous Sendblue webhook.
-2. Remove copied credentials and temporary keys.
-3. Delete only resources that contain the current nonce.
-4. Compare the final inventories with the initial inventories.
-
-Never delete a pre-existing VM, task, credential, or path. If an identity is uncertain, leave the resource unchanged and report it.
-
-## 10. V1 limits
-
-V1 does not include these features:
-
-- Dynamic route pairing or group messages.
-- Inbound messaging commands for cancel, status, or new tasks.
-- Carousels or Sendblue-specific presentation branches.
-- An operator retry command.
-- A database, connector registry, remote helper, or cleanup service.
-
-The code keeps one narrow connector boundary for later connectors. It does not add a registry before a second connector exists.
-
-## 11. Primary references
-
-- [Codex app-server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md).
-- [Sendblue webhooks](https://docs.sendblue.com/getting-started/webhooks/).
-- [Sendblue security](https://docs.sendblue.com/security/).
-- [Sendblue status callbacks](https://docs.sendblue.com/getting-started/sending-messages/#status-callback).
-- [Sendblue send-message](https://docs.sendblue.com/api/resources/messages/methods/send/).
-- [Sendblue media upload](https://docs.sendblue.com/api-v2/media/).
-- [Sendblue typing](https://docs.sendblue.com/api-v2/typing-indicators).
-- [Sendblue limits](https://docs.sendblue.com/limits/).
-- [Sendblue TypeScript SDK](https://docs.sendblue.com/api/typescript/).
-- [file-type](https://github.com/sindresorhus/file-type).
-- [Valibot](https://github.com/open-circle/valibot).
-- [Node `fs.openAsBlob()`](https://nodejs.org/api/fs.html#fsopenasblobpath-options).
-- [EXE.dev HTTPS gateway](https://exe.dev/docs/proxy).
-
+See [SendBlue polling recovery](sendblue.md#polling-recovery) for checkpoint bounds.
+See [manual resolution](gateway.md#recover-an-uncertain-operation) for unresolved admissions and deliveries.
+See [release qualification](release-qualification.md) for the tested platforms and remaining limits.

@@ -9,6 +9,7 @@ codex-router [--config PATH] send AGENT_ID --stdin [--json | --stream]
 codex-router [--config PATH] cancel AGENT_ID [--json]
 codex-router [--config PATH] gateway
 codex-router [--config PATH] gateway status [--json]
+codex-router [--config PATH] gateway polling-reset ACCOUNT_ID SINCE_UTC [--json]
 codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID failed [--json]
 codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE [--json]
 ```
@@ -203,15 +204,13 @@ The app-server owns turn concurrency. An idle send uses `turn/start`; an active
 send uses `turn/steer` with the exact active turn ID. The router does not queue,
 interrupt, restart, or automatically resend ordinary input.
 
-When native Codex remote control is running locally or on an agent's SSH host,
-the router connects through `codex app-server proxy` and shares that app-server.
-When the local control socket is absent, it owns
-`codex app-server --listen stdio://` for the command. SSH agents never use
-remote stdio; they start or reuse the persistent Codex daemon and connect by
-proxy.
+Local requests first discover the Desktop owner on macOS or Windows.
+If Desktop owns the chat, requests use that connection.
+Otherwise, the router connects to an existing app-server endpoint or starts an owned stdio server after confirming endpoint absence.
+An unsafe or unreachable endpoint does not authorize a fallback server.
 
-If a local control socket exists but cannot be connected, the router falls back
-once to owned stdio. It does not delete the socket or start a local daemon.
+SSH agents start or reuse the persistent Codex daemon and connect through its proxy.
+See [gateway execution](gateway.md#execution-and-connector-behavior) for shared ownership and recovery behavior.
 
 ## Gateway commands
 
@@ -220,7 +219,7 @@ See [Gateway setup and recovery](gateway.md) for the ordinary message flow and d
 `gateway` runs in the foreground. It does not accept `--json`, `--stream`, or `--stdin`.
 Direct credentials are read from TOML. Environment references are resolved at gateway startup.
 Other commands validate the gateway tables without resolving environment references.
-Doctor reports whether credentials are present, without contacting Sendblue or printing their values.
+Doctor reports whether credentials are present, without contacting SendBlue or printing their values.
 
 `gateway status` works while the service runs and never acquires the state lock. It reads a private status snapshot.
 The snapshot refreshes every five seconds. After 15 seconds without an update, status reports `stale`.
@@ -246,22 +245,25 @@ Unknown or already resolved identities fail with `effect_not_found`. No retry co
 
 | Table | Fields |
 | --- | --- |
-| `gateway` | Required `listen_port`, `public_url`; optional `state_dir` |
-| `gateway.sendblue` | Required `id`; each credential uses `api_key_id`, `api_secret_key`, or `webhook_secret`, or its corresponding `_env` field |
-| `gateway.routes` | Required `id`, `sendblue`, `sender`, `sendblue_number`, `agent` |
+| `gateway` | Required `listen_port`; optional `listen_host`, `state_dir`, `public_url`, `max_requests`, `retained_bytes` |
+| `gateway.tls` | Required `cert` and `key` when the table is present |
+| `gateway.sendblue` | Required `id` and API credentials; optional polling fields; webhook credentials only for webhook mode |
+| `gateway.https` | Required `id` and exactly one of `bearer_token` or `bearer_token_env` |
+| `gateway.routes` | Required `id` and `agent`; `sendblue` with both phone numbers, `https`, or both connectors |
 
-Set exactly one direct value or environment reference for each credential. Empty values and line breaks are rejected.
-Keep configs with direct credentials owner-only (`chmod 600`).
+Set exactly one direct value or environment reference for each credential.
+Unknown gateway fields are rejected. See [SendBlue setup](sendblue.md) and [HTTPS setup](https.md) for complete examples and limits.
 
-At least one account and route are required. Unknown gateway fields are rejected.
-IDs use lowercase slugs that start with a letter. Environment-variable names use letters, digits, and underscores, without an initial digit.
-
-`listen_port` is an integer from 1 to 65535. `public_url` is an HTTPS origin without credentials, a path, query, or fragment.
+`listen_port` accepts 1–65535. The listener defaults to `127.0.0.1`.
+Nonloopback access requires TLS and a specific private IPv4 address.
+`public_url` is required only for SendBlue webhook mode. It must be an HTTPS origin without credentials, path, query, or fragment.
 `state_dir` must be absolute. Its default is `~/.codex-router/gateway`.
-Phone numbers contain `+`, a nonzero country-code digit, and 6 to 14 additional digits.
 
-Routes reference existing accounts and agents. Each account/sender/line combination and each route target must be unique.
-Pending work prevents changes to its account, numbers, SSH host, task ID, or working directory.
+Routes reference existing accounts and agents. Each account/sender/line combination and each execution target must be unique.
+Pending work prevents changes to its source identity or execution target.
+
+`gateway polling-reset` requires a stopped service. It changes a SendBlue account's recovery boundary while retaining receipts.
+See [polling recovery](sendblue.md#polling-recovery) for timestamp requirements.
 
 ### Gateway HTTP contract
 
@@ -272,7 +274,9 @@ Pending work prevents changes to its account, numbers, SSH host, task ID, or wor
 | `POST /webhooks/sendblue/ACCOUNT` | 204 after durable acceptance, deduplication, or intentional ignoring |
 | `POST /callbacks/sendblue/ACCOUNT/PART/TOKEN` | 204 after settlement or an ignored callback |
 
-POST requests require `application/json` and the configured `sb-signing-secret` header.
+The SendBlue webhook and callback endpoints exist only in webhook mode.
+Those POST requests require `application/json` and the configured `sb-signing-secret` header.
+See [HTTPS requests and SSE](https.md) for the separate bearer-authenticated API.
 Authentication precedes JSON parsing. POST responses have empty bodies.
 Authenticated outbound, group, and unmatched inbound events make no state changes.
 A current callback also requires its random token. An authenticated stale callback returns 204.

@@ -1,20 +1,22 @@
 {
-  "name": "codex-router",
+  "name": "@skarian/codex-router",
   "version": "0.1.0",
-  "private": true,
-  "description": "Route text, messages, and files to trusted Codex tasks by local alias.",
+  "description": "Route messages to Codex chats through the CLI, SendBlue, or HTTPS with SSE.",
   "type": "module",
   "bin": {
     "codex-router": "dist/src/cli.js"
   },
   "files": [
     "dist/src",
-    "docs"
+    "docs",
+    "examples/esp32-https"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test"
   },
   "engines": {
     "node": "^20.17.0 || >=22.9.0"
@@ -33,5 +35,18 @@
     "@types/write-file-atomic": "4.0.3",
     "@types/ws": "^8.18.1",
     "typescript": "^5.9.3"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Skarian/codex-router.git"
+  },
+  "homepage": "https://github.com/Skarian/codex-router#readme",
+  "bugs": {
+    "url": "https://github.com/Skarian/codex-router/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }
