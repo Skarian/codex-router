@@ -43,26 +43,58 @@ Run `agents list --json` with an isolated configuration through that executable.
 Verify a gateway startup with temporary state before using the package with a live configuration.
 Do not start a second gateway against an existing state directory.
 
-## Publish
+## Configure GitHub trusted publishing
 
-Authenticate as an npm user with access to the `@skarian` scope:
+The workflow is `.github/workflows/publish.yml`.
+It verifies packages on main, pull requests, and manual runs. Only version tags can publish.
+
+Open the package settings on npm and add a GitHub Actions trusted publisher:
+
+| Field | Value |
+| --- | --- |
+| Organization or user | `Skarian` |
+| Repository | `codex-router` |
+| Workflow filename | `publish.yml` |
+| Environment | Leave empty |
+| Allowed actions | Allow direct publication with `npm publish` |
+
+The package must exist before this package-settings configuration is available.
+An initial manual release can require npm login and browser 2FA.
+See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) for setup details.
+
+The publish job uses an OIDC identity and requests provenance. No npm token secret is required.
+GitHub Actions use exact commit hashes. Node and npm use exact versions.
+`npm ci` installs dependencies from the lockfile.
+
+## Release a version
+
+Start from a clean main checkout:
 
 ```sh
-npm login
-npm whoami
+git switch main
+git pull --ff-only
+npm version patch
+git push origin main --follow-tags
 ```
 
-Commit the verified source and documentation before publishing.
-For later releases, select a new version with `npm version patch`, `minor`, or `major` before the final package checks.
-The first release uses `0.1.0`.
+Use `minor` or `major` for a larger release.
+`npm version` updates the package files and creates a commit and version tag.
+The workflow requires the tag to match `package.json` and its commit to belong to main.
+
+The verification job runs tests, builds a package, and installs its archive into an isolated prefix.
+The publish job starts only after verification passes. Ordinary main pushes never publish.
+
+Inspect the workflow result, then verify the registry version:
 
 ```sh
-npm publish --access public
 npm view @skarian/codex-router version
 ```
 
-Complete the npm authentication prompt if required.
-The repository sets public access and the npm registry in `publishConfig`.
-Keep npm tokens outside the repository.
+Users can pin a release explicitly:
 
-Push the release commit and its tag when applicable.
+```sh
+npm install --global @skarian/codex-router@0.1.0
+```
+
+Do not move a published release tag or reuse an npm version.
+If publication fails, inspect the job before choosing whether to rerun it or create a new version.
