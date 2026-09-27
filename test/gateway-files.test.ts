@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, realpath, mkdir, readdir, lstat, readFile, writeFile, rm, symlink, open } from "node:fs/promises";
+import { mkdtemp, realpath, mkdir, readdir, lstat, readFile, writeFile, rm, symlink, open, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -16,7 +16,7 @@ async function fixture() {
   const route: GatewayRoute = { id: "route", sendblueId: "account", sender: "+15125550100", sendblueNumber: "+15125550200", agent: { id: "one", label: "One", cwd: root, threadId: "thread", model: "test" } };
   const session: GatewaySession = {
     serverInfo: { codexHome: home, platformFamily: "unix", platformOs: "macos" }, artifactBaseline: [],
-    async resume() { return { thread: {} }; }, async admit() { return "turn"; }, async steer() { return "turn"; },
+    async resume() { return { thread: {} }; }, async admit() { return "turn"; },
     async observe() { return { turnId: "turn", status: "completed", imageGenerations: [] }; }, async restore() { return "turn"; }, async close() {},
     async filesystem(method, params) {
       const p = params as { path: string; recursive?: boolean; force?: boolean };
@@ -188,6 +188,9 @@ test("a source change during a streamed copy rejects the output", async () => {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
     const changed = await open(source, "r+"); await changed.write(Buffer.from("changed"), 0, 7, 0); await changed.close();
+    // Some filesystems reuse one timestamp tick for consecutive writes.
+    const changedTime = new Date(Date.now() + 1000);
+    await utimes(source, changedTime, changedTime);
     await rejected; await assert.rejects(lstat(destination));
   } finally { await f.close(); }
 });

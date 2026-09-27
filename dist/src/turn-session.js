@@ -47,7 +47,7 @@ async function reconnectDelay(attempt, signal, delaysMs = RECONNECT_DELAYS_MS) {
             clearTimeout(timer);
             reject(new RouterError("interrupted", "The Codex turn was interrupted by the caller.", { ambiguous: true }));
         };
-        timer.unref();
+        // Recovery can temporarily have no live socket. Keep the foreground command alive.
         signal?.addEventListener("abort", onAbort, { once: true });
     });
 }
@@ -234,11 +234,6 @@ export class TurnSession {
         const operation = this.admissionQueue.then(() => this.admitOnce(input, intent));
         this.admissionQueue = operation.catch(() => undefined);
         return operation;
-    }
-    steer(input, intent) {
-        if (!intent.expectedTurnId)
-            return Promise.reject(new RouterError("input_invalid", "A steer requires the expected turn ID."));
-        return this.admit(input, intent);
     }
     async admitOnce(input, intent) {
         this.checkOpen();

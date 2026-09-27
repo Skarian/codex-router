@@ -47,7 +47,6 @@ class FakeSession implements GatewaySession {
   async filesystem() { return {}; }
   async resume() { return { thread: { status: { type: "idle" }, turns: [] } }; }
   async admit(input: unknown, intent: unknown) { this.admissions.push({ input, intent }); return "owned"; }
-  steer(input: unknown, intent: unknown) { return this.admit(input, intent); }
   async restore(...args: unknown[]) { this.restores.push(args); return "owned"; }
   observe() { return this.done; }
   async close() { this.finish({ turnId: "owned", status: "interrupted", imageGenerations: [] }); }
@@ -487,4 +486,25 @@ test("shutdown during the sending snapshot starts no provider request", async ()
     assert.equal(f.sends.length, 0);
     assert.equal(unresolved(f.store.snapshot()).unresolved.length, 1);
   } finally { await f.close(); }
+});
+
+test("a stalled request receives 408 before its socket closes", async () => {
+  const { createConnection } = await import("node:net");
+  const f = await fixture(); const server = createGatewayServer(f.gateway);
+  try {
+    await f.gateway.start();
+    // Use a short real socket timeout while retaining the production timeout handler.
+    server.once("request", (request) => request.setTimeout(20));
+    await listenGateway(server, 0);
+    const response = await new Promise<string>((resolve, reject) => {
+      const socket = createConnection({ host: "127.0.0.1", port: (server.address() as { port: number }).port });
+      let received = "";
+      socket.setEncoding("utf8"); socket.setTimeout(3000, () => socket.destroy(new Error("timeout response missing")));
+      socket.on("error", reject); socket.on("data", (chunk) => { received += chunk; }); socket.on("end", () => resolve(received));
+      socket.on("connect", () => socket.write(`POST /webhooks/sendblue/account HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nsb-signing-secret: ${f.connector.signingSecret}\r\nContent-Length: 100\r\n\r\n{`));
+    });
+    assert.match(response, /^HTTP\/1\.1 408 /);
+    assert.match(response, /connection: close/i);
+    assert.equal(f.store.snapshot().routes.route!.seenMessages.length, 0);
+  } finally { await closeGatewayServer(server); await f.close(); }
 });

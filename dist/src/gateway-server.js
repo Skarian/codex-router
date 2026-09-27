@@ -44,14 +44,14 @@ async function body(request) {
         request.once("end", end);
         request.once("error", error);
         request.once("aborted", aborted);
-        request.setTimeout(60000, () => { cleanup(); reject(new HttpFailure(408)); request.destroy(); });
+        request.setTimeout(60000, () => { cleanup(); reject(new HttpFailure(408)); request.resume(); });
     });
 }
 export function createGatewayServer(gateway) {
     const server = createServer((request, response) => {
         void handle(gateway, request, response).catch((error) => {
             if (!response.headersSent)
-                response.writeHead(error instanceof HttpFailure ? error.status : 503);
+                response.writeHead(error instanceof HttpFailure ? error.status : 503, error instanceof HttpFailure && error.status === 408 ? { connection: "close" } : {});
             response.end();
         });
     });

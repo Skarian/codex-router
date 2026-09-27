@@ -33,7 +33,7 @@ export interface GatewayConnector {
     upload(path: string, name: string, mediaType: string, signal: AbortSignal): Promise<string>;
     typing(route: GatewayRoute, state: "start" | "stop", signal: AbortSignal): Promise<void>;
 }
-export type GatewaySession = Pick<TurnSession, "resume" | "admit" | "steer" | "observe" | "restore" | "close" | "artifactBaseline" | "serverInfo" | "filesystem">;
+export type GatewaySession = Pick<TurnSession, "resume" | "admit" | "observe" | "restore" | "close" | "artifactBaseline" | "serverInfo" | "filesystem">;
 export interface GatewayFiles {
     cleanup(state: GatewayState): Promise<void>;
     release?(route: GatewayRoute, active: CodexWork | Delivery, session?: GatewaySession): Promise<void>;

@@ -111,18 +111,6 @@ export function waitForOutcome(
   });
 }
 
-export async function waitForTurn(
-  client: JsonRpcClient,
-  threadId: string,
-  turnId: string,
-  emit: (message: SemanticMessage) => void,
-  signal?: AbortSignal,
-  initialNotifications: ReadonlyArray<Notification> = [],
-  state: TurnState = { seenItemIds: new Set(), seenSemanticUnits: new Set() },
-): Promise<SemanticMessage> {
-  return textResult(await waitForOutcome(client, threadId, turnId, emit, signal, initialNotifications, state));
-}
-
 export function textResult(outcome: TurnOutcome): SemanticMessage {
   if (outcome.status === "completed" && outcome.finalText !== undefined) {
     return { type: "completed", text: outcome.finalText };
@@ -226,11 +214,6 @@ export function findCorrelatedTurn(resumeResult: unknown, turnId: string | undef
     })) return turn;
   }
   return undefined;
-}
-
-export function terminalResult(turn: Record<string, unknown>, state: TurnState): SemanticMessage | undefined {
-  const outcome = terminalOutcome(turn, state);
-  return outcome ? textResult(outcome) : undefined;
 }
 
 export function acceptedTurnId(result: unknown, operation: "turn/start" | "thread/resume"): string {

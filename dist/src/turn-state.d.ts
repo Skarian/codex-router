@@ -30,7 +30,6 @@ export interface SemanticMessage {
 }
 export declare function resumedThreadState(resumeResult: unknown): ResumedThreadState;
 export declare function waitForOutcome(client: JsonRpcClient, threadId: string, turnId: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal, initialNotifications?: ReadonlyArray<Notification>, state?: TurnState): Promise<TurnOutcome>;
-export declare function waitForTurn(client: JsonRpcClient, threadId: string, turnId: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal, initialNotifications?: ReadonlyArray<Notification>, state?: TurnState): Promise<SemanticMessage>;
 export declare function textResult(outcome: TurnOutcome): SemanticMessage;
 export declare function terminalOutcome(turn: Record<string, unknown>, state: TurnState): TurnOutcome | undefined;
 export declare function applyTurnItems(turn: Record<string, unknown>, state: TurnState, emit: (message: SemanticMessage) => void): void;
@@ -38,6 +37,5 @@ export declare function applyTurnItems(turn: Record<string, unknown>, state: Tur
 export declare function applyResumedImages(turn: Record<string, unknown>, state: TurnState): void;
 export declare function baselineTurnItems(turn: Record<string, unknown>, state: TurnState): void;
 export declare function findCorrelatedTurn(resumeResult: unknown, turnId: string | undefined, clientUserMessageId: string): Record<string, unknown> | undefined;
-export declare function terminalResult(turn: Record<string, unknown>, state: TurnState): SemanticMessage | undefined;
 export declare function acceptedTurnId(result: unknown, operation: "turn/start" | "thread/resume"): string;
 export declare function acceptedSteerTurnId(result: unknown, expectedTurnId: string): string;

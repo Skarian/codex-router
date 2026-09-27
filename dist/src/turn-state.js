@@ -80,9 +80,6 @@ export function waitForOutcome(client, threadId, turnId, emit, signal, initialNo
             signal?.addEventListener("abort", onAbort, { once: true });
     });
 }
-export async function waitForTurn(client, threadId, turnId, emit, signal, initialNotifications = [], state = { seenItemIds: new Set(), seenSemanticUnits: new Set() }) {
-    return textResult(await waitForOutcome(client, threadId, turnId, emit, signal, initialNotifications, state));
-}
 export function textResult(outcome) {
     if (outcome.status === "completed" && outcome.finalText !== undefined) {
         return { type: "completed", text: outcome.finalText };
@@ -193,10 +190,6 @@ export function findCorrelatedTurn(resumeResult, turnId, clientUserMessageId) {
             return turn;
     }
     return undefined;
-}
-export function terminalResult(turn, state) {
-    const outcome = terminalOutcome(turn, state);
-    return outcome ? textResult(outcome) : undefined;
 }
 export function acceptedTurnId(result, operation) {
     const turn = operation === "turn/start" ? object(object(result)?.turn) : object(result);

@@ -118,4 +118,4 @@ See [Gateway technical contracts](gateway-contracts.md) for exact state, callbac
 
 ## Validation status
 
-Automated tests cover provider payloads, durable recovery, callbacks, retries, file transfer, and shutdown. Live Codex checks cover local and SSH connections. Real Sendblue delivery and public EXE.dev webhook validation remain required before release.
+Automated tests cover provider payloads, durable recovery, callbacks, retries, file transfer, and shutdown. Live checks cover local and SSH Codex connections, file transfers, and the public EXE.dev webhook. Real Sendblue delivery validation remains required before release.

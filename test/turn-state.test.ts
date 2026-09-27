@@ -7,7 +7,7 @@ import {
   acceptedTurnId,
   findCorrelatedTurn,
   resumedThreadState,
-  waitForTurn,
+  waitForOutcome,
   type SemanticMessage,
 } from "../src/turn-state.js";
 import type { MessageTransport, TransportKind } from "../src/transport.js";
@@ -62,11 +62,11 @@ test("resumed thread state requires one authoritative active turn", () => {
   }
 });
 
-test("waitForTurn emits only completed semantic units and the terminal final answer", async () => {
+test("waitForOutcome emits only completed semantic units and the terminal final answer", async () => {
   const transport = new EventTransport();
   const client = new JsonRpcClient(transport);
   const emitted: SemanticMessage[] = [];
-  const result = waitForTurn(client, "thread", "turn", (message) => emitted.push(message));
+  const result = waitForOutcome(client, "thread", "turn", (message) => emitted.push(message));
 
   transport.receive("item/completed", { threadId: "thread", turnId: "turn", item: { type: "commandExecution", command: "secret" } });
   transport.receive("item/completed", { threadId: "thread", turnId: "turn", item: { type: "reasoning", summary: ["First", "Second"] } });
@@ -78,27 +78,27 @@ test("waitForTurn emits only completed semantic units and the terminal final ans
     { type: "reasoning", text: "First\n\nSecond" },
     { type: "commentary", text: "Progress" },
   ]);
-  assert.deepEqual(await result, { type: "completed", text: "Done" });
+  assert.deepEqual(await result, { turnId: "turn", status: "completed", finalText: "Done", imageGenerations: [] });
 });
 
-test("waitForTurn drains terminal notifications buffered before subscription", async () => {
+test("waitForOutcome drains terminal notifications buffered before subscription", async () => {
   const transport = new EventTransport();
   const client = new JsonRpcClient(transport);
-  const result = waitForTurn(client, "thread", "fast-turn", () => undefined, undefined, [
+  const result = waitForOutcome(client, "thread", "fast-turn", () => undefined, undefined, [
     { method: "item/completed", params: { threadId: "thread", turnId: "fast-turn", item: { type: "agentMessage", phase: "final_answer", text: "Immediate" } } },
     { method: "turn/completed", params: { threadId: "thread", turn: { id: "fast-turn", status: "completed" } } },
   ]);
-  assert.deepEqual(await result, { type: "completed", text: "Immediate" });
+  assert.deepEqual(await result, { turnId: "fast-turn", status: "completed", finalText: "Immediate", imageGenerations: [] });
 });
 
-test("waitForTurn ignores the removed router deadline and completes only on terminal state", async () => {
+test("waitForOutcome ignores the removed router deadline and completes only on terminal state", async () => {
   const previous = process.env.CODEX_ROUTER_TURN_TIMEOUT_MS;
   process.env.CODEX_ROUTER_TURN_TIMEOUT_MS = "1";
   try {
     const transport = new EventTransport();
     const client = new JsonRpcClient(transport);
     let settled = false;
-    const result = waitForTurn(client, "thread", "long-turn", () => undefined).finally(() => { settled = true; });
+    const result = waitForOutcome(client, "thread", "long-turn", () => undefined).finally(() => { settled = true; });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(settled, false);
     transport.receive("item/completed", {
@@ -107,18 +107,18 @@ test("waitForTurn ignores the removed router deadline and completes only on term
       item: { id: "final", type: "agentMessage", phase: "final_answer", text: "Eventually done" },
     });
     transport.receive("turn/completed", { threadId: "thread", turn: { id: "long-turn", status: "completed" } });
-    assert.deepEqual(await result, { type: "completed", text: "Eventually done" });
+    assert.deepEqual(await result, { turnId: "long-turn", status: "completed", finalText: "Eventually done", imageGenerations: [] });
   } finally {
     if (previous === undefined) delete process.env.CODEX_ROUTER_TURN_TIMEOUT_MS;
     else process.env.CODEX_ROUTER_TURN_TIMEOUT_MS = previous;
   }
 });
 
-test("waitForTurn exits promptly when the caller aborts", async () => {
+test("waitForOutcome exits promptly when the caller aborts", async () => {
   const transport = new EventTransport();
   const client = new JsonRpcClient(transport);
   const controller = new AbortController();
-  const result = waitForTurn(client, "thread", "turn", () => undefined, controller.signal);
+  const result = waitForOutcome(client, "thread", "turn", () => undefined, controller.signal);
   controller.abort();
   await assert.rejects(
     result,
@@ -126,33 +126,33 @@ test("waitForTurn exits promptly when the caller aborts", async () => {
   );
 });
 
-test("waitForTurn does not re-emit items restored after reconnect", async () => {
+test("waitForOutcome does not re-emit items restored after reconnect", async () => {
   const transport = new EventTransport();
   const client = new JsonRpcClient(transport);
   const emitted: SemanticMessage[] = [];
   const state = { seenItemIds: new Set<string>(), seenSemanticUnits: new Set<string>() };
-  const result = waitForTurn(client, "thread", "turn", (message) => emitted.push(message), undefined, [
+  const result = waitForOutcome(client, "thread", "turn", (message) => emitted.push(message), undefined, [
     { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "reason", type: "reasoning", summary: ["Once"] } } },
     { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "reason", type: "reasoning", summary: ["Once"] } } },
     { method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed", items: [{ id: "final", type: "agentMessage", phase: "final_answer", text: "Done" }] } } },
   ], state);
-  assert.deepEqual(await result, { type: "completed", text: "Done" });
+  assert.deepEqual(await result, { turnId: "turn", status: "completed", finalText: "Done", imageGenerations: [] });
   assert.deepEqual(emitted, [{ type: "reasoning", text: "Once" }]);
 });
 
-test("waitForTurn deduplicates replayed semantic content even when persisted item ids change", async () => {
+test("waitForOutcome deduplicates replayed semantic content even when persisted item ids change", async () => {
   const transport = new EventTransport();
   const client = new JsonRpcClient(transport);
   const emitted: SemanticMessage[] = [];
   const state = { seenItemIds: new Set<string>(), seenSemanticUnits: new Set<string>() };
-  const result = waitForTurn(client, "thread", "turn", (message) => emitted.push(message), undefined, [
+  const result = waitForOutcome(client, "thread", "turn", (message) => emitted.push(message), undefined, [
     { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "live", type: "agentMessage", phase: "commentary", text: "Same progress" } } },
     { method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed", items: [
       { id: "persisted", type: "agentMessage", phase: "commentary", text: "Same progress" },
       { id: "final", type: "agentMessage", phase: "final_answer", text: "Done" },
     ] } } },
   ], state);
-  assert.deepEqual(await result, { type: "completed", text: "Done" });
+  assert.deepEqual(await result, { turnId: "turn", status: "completed", finalText: "Done", imageGenerations: [] });
   assert.deepEqual(emitted, [{ type: "commentary", text: "Same progress" }]);
 });
 

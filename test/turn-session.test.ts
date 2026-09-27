@@ -600,13 +600,13 @@ test("shared session steers twice while one observation waits", async () => {
     await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
     const observed = session.observe("shared");
     await Promise.all([
-      session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" }),
-      session.steer(input, { clientUserMessageId: "third", expectedTurnId: "shared" }),
+      session.admit(input, { clientUserMessageId: "second", expectedTurnId: "shared" }),
+      session.admit(input, { clientUserMessageId: "third", expectedTurnId: "shared" }),
     ]);
     transport.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed", items: [] } });
     assert.deepEqual(await observed, { turnId: "shared", status: "completed", imageGenerations: [] });
     assert.equal(steers, 3);
-    await assert.rejects(session.steer(input, { clientUserMessageId: "fourth", expectedTurnId: "shared" }));
+    await assert.rejects(session.admit(input, { clientUserMessageId: "fourth", expectedTurnId: "shared" }));
     assert.equal(steers, 3);
   } finally { await session.close(); }
 });
@@ -646,8 +646,8 @@ test("recovery during a later steer publishes one replacement for observation an
     const input = [{ type: "text" as const, text: "hello", text_elements: [] }];
     await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
     const observed = session.observe("shared");
-    await session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" });
-    await session.steer(input, { clientUserMessageId: "third", expectedTurnId: "shared" });
+    await session.admit(input, { clientUserMessageId: "second", expectedTurnId: "shared" });
+    await session.admit(input, { clientUserMessageId: "third", expectedTurnId: "shared" });
     recovered.receive("turn/completed", { threadId: "thread", turn: { id: "shared", status: "completed", items: [] } });
     assert.equal((await observed).status, "completed");
     assert.equal(recoveryCount, 1);
@@ -681,7 +681,7 @@ test("completed turn cannot prove that an unacknowledged later steer was accepte
   await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
   const observed = session.observe("shared");
   let settled = false;
-  const steer = session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" });
+  const steer = session.admit(input, { clientUserMessageId: "second", expectedTurnId: "shared" });
   const checked = assert.rejects(steer, (error: unknown) => error instanceof RouterError && error.ambiguous);
   void steer.finally(() => { settled = true; }).catch(() => undefined);
   assert.equal((await observed).status, "completed");
@@ -725,7 +725,7 @@ test("completion racing a definite rejection preserves the owned observation", a
     const input = [{ type: "text" as const, text: "hello", text_elements: [] }];
     await session.admit(input, { clientUserMessageId: "first", expectedTurnId: "shared" });
     const observed = session.observe("shared");
-    await assert.rejects(session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" }),
+    await assert.rejects(session.admit(input, { clientUserMessageId: "second", expectedTurnId: "shared" }),
       (error: unknown) => error instanceof RpcRequestError && !error.ambiguous && error.payload.message === "no active turn");
     assert.equal((await observed).status, "completed");
   } finally { await session.close(); }
@@ -755,7 +755,7 @@ test("close during shared recovery rejects queued admissions and closes the late
   const observed = assert.rejects(session.observe("shared"), (error: unknown) => error instanceof RouterError && error.code === "interrupted");
   initial.disconnect();
   await started;
-  const queued = assert.rejects(session.steer(input, { clientUserMessageId: "second", expectedTurnId: "shared" }));
+  const queued = assert.rejects(session.admit(input, { clientUserMessageId: "second", expectedTurnId: "shared" }));
   const closed = session.close();
   release({ ...scriptedConnection(new ScriptedTransport(() => ({}))), close: async () => { laterCloses++; } });
   await Promise.all([closed, observed, queued]);
@@ -839,4 +839,38 @@ test("terminal resume retains completed native events buffered before its respon
     await session.restore("shared", undefined, []);
     assert.deepEqual((await session.observe("shared")).imageGenerations, [{ id: "image", savedPath: "/new.png" }]);
   } finally { await session.close(); }
+});
+
+test("a foreground process stays alive between disconnected SSH sockets", async () => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const script = `
+import {TurnSession} from ${JSON.stringify(new URL("../src/turn-session.js", import.meta.url).href)};
+import {JsonRpcClient} from ${JSON.stringify(new URL("../src/json-rpc.js", import.meta.url).href)};
+class Transport {
+  kind = "proxy";
+  constructor(completed) { this.completed = completed; }
+  onMessage(fn) { this.message = fn; return () => {}; }
+  onClose(fn) { this.closed = fn; return () => {}; }
+  async start() {}
+  async close() {}
+  async send(request) {
+    const turn = {id:"turn", status:this.completed ? "completed" : "inProgress", items:this.completed ? [{id:"final",type:"agentMessage",phase:"final_answer",text:"recovered"}] : []};
+    this.message({id:request.id,result:{thread:{status:{type:this.completed ? "idle" : "active"},turns:[turn]}}});
+  }
+}
+const first = new Transport(false), next = new Transport(true);
+const connection = t => ({client:new JsonRpcClient(t),transportKind:"proxy",close:async()=>{}});
+const session = await TurnSession.open({id:"qa",label:"QA",threadId:"thread",cwd:"/tmp",model:"test",sshHost:"test"}, {
+  checkDirectory:async()=>({ok:true}), connect:async()=>connection(first),clientUserMessageId:()=>"unused",reconnectDelaysMs:[30],
+  recovery:{connectLocalProxy:async()=>{throw Error("unused")},connectRemote:async()=>connection(next)}
+});
+await session.restore("turn",undefined,[]);
+const result=session.observe("turn");
+setTimeout(()=>first.closed(new Error("connection lost")),10);
+console.log((await result).finalText);
+await session.close();
+`;
+  const result = await promisify(execFile)(process.execPath, ["--input-type=module", "--eval", script], { timeout: 5000 });
+  assert.equal(result.stdout.trim(), "recovered");
 });

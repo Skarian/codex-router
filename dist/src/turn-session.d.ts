@@ -68,7 +68,6 @@ export declare class TurnSession {
     private checkOpen;
     resume(): Promise<ReturnType<typeof resumedThreadState>>;
     admit(input: readonly TurnInput[], intent: AdmissionIntent): Promise<string>;
-    steer(input: readonly TurnInput[], intent: AdmissionIntent): Promise<string>;
     private admitOnce;
     /** Reconstruct durable work without starting or steering a turn. */
     restore(turnId: string | undefined, intent: AdmissionIntent | undefined, artifactBaseline: readonly string[]): Promise<string>;

@@ -114,51 +114,9 @@ Do not publish partial artifacts or intermediate text.
 
 When delivery ends, release the route. Keep the existing one-shot text and error behavior in `sendTurn()`.
 
-## 2. Configuration contract
+## 2. Route identity
 
-Use this V1 TOML shape:
-
-```toml
-[gateway]
-listen_port = 8787
-public_url = "https://example.exe.xyz"
-# state_dir = "/absolute/optional/path"
-
-[[gateway.sendblue]]
-id = "personal"
-api_key_id_env = "SENDBLUE_API_KEY_ID"
-api_secret_key_env = "SENDBLUE_API_SECRET_KEY"
-webhook_secret_env = "SENDBLUE_WEBHOOK_SECRET"
-
-[[gateway.routes]]
-id = "home-messages"
-sendblue = "personal"
-sender = "+15125550100"
-sendblue_number = "+15125550200"
-agent = "home"
-```
-
-The configuration follows these rules:
-
-- The gateway always binds `127.0.0.1`.
-- `listen_port` is required and must be from 1 through 65535.
-- `public_url` is an HTTPS origin without a path, query, or fragment.
-- If present, `state_dir` must be absolute.
-- Sendblue IDs and route IDs use the existing agent-ID format.
-- Environment-variable fields contain names instead of secrets.
-- `sendblue_number` is the inbound destination and outbound `from_number`.
-- `sender` is the only permitted end-user number for the route.
-- `sendblue` references one `gateway.sendblue` entry.
-- `agent` references one existing agent ID.
-- Quiet batching is five seconds and maximum batching is 30 seconds.
-
-The router never changes the account `globalSecret`. The configured signing secret must match that account value.
-
-Existing commands validate the gateway structure. Only `gateway` resolves gateway secrets from the environment.
-
-Validate target uniqueness across resolved routes. Reject two routes that reference the same agent, even through different conversation numbers.
-
-Also reject duplicate configured `thread_id` values. Other Codex clients can still use a routed task.
+The [CLI reference](cli-reference.md#gateway-configuration-contract) defines the configuration fields and validation rules.
 
 ### Route identity across restarts
 
@@ -182,113 +140,8 @@ Retain removed idle route records until their identities expire. This prevents a
 
 ## 3. Durable state contract
 
-Use one versioned gateway record:
-
-```ts
-interface GatewayState {
-  version: 1;
-  routes: Record<string, RouteState>;
-}
-
-interface RouteState {
-  binding: RouteBinding;
-  nextSequence: number;
-  seenMessages: Array<{ sendblueId: string; messageHandle: string; receivedAtMs: number }>;
-  openBatch?: Batch;
-  queue: Batch[];
-  active?: CodexWork | Delivery;
-}
-
-interface RouteBinding {
-  sendblueId: string;
-  sender: string;
-  sendblueNumber: string;
-  target: {
-    sshHost: string | null;
-    threadId: string;
-    cwd: string;
-  };
-}
-
-interface Batch {
-  id: string;
-  openedAtMs: number;
-  quietDeadlineMs: number;
-  maximumDeadlineMs: number;
-  events: InboundEvent[];
-}
-
-interface InboundEvent {
-  messageHandle: string;
-  providerTimeMs: number;
-  receiptSequence: number;
-  text: string;
-  attachment?: InboundAttachment;
-}
-
-type InboundAttachment =
-  | {
-      state: "pending";
-      sourceUrl: string;
-      name: string;
-    }
-  | {
-      state: "ready";
-      name: string;
-      mediaType: string;
-      inputKind: "image" | "file";
-      localPath: string;
-      hostPath: string;
-    }
-  | {
-      state: "omitted";
-      name: string;
-      reason: "download_failed" | "invalid_media" | "copy_failed";
-    };
-
-interface CodexWork {
-  kind: "codex";
-  ownerBatchId: string;
-  joinedBatchIds: string[];
-  batches: Batch[];
-  turnId?: string;
-  pendingAdmission?: AdmissionIntent;
-  publicationIds: string[];
-  artifactBaseline: string[];
-  admissionFailed?: true;
-}
-
-interface AdmissionIntent {
-  batchId: string;
-  clientUserMessageId: string;
-  publicationId: string;
-  expectedTurnId?: string;
-}
-
-interface Delivery {
-  kind: "delivery";
-  id: string;
-  batchIds: string[];
-  parts: DeliveryPart[];
-}
-
-interface DeliveryPart {
-  id: string;
-  payload:
-    | { kind: "text"; text: string }
-    | { kind: "media"; localPath: string; name: string; mediaType: string; mediaUrl: string };
-  status: "ready" | "sending" | "accepted" | "failed" | "skipped";
-  callbackToken?: string;
-  providerHandle?: string;
-}
-
-type ArtifactOmissionReason =
-  | "unsafe_file"
-  | "changing_file"
-  | "copy_failed"
-  | "upload_failed"
-  | "connector_limit";
-```
+The [state schemas](../src/gateway-state.ts) define the versioned record and its TypeScript types.
+The record stores route bindings, deduplication identities, queued batches, active Codex work, and ordered delivery parts.
 
 Each delivery part uses these transitions:
 
@@ -437,7 +290,8 @@ The HTTP server permits 30 seconds for request headers. It permits 60 seconds of
 
 All webhook and callback bodies have a 256 KiB raw-body limit.
 
-All timers are abortable and do not keep the process alive. Shutdown aborts each active HTTP request.
+Request deadline timers do not keep the process alive. Reconnection waits keep an active CLI command alive between sockets.
+Shutdown aborts each active HTTP request and reconnection wait.
 
 Do not add a total operation deadline. Do not add deadlines to Codex work, local streams, SSH streams, queued batches, or blocked routes.
 
@@ -533,118 +387,20 @@ An abort cannot undo a request that already reached Sendblue. The accepted dupli
 
 An unknown status does not settle the part. Sendblue documents three webhook retries and a 45-second response window.
 
-## 7. CLI contract
+## 7. Operator and HTTP interfaces
 
-Add only these commands:
+The [CLI reference](cli-reference.md#gateway-commands) defines status, resolution, and output contracts.
+The [HTTP reference](cli-reference.md#gateway-http-contract) defines paths, authentication, response statuses, and body limits.
+The [recovery procedure](gateway.md#recover-an-uncertain-operation) explains operator actions.
 
-```text
-codex-router [--config PATH] gateway
-codex-router [--config PATH] gateway status [--json]
-codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID failed [--json]
-codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE [--json]
-```
+Status and resolution require the stopped gateway state lock. A Codex admission permits only failed resolution.
+An operator-failed admission retains its input files until the owned turn ends. It never triggers another submission.
+An accepted send resolution continues later parts. A failed send resolution skips later parts.
 
-`gateway` runs in the foreground. Do not add start, stop, daemon, restart, or gateway-specific doctor commands.
+Readiness follows local recovery. Unavailable hosts and unresolved route effects do not change global readiness.
+Shutdown sets readiness false before it stops intake.
 
-`gateway status` and `gateway resolve` acquire the state lock. They fail while the gateway runs.
-
-Use the client message ID as a Codex effect ID. Use the delivery-part ID as a Sendblue effect ID.
-
-The `failed` resolution applies to an uncertain Codex admission or Sendblue part. The `accepted` resolution applies only to a Sendblue part.
-
-When a Codex admission resolves as failed, clear its intent and set `admissionFailed` in one transaction.
-
-If no accepted turn exists, create one failure delivery. Otherwise, preserve the owned turn and its file references until terminal observation.
-
-Add this notice to its terminal response: `Codex did not confirm the latest input. It was not sent again.`
-
-If no accepted turn exists, use that notice as the entire failure delivery.
-
-Do not interrupt the owned turn or admit another turn during this recovery.
-
-When a Sendblue part resolves as accepted, store the handle. On restart, continue with later ready parts.
-
-When a Sendblue part resolves as failed, skip later ready parts.
-
-Use this JSON status shape:
-
-```json
-{
-  "unresolved": [
-    {
-      "routeId": "home-messages",
-      "effectId": "part-uuid",
-      "kind": "send"
-    }
-  ]
-}
-```
-
-`gateway status` fails with `gateway_running` while the foreground gateway owns the lock. Use the health endpoints for live status.
-
-The `kind` value is `codex_admission` or `send`.
-
-Use this JSON resolution shape:
-
-```json
-{
-  "type": "resolved",
-  "routeId": "home-messages",
-  "effectId": "part-uuid",
-  "resolution": "failed"
-}
-```
-
-An accepted Sendblue resolution also contains `providerHandle`.
-
-Keep the existing exit rules. Success uses 0, invalid command use uses 2, and operational failure uses 1.
-
-Add `gateway_running` and `effect_not_found` as operational failure codes.
-
-## 8. HTTP contract
-
-All POST responses have an empty body.
-
-### Inbound webhook
-
-`POST /webhooks/sendblue/<sendblue-id>` returns these statuses:
-
-- 204 for an accepted, duplicate, or intentionally ignored event.
-- 400 for malformed authenticated JSON or invalid documented fields.
-- 401 for a missing or incorrect signing secret.
-- 404 for an unknown Sendblue ID or path.
-- 413 for a body larger than 256 KiB.
-- 415 for a non-JSON content type.
-- 503 for unavailable readiness or durable-storage failure.
-
-Return 204 without state changes for authenticated outbound events, groups, unknown senders, and unmatched numbers.
-
-### Status callback
-
-`POST /callbacks/sendblue/<sendblue-id>/<part-id>/<token>` returns these statuses:
-
-- 204 for settlement, duplicate, stale part, unknown status, or a non-settling negative callback.
-- 400 for malformed authenticated JSON or invalid documented fields.
-- 401 for a missing or incorrect signing secret.
-- 401 for an incorrect token on a current part.
-- 404 for an unknown Sendblue ID or path.
-- 413 for a body larger than 256 KiB.
-- 415 for a non-JSON content type.
-- 503 for a required durable-write failure.
-
-Validate the signing header before parsing the body. After valid account authentication, a stale part returns 204.
-
-### Health
-
-`GET /healthz` returns 200 with `{"ok":true}` after the HTTP server binds.
-
-After local startup recovery, `GET /readyz` returns 200 with `{"ready":true}`. Before that point, it returns 503 with `{"ready":false}`.
-
-Host recovery and uncertain route effects do not change global readiness. Shutdown sets readiness false before stopping intake.
-
-Other methods return 405. Other paths return 404.
-
-## 9. Security and privacy rules
+## 8. Security and privacy rules
 
 Authenticate a webhook from its raw body before JSON parsing. Match exactly one static route after authentication.
 
@@ -664,7 +420,7 @@ An unavailable or unsafe publication directory adds an omission notice. Valid te
 
 Publication discovery stays inside gateway-owned directories. The exact native-image import in section 4 is the only outside-file exception.
 
-## 10. Implementation proof matrix
+## 9. Implementation proof matrix
 
 Use deterministic tests for state transitions, timers, and injected failures. Use live probes for provider payloads and platform behavior.
 
@@ -710,7 +466,7 @@ Release validation must prove these contracts. Historical probes provide context
 - Validate the configured `sb-signing-secret` on inbound and status callbacks.
 - Validate five-second quiet batching and the 30-second maximum.
 - Validate typing during batching and useful work.
-- Validate every HTTP status and body limit in section 8.
+- Validate every HTTP status and body limit in the [HTTP reference](cli-reference.md#gateway-http-contract).
 - Validate message, typing, upload, header, and body-inactivity deadlines.
 - Drop a response after provider acceptance and record each physical request.
 - Race each callback status against retry delays, active requests, and late errors.
@@ -750,7 +506,7 @@ After live tests:
 
 Never delete a pre-existing VM, task, credential, or path. If an identity is uncertain, leave the resource unchanged and report it.
 
-## 11. V1 limits
+## 10. V1 limits
 
 V1 does not include these features:
 
@@ -762,7 +518,7 @@ V1 does not include these features:
 
 The code keeps one narrow connector boundary for later connectors. It does not add a registry before a second connector exists.
 
-## 12. Primary references
+## 11. Primary references
 
 - [Codex app-server README](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md).
 - [Sendblue webhooks](https://docs.sendblue.com/getting-started/webhooks/).

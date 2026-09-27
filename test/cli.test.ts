@@ -72,7 +72,7 @@ test("stream EPIPE aborts observation, reaps owned app-server, and never resends
   const home = join(directory, "codex-home");
   await mkdir(home);
   await writeFile(fakeCodex, `#!/usr/bin/env node
-import { appendFileSync, writeFileSync } from "node:fs";
+const { appendFileSync, writeFileSync } = require("node:fs");
 writeFileSync(process.env.FAKE_CODEX_PID, String(process.pid));
 process.on("SIGTERM", () => {});
 let buffer = "";
