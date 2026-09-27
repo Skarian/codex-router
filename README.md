@@ -14,11 +14,15 @@ The gateway saves accepted input and pending responses across restarts.
 
 ## Install
 
+Install the published [npm package](https://www.npmjs.com/package/@skarian/codex-router).
 Requires Node.js 20.17–20.x or 22.9 and newer.
 
 ```sh
-npm install --global @skarian/codex-router
+npm install --global @skarian/codex-router@latest
 ```
+
+On Windows PowerShell, use `npm.cmd` in place of `npm`.
+No repository checkout or build step is required.
 
 The command name is `codex-router`. The unscoped npm package `codex-router` is a different project.
 
@@ -29,6 +33,18 @@ Linux servers use the CLI and app-server path.
 
 For SSH agents, install standalone Codex on the remote host. Its daemon commands must work through noninteractive SSH.
 See [SSH configuration](docs/cli-reference.md#configuration) for the installation and connection requirements.
+
+## Update
+
+Run the same command to install the latest published release:
+
+```sh
+npm install --global @skarian/codex-router@latest
+```
+
+Restart a running gateway after the update. Your configuration stays in `~/.codex-router/config.toml`.
+To install a specific release, replace `@latest` with its version, such as `@0.0.1`.
+Only explicit versioned releases reach npm. Commits to `main` do not publish or update installed copies.
 
 ## Configure a chat
 
