@@ -222,12 +222,16 @@ Direct credentials are read from TOML. Environment references are resolved at ga
 Other commands validate the gateway tables without resolving environment references.
 Doctor reports whether credentials are present, without contacting Sendblue or printing their values.
 
-`gateway status` and `gateway resolve` require the gateway to be stopped. Both commands acquire the state lock.
-They fail with `gateway_running` while another process owns it.
+`gateway status` works while the service runs and never acquires the state lock. It reads a private status snapshot.
+The snapshot refreshes every five seconds. After 15 seconds without an update, status reports `stale`.
+Missing, invalid, or mismatched live snapshots report `unavailable`. Both conditions return exit code 1.
+`gateway resolve` still requires a stopped service and acquires the state lock.
 
-Status JSON contains one `unresolved` array. Each entry contains `routeId`, `effectId`, and `kind`.
-The `kind` value is `codex_admission` or `send`. An empty array means there are no unresolved effects.
-Plain output contains one route, kind, and effect ID per line.
+Status JSON preserves the `unresolved` array and adds a `runtime` object. Each entry contains `routeId`, `effectId`, and `kind`.
+The `kind` value is `codex_admission` or `send`. Check `runtime.state` before interpreting an empty array.
+Live runtime status includes readiness, polling errors, retry times, last polling success, and route activity.
+Stopped status reads unresolved effects from canonical state without changing it.
+Plain output shows runtime state, account and route summaries, then unresolved effect IDs.
 
 Resolution JSON has this shape:
 

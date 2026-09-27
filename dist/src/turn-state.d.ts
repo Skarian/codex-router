@@ -1,5 +1,8 @@
 import type { JsonRpcClient } from "./json-rpc.js";
 export interface TurnState {
+    inputUuid?: string | undefined;
+    inputSeen?: boolean;
+    excludedCommentaryIds?: Set<string>;
     finalText?: string;
     imageGenerations?: Map<string, TurnOutcome["imageGenerations"][number]>;
     artifactBaseline?: ReadonlySet<string>;
@@ -27,7 +30,13 @@ export interface ResumedThreadState {
 export interface SemanticMessage {
     type: "reasoning" | "commentary" | "completed";
     text: string;
+    readonly itemId?: string;
+    readonly turnId?: string;
 }
+/** Native metadata stays internal; CLI JSON remains exactly type and text. */
+export declare function semanticMessage(type: SemanticMessage["type"], text: string, itemId?: string, turnId?: string): SemanticMessage;
+export declare function emitSafely(emit: (message: SemanticMessage) => void, message: SemanticMessage): void;
+export declare function scopeCommentary(turn: Record<string, unknown>, state: TurnState, uuid: string): void;
 export declare function resumedThreadState(resumeResult: unknown): ResumedThreadState;
 export declare function waitForOutcome(client: JsonRpcClient, threadId: string, turnId: string, emit: (message: SemanticMessage) => void, signal?: AbortSignal, initialNotifications?: ReadonlyArray<Notification>, state?: TurnState): Promise<TurnOutcome>;
 export declare function textResult(outcome: TurnOutcome): SemanticMessage;

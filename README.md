@@ -15,7 +15,7 @@ echo 'Turn off the living room light.' |
 
 ## Install
 
-Codex Router requires Node.js 20 or newer and an authenticated Codex CLI.
+Codex Router requires Node.js 20.17–20.x or 22.9 and newer and an authenticated Codex CLI.
 
 ```sh
 npm install --global git+https://github.com/Skarian/codex-router.git

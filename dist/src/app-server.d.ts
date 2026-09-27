@@ -6,6 +6,7 @@ export interface AppServerConnection {
     readonly transportKind: "proxy" | "stdio";
     close(): Promise<void>;
 }
+export declare function localControlSocketState(path: string): Promise<"absent" | "socket" | "other">;
 export declare function remoteControlSocketState(sshHost: string): Promise<RemoteSocketState>;
 export declare function parseRemoteControlSocketState(stdout: string): RemoteSocketState;
 export declare function parseDaemonStartResult(stdout: string): Record<string, unknown>;

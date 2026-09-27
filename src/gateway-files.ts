@@ -1,3 +1,4 @@
+import { preparePrivateDirectory, assertPrivatePath, validateExistingPrivatePaths, assertNativeStoragePath, syncDirectory, noFollowFlag } from "./platform-storage.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream, createWriteStream } from "node:fs";
 import { link, lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
@@ -9,7 +10,7 @@ import { promisify } from "node:util";
 import { fileTypeFromFile } from "file-type";
 import type { GatewayRoute } from "./config.js";
 import { RouterError } from "./errors.js";
-import { delay, type GatewayConnector, type GatewayFiles, type GatewaySession } from "./gateway.js";
+import { delay, type SendblueProvider, type GatewayFiles, type GatewaySession } from "./gateway.js";
 import { ADMISSION_FAILURE, type Batch, type CodexWork, type Delivery, type DeliveryPart, type GatewayState, type InboundAttachment } from "./gateway-state.js";
 import type { TurnOutcome } from "./turn-state.js";
 import { sshProcessSpec } from "./transport.js";
@@ -33,6 +34,7 @@ function localStorage(error: unknown): RouterError {
 
 async function assertNoSymlinks(path: string): Promise<void> {
   if (!isAbsolute(path)) throw new FileOmission("unsafe_file");
+  if (process.platform === "win32") { try { assertNativeStoragePath(path); } catch { throw new FileOmission("unsafe_file"); } }
   let cursor = resolve(path);
   while (true) {
     const stat = await lstat(cursor).catch(() => { throw new FileOmission("unsafe_file"); });
@@ -49,13 +51,9 @@ export async function inspectLocal(path: string): Promise<{ size: number; identi
   return { size: Number(stat.size), identity: [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(":") };
 }
 
-async function syncDirectory(path: string): Promise<void> {
-  const file = await open(path, constants.O_RDONLY);
-  try { await file.sync(); } finally { await file.close(); }
-}
 async function promote(temp: string, destination: string): Promise<void> {
   try {
-    const file = await open(temp, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const file = await open(temp, constants.O_RDWR | noFollowFlag);
     try { await file.sync(); } finally { await file.close(); }
     await link(temp, destination);
     await rm(temp);
@@ -83,7 +81,7 @@ async function streamToLocal(source: NodeJS.ReadableStream, destination: string,
 
 export async function copyLocal(source: string, destination: string, signal: AbortSignal): Promise<void> {
   const before = await inspectLocal(source);
-  await streamToLocal((await open(source, constants.O_RDONLY | constants.O_NOFOLLOW)).createReadStream(), destination, signal);
+  await streamToLocal((await open(source, constants.O_RDONLY | noFollowFlag)).createReadStream(), destination, signal);
   const after = await inspectLocal(source);
   if (before.identity !== after.identity || (await inspectLocal(destination)).size !== before.size) {
     await rm(destination, { force: true }); throw new FileOmission("changing_file");
@@ -235,20 +233,21 @@ export class GatewayFilePlane implements GatewayFiles {
   private spool(kind: "inbox" | "outbox"): string { return join(this.root, kind); }
   private home(session: GatewaySession): string {
     const home = session.serverInfo.codexHome;
-    if (!home || !isAbsolute(home) || session.serverInfo.platformFamily !== "unix") throw new RouterError("codex_unavailable", "The gateway requires an absolute Codex home on a Unix host.");
+    if (!home || !isAbsolute(home) || (session.serverInfo.platformFamily !== "unix" && !(process.platform === "win32" && session.serverInfo.platformFamily === "windows"))) throw new RouterError("codex_unavailable", "The gateway requires an absolute Codex home on a supported host.");
     return join(home, "codex-router-gateway");
   }
   async cleanup(state: GatewayState): Promise<void> {
+    await preparePrivateDirectory(this.directory);
     this.root = await realpath(this.directory);
     const keep = references(state).local;
     for (const name of await readdir(this.root)) {
       if (/^state-[a-f0-9-]{36}\.tmp$/.test(name)) await rm(join(this.root, name), { force: true });
     }
     for (const path of keep) if (dirname(path) !== this.spool("inbox") && dirname(path) !== this.spool("outbox")) throw new RouterError("state_invalid", "A spool reference is outside gateway storage.");
+    if (process.platform === "win32") await validateExistingPrivatePaths([this.spool("inbox"), this.spool("outbox"), ...keep]);
     for (const kind of ["inbox", "outbox"] as const) {
       const directory = this.spool(kind); await mkdir(directory, { recursive: true, mode: 0o700 });
-      const stat = await lstat(directory);
-      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077)) throw new RouterError("state_invalid", "The gateway spool directory is unsafe.");
+      await assertPrivatePath(directory, true);
       for (const name of await readdir(directory)) {
         const path = join(directory, name);
         if (!keep.has(path)) await rm(path, { recursive: true, force: true });
@@ -259,7 +258,10 @@ export class GatewayFilePlane implements GatewayFiles {
     const key = `${route.agent.sshHost ?? "local"}\0${this.home(session)}`;
     let pending = this.reconciled.get(key);
     if (!pending) {
-      pending = this.reconcileHost(route, state, session, signal);
+      pending = this.reconcileHost(route, state, session, signal).catch((error: unknown) => {
+        if (this.reconciled.get(key) === pending) this.reconciled.delete(key);
+        throw error;
+      });
       this.reconciled.set(key, pending);
     }
     return pending;
@@ -276,11 +278,16 @@ export class GatewayFilePlane implements GatewayFiles {
     }
     await session.filesystem("fs/createDirectory", { path, recursive: true });
     if (route.agent.sshHost) await ssh(route, CHECK_PATH + 'chmod 700 -- "$1"', [path], signal);
-    else { const { chmod } = await import("node:fs/promises"); await chmod(path, 0o700); }
+    else if (process.platform !== "win32") { const { chmod } = await import("node:fs/promises"); await chmod(path, 0o700); }
+    else await assertPrivatePath(path, true);
   }
   private async reconcileHost(route: GatewayRoute, state: GatewayState, session: GatewaySession, signal: AbortSignal): Promise<void> {
     const root = this.home(session); const keep = references(state);
+    if (!route.agent.sshHost && process.platform === "win32") await preparePrivateDirectory(root);
     await this.directoryOnHost(route, root, session, signal);
+    if (!route.agent.sshHost && process.platform === "win32") await validateExistingPrivatePaths([
+      join(root, "inbox"), join(root, "outbox"), ...[...keep.host].filter(path => dirname(path) === join(root, "inbox")),
+    ]);
     for (const kind of ["inbox", "outbox"] as const) {
       const path = join(root, kind); await this.directoryOnHost(route, path, session, signal);
       const entries = await session.filesystem("fs/readDirectory", { path }) as { entries: Array<{ fileName: string }> };
@@ -295,6 +302,15 @@ export class GatewayFilePlane implements GatewayFiles {
   }
   async prepareBatch(route: GatewayRoute, batch: Batch, session: GatewaySession, signal: AbortSignal): Promise<Batch> {
     const prepared = structuredClone(batch);
+    if (process.platform === "win32") {
+      const cached: string[] = [];
+      for (const event of prepared.events) if (event.attachment?.state === "pending") {
+        const id = createHash("sha256").update(JSON.stringify([route.id, batch.id, event.messageHandle])).digest("hex");
+        cached.push(join(this.spool("inbox"), id));
+        if (!route.agent.sshHost) cached.push(join(this.home(session), "inbox", id));
+      }
+      await validateExistingPrivatePaths(cached);
+    }
     for (const event of prepared.events) {
       const attachment = event.attachment;
       if (attachment?.state !== "pending") continue;
@@ -327,7 +343,7 @@ export class GatewayFilePlane implements GatewayFiles {
     await this.directoryOnHost(route, path, session, signal);
     return path;
   }
-  async delivery(route: GatewayRoute, work: CodexWork, outcome: TurnOutcome, session: GatewaySession, connector: GatewayConnector, signal: AbortSignal): Promise<DeliveryPart[]> {
+  async delivery(route: GatewayRoute, work: CodexWork, outcome: TurnOutcome, session: GatewaySession, connector: SendblueProvider, signal: AbortSignal): Promise<DeliveryPart[]> {
     const notices: string[] = [];
     const media: DeliveryPart[] = [];
     const hashes = new Set<string>();
@@ -368,6 +384,9 @@ export class GatewayFilePlane implements GatewayFiles {
           if (route.agent.sshHost) await ssh(route, CHECK_PATH + 'test -d "$1" || exit 23', [path], signal);
           else { await assertNoSymlinks(path); if (!(await lstat(path)).isDirectory()) throw new FileOmission("unsafe_file"); }
           listing = await session.filesystem("fs/readDirectory", { path }) as typeof listing;
+          if (!route.agent.sshHost && process.platform === "win32") await validateExistingPrivatePaths([
+            path, ...listing.entries.filter(entry => entry.isFile && safeFilename(entry.fileName) === entry.fileName).map(entry => join(path, entry.fileName)),
+          ]);
         } catch (error) {
           if (signal.aborted) throw error;
           notices.push("Files omitted: the response directory is unavailable or unsafe.");
@@ -400,14 +419,27 @@ export class GatewayFilePlane implements GatewayFiles {
     return [...parts, ...media];
   }
   async release(route: GatewayRoute, active: CodexWork | Delivery, session?: GatewaySession): Promise<void> {
+    const removeLocal = async (path: string, recursive = false): Promise<void> => {
+      try { await lstat(path); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+      await assertNoSymlinks(path);
+      await rm(path, { force: true, recursive });
+    };
+    const removeHost = async (path: string, recursive = false): Promise<void> => {
+      if (!route.agent.sshHost) return removeLocal(path, recursive);
+      await ssh(route, CHECK_PATH + (recursive ? 'rm -rf -- "$1"' : 'rm -f -- "$1"'), [path], AbortSignal.timeout(15000));
+    };
     if (active.kind === "delivery") {
-      for (const part of active.parts) if (part.payload.kind === "media" && dirname(part.payload.localPath) === this.spool("outbox")) await rm(part.payload.localPath, { force: true });
+      for (const part of active.parts) if (part.payload.kind === "media" && dirname(part.payload.localPath) === this.spool("outbox")) await removeLocal(part.payload.localPath);
       return;
     }
+    // Cleanup owns its filesystem operations; the execution session may already
+    // be closed after the prepared delivery became durable.
+    const home = session ? this.home(session) : undefined;
     for (const batch of active.batches) for (const event of batch.events) if (event.attachment?.state === "ready") {
-      if (dirname(event.attachment.localPath) === this.spool("inbox")) await rm(event.attachment.localPath, { force: true });
-      if (session && dirname(event.attachment.hostPath) === join(this.home(session), "inbox")) await session.filesystem("fs/remove", { path: event.attachment.hostPath, force: true });
+      if (dirname(event.attachment.localPath) === this.spool("inbox")) await removeLocal(event.attachment.localPath);
+      if (home && dirname(event.attachment.hostPath) === join(home, "inbox")) await removeHost(event.attachment.hostPath);
     }
-    if (session) for (const id of active.publicationIds) await session.filesystem("fs/remove", { path: join(this.home(session), "outbox", component(id)), recursive: true, force: true });
+    if (home) for (const id of active.publicationIds) await removeHost(join(home, "outbox", component(id)), true);
   }
 }

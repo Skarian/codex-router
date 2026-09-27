@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
 import { parseConfig, type GatewayConfig } from "../src/config.js";
-import { Gateway, type GatewayConnector, type GatewayFiles, type GatewaySession, type SendOutcome } from "../src/gateway.js";
+import { Gateway, type SendblueProvider, type GatewayFiles, type GatewaySession, type SendOutcome } from "../src/gateway.js";
 import { GatewayStore, bindRoutes, resolveEffect, unresolved, type Delivery, type GatewayState } from "../src/gateway-state.js";
 import { createGatewayServer, listenGateway, closeGatewayServer } from "../src/gateway-server.js";
 import type { TurnOutcome } from "../src/turn-state.js";
@@ -25,6 +25,7 @@ public_url="https://example.exe.xyz"
 state_dir=${JSON.stringify(directory)}
 [[gateway.sendblue]]
 id="account"
+mode="webhook"
 api_key_id_env="KEY"
 api_secret_key_env="SECRET"
 webhook_secret_env="SIGNING"
@@ -60,7 +61,7 @@ async function fixture(beforeWrite?: () => Promise<void>) {
   const session = new FakeSession();
   const sends: unknown[] = [];
   const typing: string[] = [];
-  const connector: GatewayConnector = {
+  const connector: SendblueProvider = {
     signingSecret: "test-signing-secret",
     inbound(value) {
       const record = value as { messageHandle?: string; ignored?: boolean };
@@ -88,7 +89,7 @@ async function fixture(beforeWrite?: () => Promise<void>) {
 }
 
 function delivery(): Delivery {
-  return { kind: "delivery", id: "delivery", batchIds: ["batch"], parts: [
+  return { kind: "delivery", id: "delivery", sourceId: "sendblue:account", batchIds: ["batch"], parts: [
     { id: "part-one", status: "ready", payload: { kind: "text", text: "first" } },
     { id: "part-two", status: "ready", payload: { kind: "text", text: "second" } },
   ] };
@@ -179,19 +180,17 @@ test("an idle route rename preserves connector-wide deduplication", async () => 
     await gateway.start();
     await gateway.receive("account", { messageHandle: "seen", sender: "+15125550100", sendblueNumber: "+15125550200", providerTimeMs: Date.now(), text: "duplicate" });
     assert.equal(f.store.snapshot().routes.renamed!.openBatch, undefined);
-    assert.equal(f.store.snapshot().routes.route!.seenMessages.length, 1);
+    assert.equal(f.store.snapshot().routes.route!.receipts!.length, 1);
     await gateway.close();
   } finally { await f.close(); }
 });
 
-test("state lock rejects live owners and replaces a proven dead owner", async () => {
+test("state lock rejects a live owner and permits reopening after close", async () => {
   const directory = await mkdtemp(join(tmpdir(), "gateway-lock-"));
   try {
     const first = await GatewayStore.open(directory);
-    await assert.rejects(GatewayStore.open(directory), (error: unknown) => error instanceof RouterError && error.code === "gateway_running");
+    await assert.rejects(GatewayStore.open(directory), { code: "gateway_running" });
     await first.close();
-    await mkdir(join(directory, "lock"), { mode: 0o700 });
-    await writeFile(join(directory, "lock/owner.json"), JSON.stringify({ pid: 2000000000, host: hostname(), token: "dead" }), { mode: 0o600 });
     const second = await GatewayStore.open(directory); await second.close();
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -227,7 +226,7 @@ test("callback settlement waits for a live retry to drain before the next part",
   const f = await fixture(); let finishRetry!: (outcome: SendOutcome) => void; let calls = 0; let retrySignal: AbortSignal | undefined;
   f.connector.send = async (_route, _part, _url, signal) => {
     calls++;
-    if (calls === 1) return { status: "uncertain", retryable: true, retryAfterMs: 0 };
+    if (calls === 1) return { status: "rejected", retryable: true, retryAfterMs: 0 };
     if (calls === 2) { retrySignal = signal; return new Promise((resolve) => { finishRetry = resolve; }); }
     return { status: "accepted", providerHandle: "next" };
   };
@@ -320,12 +319,12 @@ test("CLI status and resolution require a stopped gateway and never resolve secr
   const args = ["dist/src/cli.js", "--config", path, "gateway"];
   try {
     await assert.rejects(exec(process.execPath, [...args, "status", "--json"]), (error: unknown) => {
-      const result = error as { code: number; stdout: string }; return result.code === 1 && JSON.parse(result.stdout).code === "gateway_running";
+      const result = error as { code: number; stdout: string }; return result.code === 1 && JSON.parse(result.stdout).runtime.state === "unavailable";
     });
     await f.store.transaction((state) => { bindRoutes(state, f.config); const active = delivery(); active.parts[0]!.status = "sending"; active.parts[0]!.callbackToken = "token"; state.routes.route!.active = active; });
     await f.store.close();
     const status = JSON.parse((await exec(process.execPath, [...args, "status", "--json"])).stdout);
-    assert.deepEqual(status, { unresolved: [{ routeId: "route", effectId: "part-one", kind: "send" }] });
+    assert.deepEqual(status, { unresolved: [{ routeId: "route", effectId: "part-one", kind: "send" }], runtime: { state: "stopped" } });
     const result = JSON.parse((await exec(process.execPath, [...args, "resolve", "route", "part-one", "accepted", "observed", "--json"])).stdout);
     assert.deepEqual(result, { type: "resolved", routeId: "route", effectId: "part-one", resolution: "accepted", providerHandle: "observed" });
     await assert.rejects(exec(process.execPath, [...args, "resolve", "route", "part-one", "retry", "--json"]), (error: unknown) => (error as { code: number }).code === 2);
@@ -334,6 +333,7 @@ test("CLI status and resolution require a stopped gateway and never resolve secr
 
 test("a crash after Codex acceptance restores the persisted intent without replay", async () => {
   let fail = false; const f = await fixture(async () => { if (fail) throw new Error("disk full"); });
+  let receipts = 0; f.connector.readReceipt = async () => { receipts++; };
   const original = f.session.admit.bind(f.session);
   f.session.admit = async (input, intent) => {
     const work = f.store.snapshot().routes.route!.active;
@@ -345,11 +345,13 @@ test("a crash after Codex acceptance restores the persisted intent without repla
   try {
     await f.gateway.start(); await f.receive("one"); f.advance(5000); await f.gateway.idle();
     assert.equal(f.session.admissions.length, 1); assert.equal(unresolved(f.store.snapshot()).unresolved.length, 1);
+    assert.equal(receipts, 1);
     await f.gateway.close(); fail = false;
     const restored = new FakeSession();
     restarted = new Gateway(f.config, f.store, { ...f.gateway.operations, openSession: async () => restored });
     await restarted.start(); await restarted.idle();
     assert.equal(restored.admissions.length, 0); assert.equal(restored.restores.length, 1);
+    assert.equal(receipts, 1);
     assert.equal(unresolved(f.store.snapshot()).unresolved.length, 0);
     restored.finish({ turnId: "owned", status: "completed", finalText: "restored", imageGenerations: [] });
     await until(() => f.sends.length === 1); await restarted.idle();
@@ -366,7 +368,7 @@ test("an unavailable host cannot block readiness, durable intake, or a frozen de
       bindRoutes(state, config);
       state.routes.healthy!.active = delivery();
       const now = Date.now();
-      state.routes.route!.queue.push({ id: "queued", openedAtMs: now, quietDeadlineMs: now, maximumDeadlineMs: now, events: [{ messageHandle: "one", providerTimeMs: now, receiptSequence: 0, text: "hello" }] });
+      state.routes.route!.queue.push({ id: "queued", sourceId: "sendblue:account", openedAtMs: now, quietDeadlineMs: now, maximumDeadlineMs: now, events: [{ messageHandle: "one", providerTimeMs: now, receiptSequence: 0, text: "hello" }] });
     });
     gateway = new Gateway(config, f.store, { ...f.gateway.operations, openSession: (_route, signal) => new Promise((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
@@ -413,7 +415,7 @@ test("a negative callback selects settlement before a delayed snapshot and preve
   const waiting = new Promise<void>((resolve) => { entered = resolve; });
   const f = await fixture(async () => { if (block) { entered(); await new Promise<void>((resolve) => { release = resolve; }); } });
   let calls = 0;
-  f.connector.send = async () => { calls++; return { status: "uncertain", retryable: true, retryAfterMs: 50 }; };
+  f.connector.send = async () => { calls++; return { status: "rejected", retryable: true, retryAfterMs: 50 }; };
   try {
     await f.store.transaction((state) => { bindRoutes(state, f.config); state.routes.route!.active = delivery(); });
     await f.gateway.start(); await until(() => calls === 1);
@@ -506,7 +508,7 @@ test("a stalled request receives 408 before its socket closes", async () => {
     });
     assert.match(response, /^HTTP\/1\.1 408 /);
     assert.match(response, /connection: close/i);
-    assert.equal(f.store.snapshot().routes.route!.seenMessages.length, 0);
+    assert.equal(f.store.snapshot().routes.route!.receipts!.length, 0);
   } finally { await closeGatewayServer(server); await f.close(); }
 });
 
@@ -555,4 +557,118 @@ test("gateway adds only connector-provided instructions to new and steered batch
       { type: "text", text: "Connector guidance: /tmp/publication", text_elements: [] },
     ]);
   } finally { await f.close(); }
+});
+
+
+test("read receipts follow durable intake before batching and never hold up replies", async () => {
+  for (const failure of ["pending", "reject", "throw"] as const) {
+    const f = await fixture();
+    let calls = 0;
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    f.connector.readReceipt = () => {
+      calls++;
+      assert.equal(f.store.snapshot().routes.route!.receipts!.length, calls);
+      if (failure === "throw") throw new Error("provider failure");
+      return failure === "reject" ? Promise.reject(new Error("provider failure")) : pending;
+    };
+    try {
+      await f.gateway.start(); await f.receive("first"); await f.receive("first");
+      await f.gateway.idle(); assert.equal(calls, 1);
+      assert.equal(f.session.admissions.length, 0);
+      f.advance(5000); await f.gateway.idle(); assert.equal(calls, 1);
+      await f.receive("followup"); f.advance(5000); await f.gateway.idle(); assert.equal(calls, 2);
+      f.session.finish({ turnId: "owned", status: "completed", finalText: "reply", imageGenerations: [] });
+      await until(() => f.sends.length === 1); await f.gateway.idle();
+      assert.equal(f.store.snapshot().routes.route!.active, undefined);
+      assert.equal(f.gateway.processingStatus()[0]!.state, "idle");
+    } finally { release(); await f.close(); }
+  }
+});
+
+test("read receipts do not wait for Codex availability", async () => {
+  const f = await fixture(); let calls = 0;
+  f.connector.readReceipt = async () => { calls++; };
+  f.session.admit = async () => { throw new RouterError("thread_unavailable", "Unavailable"); };
+  try {
+    await f.gateway.start(); await f.receive("first"); f.advance(5000); await f.gateway.idle();
+    assert.equal(calls, 1);
+  } finally { await f.close(); }
+});
+
+for (const mode of ["poll", "webhook"] as const) test(`ambiguous ${mode} delivery never automatically sends again`, async () => {
+  const f = await fixture(); let calls = 0;
+  f.config.sendblue[0]!.mode = mode;
+  f.connector.send = async () => { calls++; return { status: "uncertain", retryable: true, retryAfterMs: 0 }; };
+  try {
+    await f.store.transaction(state => { bindRoutes(state, f.config); state.routes.route!.active = delivery(); });
+    await f.gateway.start(); await f.gateway.idle();
+    assert.equal(calls, 1);
+    assert.equal((f.store.snapshot().routes.route!.active as Delivery).parts[0]!.status, "sending");
+    assert.equal(f.gateway.processingStatus()[0]!.state, "unresolved");
+  } finally { await f.close(); }
+});
+
+
+test("exhausted definite rejections settle failed instead of remaining uncertain", async () => {
+  const f = await fixture(); let calls = 0;
+  f.connector.send = async () => { calls++; return { status: "rejected", retryable: true, retryAfterMs: 0 }; };
+  try {
+    await f.store.transaction(state => { bindRoutes(state, f.config); state.routes.route!.active = delivery(); });
+    await f.gateway.start(); await f.gateway.idle();
+    assert.equal(calls, 3);
+    assert.equal(f.store.snapshot().routes.route!.active, undefined);
+    assert.equal(f.gateway.processingStatus()[0]!.state, "idle");
+  } finally { await f.close(); }
+});
+
+test("CLI polling recovery requires stopped service and retains admission receipts", async () => {
+  const { execFile } = await import("node:child_process"); const { promisify } = await import("node:util");
+  const exec = promisify(execFile); const f = await fixture();
+  const path = join(f.directory, "poll.toml"); await writeFile(path, configSource(f.directory).replace('mode="webhook"', 'mode="poll"'));
+  const since = new Date(Date.now() - 3600000).toISOString();
+  const args = ["dist/src/cli.js", "--config", path, "gateway", "polling-reset", "account", since, "--json"];
+  try {
+    await assert.rejects(exec(process.execPath, args), (error: unknown) => JSON.parse((error as { stdout: string }).stdout).code === "gateway_running");
+    await f.store.transaction(state => { bindRoutes(state, f.config); state.routes.route!.receipts!.push({ sourceId: "sendblue:account", externalId: "already-read", receivedAtMs: Date.now() }); });
+    await f.store.close();
+    assert.deepEqual(JSON.parse((await exec(process.execPath, args)).stdout), { account: "account", pollingFrom: since });
+    const saved = JSON.parse(await readFile(join(f.directory, "state.json"), "utf8"));
+    assert.equal(saved.polling.account.completedThroughMs, Date.parse(since));
+    assert.equal(saved.routes.route.receipts[0].externalId, "already-read");
+    await assert.rejects(exec(process.execPath, [...args.slice(0, -2), "2000-01-01T00:00:00.000Z", "--json"]));
+  } finally { await f.close(); }
+});
+
+
+test("Sendblue account latency settings control admission batching", async () => {
+  const f = await fixture();
+  try {
+    f.config.sendblue[0]!.batchQuietMs = 1000;
+    const gateway = new Gateway(f.config, f.store, { connector: () => f.connector, files: { async cleanup() {}, async reconcile() {}, async prepareBatch(_r, b) { return b; }, async publication() { return "/tmp"; }, async delivery() { return []; } }, openSession: async () => f.session });
+    try {
+      await gateway.start();
+      await gateway.receive("account", { messageHandle: "fast", sender: "+15125550100", sendblueNumber: "+15125550200", providerTimeMs: Date.now(), text: "fast" });
+      const batch = f.store.snapshot().routes.route!.openBatch!;
+      assert.equal(batch.quietDeadlineMs - batch.openedAtMs, 1000);
+    } finally { await gateway.close(); }
+  } finally { await f.close(); }
+});
+
+test("Sendblue latency configuration validates bounds", () => {
+  const base = configSource("/tmp/config-latency-test");
+  const configured = parseConfig(base.replace('mode="webhook"', 'mode="poll"\npoll_interval_ms=1000\nbatch_quiet_ms=1000')).gateway!;
+  assert.equal(configured.sendblue[0]!.pollIntervalMs, 1000);
+  assert.equal(configured.sendblue[0]!.batchQuietMs, 1000);
+  for (const value of [0, -1, 249, 60001, 1.5]) assert.throws(() => parseConfig(base.replace('mode="webhook"', `mode="poll"\npoll_interval_ms=${value}`)));
+});
+
+test("failed durable intake does not send a read receipt", async () => {
+  let fail = false; const f = await fixture(async () => { if (fail) throw new Error("disk failure"); });
+  let calls = 0; f.connector.readReceipt = async () => { calls++; };
+  try {
+    await f.gateway.start(); fail = true;
+    await assert.rejects(f.receive("first"));
+    await Promise.resolve(); assert.equal(calls, 0);
+  } finally { fail = false; await f.close(); }
 });

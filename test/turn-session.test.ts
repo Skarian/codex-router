@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test, { beforeEach, afterEach } from "node:test";
 import {
-  cancelTurn,
-  sendTurn,
+  TurnSession,
 } from "../src/turn-session.js";
+import { sendTurn as sendCommand, cancelTurn } from "../src/execution-commands.js";
+import type { TurnCommandOperations } from "../src/turn-session.js";
 import type { SemanticMessage } from "../src/turn-state.js";
 import type { AppServerConnection } from "../src/app-server.js";
 import type { AgentConfig } from "../src/config.js";
@@ -13,7 +14,8 @@ import type { MessageTransport, TransportKind } from "../src/transport.js";
 
 // Fake transports have no socket to keep unreferenced deadline timers alive on Node 20.
 let transportLifetime: NodeJS.Timeout;
-beforeEach(() => { transportLifetime = setInterval(() => undefined, 1000); });
+let clientMessageId = "client-message";
+beforeEach(() => { clientMessageId = "client-message"; transportLifetime = setInterval(() => undefined, 1000); });
 afterEach(() => { clearInterval(transportLifetime); });
 
 const NO_RESPONSE = Symbol("no response");
@@ -32,6 +34,8 @@ class ScriptedTransport implements MessageTransport {
     const request = message as { id?: number; method?: string; params?: unknown };
     if (typeof request.id !== "number" || typeof request.method !== "string") return;
     try {
+      const params = request.params as { clientUserMessageId?: string } | undefined;
+      if (params?.clientUserMessageId) clientMessageId = params.clientUserMessageId;
       const result = await this.handle(request.method, request.params);
       if (result === NO_RESPONSE) return;
       this.messageListener?.({ id: request.id, result });
@@ -77,11 +81,16 @@ function scriptedConnection(transport: ScriptedTransport): AppServerConnection {
   return { client: new JsonRpcClient(transport), transportKind: transport.kind, close: async () => undefined };
 }
 
+// Exercise production command orchestration over the scripted real session.
+function sendTurn(agent: AgentConfig, text: string, emit: (message: SemanticMessage) => void,
+  signal: AbortSignal | undefined, operations: TurnCommandOperations) {
+  return sendCommand(agent, text, emit, signal, (target, abort) => TurnSession.open(target, operations, abort));
+}
+
 function testOperations(connection: AppServerConnection) {
   return {
     checkDirectory: async () => ({ name: "cwd", ok: true, text: "ok" }),
     connect: async () => connection,
-    clientUserMessageId: () => "client-message",
   };
 }
 
@@ -103,7 +112,6 @@ test("send abort before setup prevents every mutation and connection", async () 
     sendTurn(LOCAL_AGENT, "hello", () => undefined, controller.signal, {
       checkDirectory: async () => { checks += 1; return { name: "cwd", ok: true, text: "ok" }; },
       connect: async () => { connects += 1; return proxyConnection(); },
-      clientUserMessageId: () => "client-message",
     }),
     (error: unknown) => error instanceof RouterError && error.code === "interrupted" && !error.ambiguous,
   );
@@ -125,7 +133,7 @@ test("idle send starts once and follows the client-correlated owning turn", asyn
         id: "owning-turn",
         status: "completed",
         items: [
-          { id: "user", type: "userMessage", clientId: "client-message" },
+          { id: "user", type: "userMessage", clientId: clientMessageId },
           { id: "final", type: "agentMessage", phase: "final_answer", text: "Started result" },
         ],
       }] } };
@@ -136,7 +144,7 @@ test("idle send starts once and follows the client-correlated owning turn", asyn
   assert.deepEqual(result.result, { type: "completed", text: "Started result" });
   assert.equal(calls.filter(({ method }) => method === "turn/start").length, 1);
   const start = calls.find(({ method }) => method === "turn/start")?.params as Record<string, unknown>;
-  assert.equal(start.clientUserMessageId, "client-message");
+  assert.equal(start.clientUserMessageId, clientMessageId);
   assert.equal(start.cwd, "/work");
 });
 
@@ -152,7 +160,7 @@ test("idle send waits for delayed client-message notification without polling or
         transport.receive("item/started", {
           threadId: "thread",
           turnId: "owning-turn",
-          item: { id: "user", type: "userMessage", clientId: "client-message" },
+          item: { id: "user", type: "userMessage", clientId: clientMessageId },
         });
         transport.receive("item/completed", {
           threadId: "thread",
@@ -186,7 +194,7 @@ test("turn/start acknowledgment timeout correlates without resending", async () 
         id: "owning-turn",
         status: "completed",
         items: [
-          { id: "user", type: "userMessage", clientId: "client-message" },
+          { id: "user", type: "userMessage", clientId: clientMessageId },
           { id: "final", type: "agentMessage", phase: "final_answer", text: "Recovered start" },
         ],
       }] } };
@@ -243,7 +251,7 @@ test("correlation retries a timed-out historical resume without resending", asyn
         id: "owning-turn",
         status: "completed",
         items: [
-          { id: "user", type: "userMessage", clientId: "client-message" },
+          { id: "user", type: "userMessage", clientId: clientMessageId },
           { id: "final", type: "agentMessage", phase: "final_answer", text: "Found in history" },
         ],
       }] } };
@@ -277,6 +285,7 @@ test("active send steers once, waits for the shared turn, and does not replay ol
       items: [{ id: "old", type: "agentMessage", phase: "commentary", text: "Old progress" }],
     }] } };
     if (method === "turn/steer") {
+      transport.receive("item/started", { threadId: "thread", turnId: "active-turn", item: { id: "accepted-user", type: "userMessage", clientId: (params as { clientUserMessageId: string }).clientUserMessageId } });
       transport.receive("item/completed", { threadId: "thread", turnId: "active-turn", item: { id: "new", type: "agentMessage", phase: "commentary", text: "New progress" } });
       transport.receive("item/completed", { threadId: "thread", turnId: "active-turn", item: { id: "final", type: "agentMessage", phase: "final_answer", text: "Shared result" } });
       transport.receive("turn/completed", { threadId: "thread", turn: { id: "active-turn", status: "completed" } });
@@ -294,7 +303,7 @@ test("active send steers once, waits for the shared turn, and does not replay ol
   assert.deepEqual(steer, {
     threadId: "thread",
     input: [{ type: "text", text: "change focus", text_elements: [] }],
-    clientUserMessageId: "client-message",
+    clientUserMessageId: clientMessageId,
     expectedTurnId: "active-turn",
   });
 });
@@ -318,7 +327,7 @@ test("turn/steer acknowledgment timeout requires client-id correlation without r
       return { thread: { status: { type: "active" }, turns: [{
         id: "active-turn",
         status: "inProgress",
-        items: [{ id: "user", type: "userMessage", clientId: "client-message" }],
+        items: [{ id: "user", type: "userMessage", clientId: clientMessageId }],
       }] } };
     }
     if (method === "turn/steer") {
@@ -375,7 +384,7 @@ test("timed-out steer rejects correlation to a different turn", async () => {
       return { thread: { status: { type: "active" }, turns: [{
         id: "different-turn",
         status: "inProgress",
-        items: [{ id: "user", type: "userMessage", clientId: "client-message" }],
+        items: [{ id: "user", type: "userMessage", clientId: clientMessageId }],
       }] } };
     }
     if (method === "turn/steer") {
@@ -432,7 +441,7 @@ test("idle admission does not hide completion of a partially streamed item", asy
         id: "owning-turn",
         status: "inProgress",
         items: [
-          { id: "user", type: "userMessage", clientId: "client-message" },
+          { id: "user", type: "userMessage", clientId: clientMessageId },
           { id: "same", type: "agentMessage", phase: "final_answer", text: "partial" },
         ],
       }] } };
@@ -453,7 +462,7 @@ test("cancel interrupts one active turn and treats idle as a successful no-op", 
     throw new Error(`unexpected ${method}`);
   });
   assert.deepEqual(
-    await cancelTurn(LOCAL_AGENT, async () => scriptedConnection(activeTransport)),
+    await cancelTurn(LOCAL_AGENT, (agent, signal) => TurnSession.open(agent, testOperations(scriptedConnection(activeTransport)), signal)),
     { type: "interrupt_requested", agent: "local", turn_id: "active-turn" },
   );
   assert.deepEqual(activeCalls[1], { method: "turn/interrupt", params: { threadId: "thread", turnId: "active-turn" } });
@@ -464,7 +473,7 @@ test("cancel interrupts one active turn and treats idle as a successful no-op", 
     return { thread: { status: { type: "idle" }, turns: [] } };
   });
   assert.deepEqual(
-    await cancelTurn(LOCAL_AGENT, async () => scriptedConnection(idleTransport)),
+    await cancelTurn(LOCAL_AGENT, (agent, signal) => TurnSession.open(agent, testOperations(scriptedConnection(idleTransport)), signal)),
     { type: "already_idle", agent: "local" },
   );
   assert.deepEqual(idleCalls, ["thread/resume"]);
@@ -483,7 +492,7 @@ test("cancel acknowledgment timeout is ambiguous and never resends interrupt", a
     throw new Error(`unexpected ${method}`);
   });
   await assert.rejects(
-    cancelTurn(LOCAL_AGENT, async () => scriptedConnection(transport), 5),
+    cancelTurn(LOCAL_AGENT, (agent, signal) => TurnSession.open(agent, fastTimeoutOperations(scriptedConnection(transport)), signal)),
     (error: unknown) => error instanceof RouterError && error.code === "timeout" && error.ambiguous,
   );
   assert.equal(interrupts, 1);
@@ -501,7 +510,7 @@ test("identified-turn recovery retries until the persisted turn completes", asyn
       return { thread: { status: { type: "active" }, turns: [{
         id: "owning-turn",
         status: "inProgress",
-        items: [{ id: "user", type: "userMessage", clientId: "client-message" }],
+        items: [{ id: "user", type: "userMessage", clientId: clientMessageId }],
       }] } };
     }
     if (method === "turn/start") {
@@ -552,7 +561,7 @@ test("indefinite recovery stops on caller abort without resending", async () => 
       return { thread: { status: { type: "active" }, turns: [{
         id: "owning-turn",
         status: "inProgress",
-        items: [{ id: "user", type: "userMessage", clientId: "client-message" }],
+        items: [{ id: "user", type: "userMessage", clientId: clientMessageId }],
       }] } };
     }
     if (method === "turn/start") {
@@ -873,4 +882,73 @@ await session.close();
 `;
   const result = await promisify(execFile)(process.execPath, ["--input-type=module", "--eval", script], { timeout: 5000 });
   assert.equal(result.stdout.trim(), "recovered");
+});
+
+
+test("writer conflict is a definite busy result and send closes its owned connection", async () => {
+  const calls: string[] = [];
+  const transport = new ScriptedTransport((method) => {
+    calls.push(method);
+    throw new Error("thread thread already has an active writer");
+  });
+  const connection = scriptedConnection(transport);
+  let closed = 0;
+  connection.close = async () => { closed++; };
+  await assert.rejects(sendTurn(LOCAL_AGENT, "hello", () => undefined, undefined, testOperations(connection)),
+    (error: unknown) => error instanceof RouterError && error.code === "thread_busy" && !error.ambiguous);
+  assert.deepEqual(calls, ["thread/resume"]);
+  assert.equal(closed, 1);
+});
+
+test("resume only classifies the target's writer conflict as busy", async () => {
+  for (const message of ["thread other already has an active writer", "thread not found", "permission denied"]) {
+    const connection = scriptedConnection(new ScriptedTransport(() => { throw new Error(message); }));
+    const session = await TurnSession.open(LOCAL_AGENT, testOperations(connection));
+    try {
+      assert.equal(session.backend, "stdio");
+      assert.equal(session.capabilities.steer, true);
+      await assert.rejects(session.resume(), { code: "thread_unavailable" });
+    } finally { await session.close(); }
+  }
+});
+
+test("resume preserves transport failure for pre-admission retry classification", async () => {
+  const connection = scriptedConnection(new ScriptedTransport(() => NO_RESPONSE));
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(connection));
+  const failure = new RouterError("app_server_disconnected", "gone");
+  connection.client.request = async () => { throw failure; };
+  try { await assert.rejects(session.resume(), (error: unknown) => error === failure); }
+  finally { await session.close(); }
+});
+
+test("restored direct work emits only commentary after its persisted client UUID", async () => {
+  const transport = new ScriptedTransport(method => {
+    assert.equal(method, "thread/resume");
+    return { thread: { status: { type: "idle" }, turns: [{ id: "shared", status: "completed", items: [
+      { id: "old", type: "agentMessage", phase: "commentary", text: "same" },
+      { id: "u", type: "userMessage", clientId: "ours" },
+      { id: "new", type: "agentMessage", phase: "commentary", text: "same" },
+      { id: "final", type: "agentMessage", phase: "final_answer", text: "answer" },
+    ] }] } };
+  });
+  const session = await TurnSession.open(LOCAL_AGENT, testOperations(scriptedConnection(transport)));
+  try {
+    await session.restore("shared", undefined, [], "ours");
+    const messages: SemanticMessage[] = [];
+    assert.equal((await session.observe("shared", message => messages.push(message))).finalText, "answer");
+    assert.deepEqual(messages.map(message => [message.itemId, message.turnId, message.text]), [["new", "shared", "same"]]);
+  } finally { await session.close(); }
+});
+
+test("session interruption validates direct acknowledgement and never retries", async () => {
+  for (const reply of [{}, { invalid: true }]) {
+    const calls: unknown[] = [];
+    const transport = new ScriptedTransport((method, params) => { calls.push({ method, params }); return reply; });
+    const session = await TurnSession.open(LOCAL_AGENT, testOperations(scriptedConnection(transport)));
+    try {
+      if ("invalid" in reply) await assert.rejects(session.interrupt("active"), (error: any) => error.ambiguous);
+      else await session.interrupt("active");
+      assert.deepEqual(calls, [{ method: "turn/interrupt", params: { threadId: "thread", turnId: "active" } }]);
+    } finally { await session.close(); }
+  }
 });

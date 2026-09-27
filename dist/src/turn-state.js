@@ -1,5 +1,33 @@
 import { RouterError } from "./errors.js";
 const MAX_OUTPUT_BYTES = 256 * 1024;
+/** Native metadata stays internal; CLI JSON remains exactly type and text. */
+export function semanticMessage(type, text, itemId, turnId) {
+    const message = { type, text };
+    Object.defineProperties(message, { itemId: { value: itemId }, turnId: { value: turnId } });
+    return message;
+}
+export function emitSafely(emit, message) {
+    try {
+        emit(message);
+    }
+    catch { /* Progress observers cannot invalidate execution. */ }
+}
+export function scopeCommentary(turn, state, uuid) {
+    state.inputUuid = uuid;
+    state.excludedCommentaryIds ??= new Set();
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    const boundary = items.findIndex(raw => object(raw)?.type === "userMessage" && object(raw)?.clientId === uuid);
+    if (typeof turn.id === "string")
+        state.inputSeen = boundary >= 0;
+    if (boundary >= 0) {
+        state.inputSeen = true;
+        for (const raw of items.slice(0, boundary)) {
+            const item = object(raw);
+            if (typeof item?.id === "string")
+                state.excludedCommentaryIds.add(item.id);
+        }
+    }
+}
 function object(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value)
         ? value
@@ -47,6 +75,16 @@ export function waitForOutcome(client, threadId, turnId, emit, signal, initialNo
                 const params = object(rawParams);
                 if (!params || params.threadId !== threadId)
                     return;
+                if (method === "item/started" && params.turnId === turnId && state.inputUuid) {
+                    const item = object(params.item);
+                    if (item?.type === "userMessage" && item.clientId === state.inputUuid)
+                        state.inputSeen = true;
+                    else if (!state.inputSeen && typeof item?.id === "string") {
+                        state.excludedCommentaryIds ??= new Set();
+                        state.excludedCommentaryIds.add(item.id);
+                    }
+                    return;
+                }
                 if (method === "item/completed" && params.turnId === turnId) {
                     const item = object(params.item);
                     if (item)
@@ -103,6 +141,8 @@ export function terminalOutcome(turn, state) {
 }
 function applyCompletedItem(item, state, emit) {
     const itemId = typeof item.id === "string" ? item.id : undefined;
+    if (item.type === "userMessage" && item.clientId === state.inputUuid)
+        state.inputSeen = true;
     if (itemId !== undefined) {
         if (state.seenItemIds.has(itemId))
             return;
@@ -122,16 +162,19 @@ function applyCompletedItem(item, state, emit) {
         const semanticKey = `reasoning\0${text}`;
         if (text && !state.seenSemanticUnits.has(semanticKey)) {
             state.seenSemanticUnits.add(semanticKey);
-            emit({ type: "reasoning", text });
+            emitSafely(emit, { type: "reasoning", text });
         }
     }
     if (item.type === "agentMessage" && typeof item.text === "string") {
         if (item.phase === "commentary") {
             const text = bounded(item.text);
-            const semanticKey = `commentary\0${text}`;
-            if (!state.seenSemanticUnits.has(semanticKey)) {
-                state.seenSemanticUnits.add(semanticKey);
-                emit({ type: "commentary", text });
+            if ((!state.inputUuid || state.inputSeen) && !(itemId && state.excludedCommentaryIds?.has(itemId))) {
+                const semanticKey = `commentary\0${text}`;
+                if (itemId || !state.seenSemanticUnits.has(semanticKey)) {
+                    if (!itemId)
+                        state.seenSemanticUnits.add(semanticKey);
+                    emitSafely(emit, semanticMessage("commentary", text, itemId));
+                }
             }
         }
         if (item.phase === "final_answer")
@@ -141,6 +184,8 @@ function applyCompletedItem(item, state, emit) {
 export function applyTurnItems(turn, state, emit) {
     if (!Array.isArray(turn.items))
         return;
+    if (state.inputUuid)
+        scopeCommentary(turn, state, state.inputUuid);
     for (const rawItem of turn.items) {
         const item = object(rawItem);
         if (item)
@@ -169,7 +214,12 @@ export function baselineTurnItems(turn, state) {
                 state.seenSemanticUnits.add(`reasoning\0${text}`);
         }
         if (item?.type === "agentMessage" && item.phase === "commentary" && typeof item.text === "string") {
-            state.seenSemanticUnits.add(`commentary\0${bounded(item.text)}`);
+            if (typeof item.id === "string") {
+                state.excludedCommentaryIds ??= new Set();
+                state.excludedCommentaryIds.add(item.id);
+            }
+            else
+                state.seenSemanticUnits.add(`commentary\0${bounded(item.text)}`);
         }
     }
 }

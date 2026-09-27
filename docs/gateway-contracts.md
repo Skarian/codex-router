@@ -6,6 +6,8 @@ Read [Gateway setup and recovery](gateway.md) for the ordinary message flow. Thi
 
 ### Inbound events
 
+Polling uses the bounded recovery algorithm in [the local connector plan](sendblue-local-plan.md). The following inbound HTTP rules apply only to explicit webhook mode.
+
 For each webhook:
 
 1. Enforce the 256 KiB raw-body limit.
@@ -297,21 +299,13 @@ Do not add a total operation deadline. Do not add deadlines to Codex work, local
 
 ### Message-send retries
 
-One live message operation permits no more than two retries after these results:
+One live message operation permits at most two retries after definite retryable rejections, such as HTTP 429. Honor valid retry headers. SDK retries are disabled.
 
-- A connection error.
-- HTTP 408, 409, 429, or 5xx.
-- `x-should-retry: true`.
-
-Do not retry after `x-should-retry: false`. Honor valid `Retry-After` and `retry-after-ms` values.
+Connection loss, HTTP 408/409/5xx, and unusable success responses are ambiguous. Never automatically resend after these outcomes. Without an accepted handle, leave the part as `sending` for explicit resolution. Matching text or timestamps cannot establish send identity.
 
 Before each physical message request, acquire the shared line limiter. It permits ten request starts per rolling second for each normalized `from_number`.
 
-If a request returns 2xx with a handle, accept the part. If the first result is a definite rejection, fail the part.
-
-After a retryable or ambiguous result, a later rejection cannot prove that the first request failed. Without an accepted handle, leave the part as `sending`.
-
-A restart never resumes the live request operation. Live retries can cause a duplicate message after response loss. V1 accepts this risk.
+A 2xx response with a handle accepts the part. A definite nonretryable rejection fails it. Exhausting retries after definite rejections also fails it. A restart never resumes an uncertain send operation.
 
 Track a live send only in memory:
 

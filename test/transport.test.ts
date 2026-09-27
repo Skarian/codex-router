@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { once } from "node:events";
 import test from "node:test";
 import { boundedProcessDiagnostic, codexProcessSpec, ProxyTransport, safeSshDiagnostic, StdioTransport, terminateChild } from "../src/transport.js";
@@ -126,4 +128,20 @@ process.stdin.on('data',handshake);process.stdin.on('end',()=>process.exit(0));
     assert.equal(((await message) as { large: string }).large.length, 5 * 1024 * 1024);
     assert.equal(((await closed) as { code?: string }).code, "output_too_large");
   } finally { await transport.close(); if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath; await rm(directory, { recursive: true, force: true }); }
+});
+
+
+test("explicit Codex executable preserves spaces, never changes SSH, and rejects relative paths", () => {
+  const previous = process.env.CODEX_ROUTER_CODEX_EXECUTABLE;
+  try {
+    const executable = join(tmpdir(), "App With Spaces", "codex.exe");
+    process.env.CODEX_ROUTER_CODEX_EXECUTABLE = executable;
+    assert.deepEqual(codexProcessSpec(["--version"]), { command: executable, args: ["--version"] });
+    assert.equal(codexProcessSpec(["--version"], "remote").args.at(-1), "'codex' '--version'");
+    process.env.CODEX_ROUTER_CODEX_EXECUTABLE = "relative/codex";
+    assert.throws(() => codexProcessSpec([]), /absolute executable path/);
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_ROUTER_CODEX_EXECUTABLE;
+    else process.env.CODEX_ROUTER_CODEX_EXECUTABLE = previous;
+  }
 });

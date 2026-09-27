@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   connectAppServer,
   connectExistingProxy,
@@ -14,10 +13,12 @@ import {
   applyTurnItems,
   applyResumedImages,
   baselineTurnItems,
+  scopeCommentary,
+  semanticMessage,
+  emitSafely,
   findCorrelatedTurn,
   resumedThreadState,
   terminalOutcome,
-  textResult,
   waitForOutcome,
   type TurnOutcome,
   type Notification,
@@ -41,7 +42,6 @@ export interface RecoveryConnectionOperations {
 export interface TurnCommandOperations {
   checkDirectory(agent: AgentConfig): Promise<{ ok: boolean }>;
   connect(agent: AgentConfig): Promise<AppServerConnection>;
-  clientUserMessageId(): string;
   effectAckTimeoutMs?: number;
   threadResumeTimeoutMs?: number;
   recovery?: RecoveryConnectionOperations;
@@ -51,7 +51,6 @@ export interface TurnCommandOperations {
 const defaultTurnCommandOperations: TurnCommandOperations = {
   checkDirectory: checkAgentDirectory,
   connect: (agent) => connectAppServer(agent.sshHost),
-  clientUserMessageId: randomUUID,
 };
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -276,8 +275,22 @@ export class TurnSession {
   }
 
   get transportKind(): "proxy" | "stdio" { return this.connection.transportKind; }
+  get backend(): "proxy" | "stdio" { return this.transportKind; }
+  readonly capabilities = { steer: true, commentary: { state: "available" } } as const;
   get serverInfo() { return this.connection.client.serverInfo; }
   get artifactBaseline(): string[] { return [...(this.state.artifactBaseline ?? [])]; }
+
+  async interrupt(expectedTurnId: string): Promise<void> {
+    this.checkOpen();
+    this.connection.client.markTurnAccepted();
+    const result = await this.connection.client.request("turn/interrupt", {
+      threadId: this.agent.threadId, turnId: expectedTurnId,
+    }, this.operations.effectAckTimeoutMs ?? EFFECT_ACK_TIMEOUT_MS);
+    const response = object(result);
+    if (!response || Object.keys(response).length !== 0) {
+      throw new RouterError("app_server_protocol_failed", "Codex app-server returned an invalid turn/interrupt response.", { ambiguous: true });
+    }
+  }
 
   async filesystem(method: "fs/getMetadata" | "fs/readDirectory" | "fs/createDirectory" | "fs/remove", params: unknown): Promise<unknown> {
     this.checkOpen();
@@ -304,7 +317,11 @@ export class TurnSession {
           this.resumed = resumedThreadState(result);
           return this.resumed;
         } catch (error) {
-          if (error instanceof RouterError && error.code === "interrupted") throw error;
+          if (error instanceof RpcRequestError
+            && error.payload.message?.includes(`thread ${this.agent.threadId} already has an active writer`)) {
+            throw new RouterError("thread_busy", `${this.agent.label}'s Codex task is owned by another process. Waiting for that owner to release it.`, { cause: error });
+          }
+          if (error instanceof RouterError && !(error instanceof RpcRequestError)) throw error;
           throw new RouterError("thread_unavailable", `${this.agent.label}'s Codex task could not be resumed.`, { cause: error });
         }
       })().finally(() => { this.resumeFlight = undefined; });
@@ -338,6 +355,7 @@ export class TurnSession {
       }));
       if (active) baselineTurnItems(active, this.state);
     }
+    this.state.inputUuid ??= intent.clientUserMessageId;
     const pending = { intent } as { intent: AdmissionIntent; turn?: Record<string, unknown> };
     this.pending = pending;
     const connection = this.connection;
@@ -377,15 +395,17 @@ export class TurnSession {
     this.checkOpen();
     if (!pending.turn) throw new RouterError("app_server_protocol_failed", "The admission has no correlated turn.", { ambiguous: true });
     this.owned = pending.turn;
+    scopeCommentary(this.owned, this.state, this.state.inputUuid!);
     this.pending = undefined;
     return acceptedTurnId(pending.turn, "thread/resume");
   }
 
   /** Reconstruct durable work without starting or steering a turn. */
-  async restore(turnId: string | undefined, intent: AdmissionIntent | undefined, artifactBaseline: readonly string[]): Promise<string> {
+  async restore(turnId: string | undefined, intent: AdmissionIntent | undefined, artifactBaseline: readonly string[], clientUserMessageId?: string): Promise<string> {
     this.checkOpen();
     if (this.owned || this.pending) throw new RouterError("input_invalid", "The session already owns Codex work.");
     this.state.artifactBaseline = new Set(artifactBaseline);
+    this.state.inputUuid = clientUserMessageId ?? intent?.clientUserMessageId;
     const resumed = await this.resume();
     let turn: Record<string, unknown> | undefined;
     if (intent) {
@@ -407,6 +427,7 @@ export class TurnSession {
     }
     this.checkOpen();
     this.owned = turn;
+    if (this.state.inputUuid) scopeCommentary(turn, this.state, this.state.inputUuid);
     this.pending = undefined;
     return acceptedTurnId(turn, "thread/resume");
   }
@@ -416,7 +437,8 @@ export class TurnSession {
     if (!this.owned || this.owned.id !== turnId) {
       return Promise.reject(new RouterError("input_invalid", "The session does not own this turn."));
     }
-    this.observation ??= this.observeOwned(emit);
+    const scopedEmit = (message: SemanticMessage) => emitSafely(emit, semanticMessage(message.type, message.text, message.itemId, turnId));
+    this.observation ??= this.observeOwned(scopedEmit);
     return this.observation;
   }
 
@@ -426,6 +448,18 @@ export class TurnSession {
       if (this.recoveryFlight) await this.recoveryFlight;
       const connection = this.connection;
       const turn = this.owned!;
+      if (this.state.inputUuid) {
+        scopeCommentary(turn, this.state, this.state.inputUuid);
+        const before: string[] = [];
+        for (const event of this.buffered.notifications) {
+          const item = object(object(event.params)?.item);
+          if (item?.type === "userMessage" && item.clientId === this.state.inputUuid) {
+            for (const id of before) this.state.excludedCommentaryIds!.add(id);
+            break;
+          }
+          if (typeof item?.id === "string") before.push(item.id);
+        }
+      }
       try {
         if (turn.status !== "inProgress") {
           for (const event of this.buffered.notifications) {
@@ -514,57 +548,5 @@ export class TurnSession {
       await Promise.allSettled([this.admissionQueue, this.observation, this.resumeFlight, this.recoveryFlight]);
     })();
     return this.closeFlight;
-  }
-}
-
-export async function sendTurn(
-  agent: AgentConfig,
-  text: string,
-  emit: (message: SemanticMessage) => void,
-  signal?: AbortSignal,
-  operations: TurnCommandOperations = defaultTurnCommandOperations,
-): Promise<{ result: SemanticMessage; transportKind: "proxy" | "stdio" }> {
-  const session = await TurnSession.open(agent, operations, signal);
-  try {
-    const resumed = await session.resume();
-    const turnId = await session.admit([{ type: "text", text, text_elements: [] }], {
-      clientUserMessageId: operations.clientUserMessageId(),
-      ...(resumed.activeTurn ? { expectedTurnId: acceptedTurnId(resumed.activeTurn, "thread/resume") } : {}),
-    });
-    return { result: textResult(await session.observe(turnId, emit)), transportKind: session.transportKind };
-  } finally {
-    await session.close();
-  }
-}
-
-export async function cancelTurn(
-  agent: AgentConfig,
-  connect: (agent: AgentConfig) => Promise<AppServerConnection> = defaultTurnCommandOperations.connect,
-  effectAckTimeoutMs = EFFECT_ACK_TIMEOUT_MS,
-): Promise<CancelResult> {
-  const connection = await connect(agent);
-  try {
-    let resumeResult: unknown;
-    try {
-      resumeResult = await connection.client.request("thread/resume", { threadId: agent.threadId }, THREAD_RESUME_TIMEOUT_MS);
-    } catch (error) {
-      throw new RouterError("thread_unavailable", `${agent.label}'s Codex task could not be resumed.`, { cause: error });
-    }
-    const resumed = resumedThreadState(resumeResult);
-    if (!resumed.activeTurn) return { type: "already_idle", agent: agent.id };
-    const turnId = acceptedTurnId(resumed.activeTurn, "thread/resume");
-    connection.client.markTurnAccepted();
-    const result = await connection.client.request(
-      "turn/interrupt",
-      { threadId: agent.threadId, turnId },
-      effectAckTimeoutMs,
-    );
-    const response = object(result);
-    if (!response || Object.keys(response).length !== 0) {
-      throw new RouterError("app_server_protocol_failed", "Codex app-server returned an invalid turn/interrupt response.", { ambiguous: true });
-    }
-    return { type: "interrupt_requested", agent: agent.id, turn_id: turnId };
-  } finally {
-    await connection.close().catch(() => undefined);
   }
 }

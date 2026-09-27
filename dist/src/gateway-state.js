@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
-import { hostname } from "node:os";
+import { randomUUID, createHash } from "node:crypto";
+import { preparePrivateDirectory, assertPrivatePath, validateExistingPrivatePaths, syncDirectory } from "./platform-storage.js";
+import { open, readFile, rename, rm } from "node:fs/promises";
+import { acquireGatewayLock } from "./gateway-lock.js";
 import { join } from "node:path";
 import * as v from "valibot";
+import { routeSources } from "./config.js";
 import { RouterError } from "./errors.js";
 const str = v.pipe(v.string(), v.minLength(1));
 const number = v.pipe(v.number(), v.safeInteger(), v.minValue(0));
@@ -13,39 +14,91 @@ const attachmentSchema = v.variant("state", [
     v.strictObject({ state: v.literal("omitted"), name: str, reason: v.picklist(["download_failed", "invalid_media", "copy_failed"]) }),
 ]);
 const eventSchema = v.strictObject({ messageHandle: str, providerTimeMs: number, receiptSequence: number, text: v.string(), attachment: v.optional(attachmentSchema) });
-const batchSchema = v.strictObject({ id: str, openedAtMs: number, quietDeadlineMs: number, maximumDeadlineMs: number, events: v.array(eventSchema) });
-const intentSchema = v.strictObject({ batchId: str, clientUserMessageId: str, publicationId: str, expectedTurnId: v.optional(str) });
+const batchSchema = v.strictObject({ id: str, sourceId: str, openedAtMs: number, quietDeadlineMs: number, maximumDeadlineMs: number, events: v.array(eventSchema) });
+const intentSchema = v.strictObject({ batchId: str, clientUserMessageId: str, publicationId: v.optional(str), expectedTurnId: v.optional(str) });
+const executionBindingSchema = v.strictObject({ backend: v.picklist(["desktop", "proxy", "stdio"]), host: str, codexHome: str, threadId: str });
 const workSchema = v.strictObject({
     kind: v.literal("codex"), ownerBatchId: str, joinedBatchIds: v.array(str), batches: v.array(batchSchema), turnId: v.optional(str),
-    pendingAdmission: v.optional(intentSchema), publicationIds: v.array(str), artifactBaseline: v.array(str), admissionFailed: v.optional(v.literal(true)),
+    pendingAdmission: v.optional(intentSchema), binding: v.optional(executionBindingSchema), clientUserMessageId: v.optional(str), publicationIds: v.array(str), artifactBaseline: v.array(str), admissionFailed: v.optional(v.literal(true)),
 });
 const payloadSchema = v.variant("kind", [
     v.strictObject({ kind: v.literal("text"), text: v.string() }),
     v.strictObject({ kind: v.literal("media"), localPath: str, name: str, mediaType: str, mediaUrl: str }),
 ]);
 const partSchema = v.strictObject({ id: str, payload: payloadSchema, status: v.picklist(["ready", "sending", "accepted", "failed", "skipped"]), callbackToken: v.optional(str), providerHandle: v.optional(str) });
-const deliverySchema = v.strictObject({ kind: v.literal("delivery"), id: str, batchIds: v.array(str), parts: v.array(partSchema) });
-const bindingSchema = v.strictObject({ sendblueId: str, sender: str, sendblueNumber: str, target: v.strictObject({ sshHost: v.nullable(str), threadId: str, cwd: str }) });
+const deliverySchema = v.strictObject({ kind: v.literal("delivery"), id: str, sourceId: str, batchIds: v.array(str), parts: v.array(partSchema) });
+const sourceSchema = v.variant("kind", [
+    v.strictObject({ kind: v.literal("sendblue"), id: str, accountId: str, sender: str, sendblueNumber: str }),
+    v.strictObject({ kind: v.literal("https"), id: str, accountId: str }),
+]);
+const resultSchema = v.strictObject({ status: v.picklist(["completed", "failed", "interrupted"]), text: v.string(), notices: v.array(v.string()) });
+const receiptSchema = v.strictObject({ sourceId: str, externalId: str, receivedAtMs: number,
+    payloadHash: v.optional(str), batchId: v.optional(str), result: v.optional(resultSchema),
+    expiresAtMs: v.optional(number), reservedBytes: v.optional(number), turnId: v.optional(str) });
+const bindingSchema = v.strictObject({ sources: v.array(sourceSchema), target: v.strictObject({ sshHost: v.nullable(str), threadId: str, cwd: str }) });
 const routeSchema = v.strictObject({
-    binding: bindingSchema, nextSequence: number,
-    seenMessages: v.array(v.strictObject({ sendblueId: str, messageHandle: str, receivedAtMs: number })),
+    binding: bindingSchema, nextSequence: number, receipts: v.array(receiptSchema),
     openBatch: v.optional(batchSchema), queue: v.array(batchSchema), active: v.optional(v.variant("kind", [workSchema, deliverySchema])),
 });
-const stateSchema = v.strictObject({ version: v.literal(1), routes: v.record(str, routeSchema) });
+const pollingSchema = v.strictObject({ activationAtMs: number, completedThroughMs: number, routeActivationAtMs: v.record(str, number) });
+const stateSchema = v.strictObject({ version: v.literal(2), routes: v.record(str, routeSchema), polling: v.optional(v.record(str, pollingSchema)) });
 export const SEEN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const ADMISSION_FAILURE = "Codex did not confirm the latest input. It was not sent again.";
 export function routeBinding(route) {
-    return { sendblueId: route.sendblueId, sender: route.sender, sendblueNumber: route.sendblueNumber,
-        target: { sshHost: route.agent.sshHost ?? null, threadId: route.agent.threadId, cwd: route.agent.cwd } };
+    return { sources: routeSources(route), target: { sshHost: route.agent.sshHost ?? null, threadId: route.agent.threadId, cwd: route.agent.cwd } };
 }
 export function validateState(value) {
     const parsed = v.safeParse(stateSchema, value);
     if (!parsed.success)
         throw new RouterError("state_invalid", "The canonical gateway state is invalid.");
     const state = parsed.output;
+    for (const poll of Object.values(state.polling ?? {})) {
+        if (poll.completedThroughMs < poll.activationAtMs || Object.values(poll.routeActivationAtMs).some(time => time < poll.activationAtMs)) {
+            throw new RouterError("state_invalid", "The polling checkpoint is invalid.");
+        }
+    }
     const partIds = new Set();
     for (const route of Object.values(state.routes)) {
         const work = route.active;
+        const sources = route.binding.sources;
+        if (!sources.length || new Set(sources.map(s => s.id)).size !== sources.length)
+            throw new RouterError("state_invalid", "Gateway source bindings are invalid.");
+        const batches = [...(route.openBatch ? [route.openBatch] : []), ...route.queue, ...(work?.kind === "codex" ? work.batches : [])];
+        for (const batch of batches)
+            if (!sources.some(s => s.id === batch.sourceId))
+                throw new RouterError("state_invalid", "A batch has no configured source.");
+        if (work?.kind === "delivery" && !sources.some(s => s.id === work.sourceId))
+            throw new RouterError("state_invalid", "Delivery has no source.");
+        const ids = new Set();
+        for (const receipt of route.receipts) {
+            const key = JSON.stringify([receipt.sourceId, receipt.externalId]);
+            if (ids.has(key))
+                throw new RouterError("state_invalid", "Duplicate submission receipt.");
+            ids.add(key);
+            const retained = sources.find(s => s.id === receipt.sourceId)?.kind === "https" || receipt.payloadHash !== undefined || receipt.result !== undefined || receipt.reservedBytes !== undefined || receipt.expiresAtMs !== undefined;
+            if (retained) {
+                const batch = batches.find(b => b.id === receipt.batchId);
+                if (!receipt.payloadHash || !receipt.batchId || receipt.reservedBytes === undefined
+                    || (receipt.result ? !receipt.expiresAtMs || !!batch : !!receipt.expiresAtMs || !batch || batch.sourceId !== receipt.sourceId
+                        || batch.events.length !== 1 || batch.events[0].messageHandle !== receipt.externalId))
+                    throw new RouterError("state_invalid", "Retained receipt has invalid execution references.");
+                if (receipt.result) {
+                    if (Buffer.byteLength(receipt.result.text) > 256 * 1024 || Buffer.byteLength(JSON.stringify(receipt.result.notices)) > 4096
+                        || Buffer.byteLength(JSON.stringify(receipt)) > receipt.reservedBytes)
+                        throw new RouterError("state_invalid", "Retained result exceeds its reserved capacity.");
+                }
+                else {
+                    const text = batch.events[0].text;
+                    const hash = createHash("sha256").update(JSON.stringify([1, text])).digest("hex");
+                    const minimum = Buffer.byteLength(JSON.stringify({ text })) + 6 * 256 * 1024 + 16 * 1024;
+                    if (receipt.payloadHash !== hash || receipt.reservedBytes < minimum)
+                        throw new RouterError("state_invalid", "Retained request identity or reservation is invalid.");
+                }
+            }
+        }
+        for (const batch of batches)
+            if (sources.find(s => s.id === batch.sourceId)?.kind === "https" && route.receipts.filter(r => r.batchId === batch.id && r.sourceId === batch.sourceId && !r.result).length !== 1)
+                throw new RouterError("state_invalid", "Retained batch has no receipt.");
         const batchIds = new Set();
         for (const batch of [...(route.openBatch ? [route.openBatch] : []), ...route.queue, ...(work?.kind === "codex" ? work.batches : [])]) {
             if (batchIds.has(batch.id) || !batch.events.length || batch.quietDeadlineMs < batch.openedAtMs || batch.maximumDeadlineMs < batch.openedAtMs) {
@@ -54,11 +107,16 @@ export function validateState(value) {
             batchIds.add(batch.id);
         }
         if (work?.kind === "codex") {
+            if (work.binding && (work.binding.host !== (route.binding.target.sshHost ?? "local")
+                || work.binding.threadId !== route.binding.target.threadId
+                || (work.binding.backend === "desktop" && (!work.clientUserMessageId || work.binding.host !== "local")))) {
+                throw new RouterError("state_invalid", "The gateway execution binding does not match its route or lacks its admission identity.");
+            }
             const owned = new Set(work.batches.map((batch) => batch.id));
             if (!owned.has(work.ownerBatchId) || work.joinedBatchIds.some((id) => !owned.has(id) || id === work.ownerBatchId)
                 || new Set(work.joinedBatchIds).size !== work.joinedBatchIds.length
                 || (work.pendingAdmission && (!owned.has(work.pendingAdmission.batchId)
-                    || !work.publicationIds.includes(work.pendingAdmission.publicationId)
+                    || (work.pendingAdmission.publicationId !== undefined && !work.publicationIds.includes(work.pendingAdmission.publicationId))
                     || work.joinedBatchIds.includes(work.pendingAdmission.batchId)))) {
                 throw new RouterError("state_invalid", "The gateway admission references are invalid.");
             }
@@ -84,9 +142,13 @@ export function validateState(value) {
 }
 export function bindRoutes(state, config) {
     for (const [id, stored] of Object.entries(state.routes)) {
-        const current = config.routes.find((route) => route.id === id);
-        const pending = stored.openBatch || stored.queue.length || stored.active;
-        if (pending && (!current || JSON.stringify(stored.binding) !== JSON.stringify(routeBinding(current)))) {
+        const current = config.routes.find(route => route.id === id);
+        const pending = [...(stored.openBatch ? [stored.openBatch] : []), ...stored.queue, ...(stored.active?.kind === "codex" ? stored.active.batches : [])];
+        const pendingSources = new Set(pending.map(b => b.sourceId));
+        if (stored.active?.kind === "delivery")
+            pendingSources.add(stored.active.sourceId);
+        if (pendingSources.size && (!current || JSON.stringify(stored.binding.target) !== JSON.stringify(routeBinding(current).target)
+            || [...pendingSources].some(sourceId => JSON.stringify(stored.binding.sources.find(s => s.id === sourceId)) !== JSON.stringify(routeSources(current).find(s => s.id === sourceId))))) {
             throw new RouterError("config_invalid", "A route with pending work changed its recipient or Codex target.");
         }
     }
@@ -94,68 +156,10 @@ export function bindRoutes(state, config) {
         const previous = Object.hasOwn(state.routes, route.id) ? state.routes[route.id] : undefined;
         state.routes[route.id] = previous
             ? { ...previous, binding: routeBinding(route) }
-            : { binding: routeBinding(route), nextSequence: 0, seenMessages: [], queue: [] };
+            : { binding: routeBinding(route), nextSequence: 0, receipts: [], queue: [] };
     }
 }
-async function ownerOnly(path, directory) {
-    const stat = await lstat(path);
-    if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile())
-        || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
-        throw new RouterError("state_invalid", "Gateway storage must be owner-only and must not use symlinks.");
-    }
-}
-async function lock(directory) {
-    const path = join(directory, "lock");
-    const ownerPath = join(path, "owner.json");
-    const token = randomUUID();
-    const claim = async () => {
-        await mkdir(path, { mode: 0o700 });
-        await writeSynced(ownerPath, JSON.stringify({ pid: process.pid, host: hostname(), token }));
-    };
-    try {
-        await claim();
-    }
-    catch (error) {
-        if (error.code !== "EEXIST")
-            throw error;
-        await ownerOnly(path, true);
-        let reclaim;
-        let reclaimed = false;
-        try {
-            reclaim = await open(join(path, "reclaim"), "wx", 0o600);
-            const owner = JSON.parse(await readFile(ownerPath, "utf8"));
-            if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || owner.host !== hostname())
-                throw new Error("unverifiable owner");
-            try {
-                process.kill(Number(owner.pid), 0);
-                throw new Error("live owner");
-            }
-            catch (failure) {
-                if (failure.code !== "ESRCH")
-                    throw failure;
-            }
-            const stale = join(directory, `stale-lock-${token}`);
-            await rename(path, stale);
-            reclaimed = true;
-            await claim();
-            await rm(stale, { recursive: true });
-        }
-        catch (cause) {
-            throw new RouterError("gateway_running", "The gateway state is locked or its owner cannot be verified.", { cause });
-        }
-        finally {
-            await reclaim?.close();
-            // A live owner's directory must not retain this contender's claim.
-            if (reclaim && !reclaimed)
-                await rm(join(path, "reclaim"), { force: true }).catch(() => undefined);
-        }
-    }
-    return async () => {
-        const owner = JSON.parse(await readFile(ownerPath, "utf8"));
-        if (owner.token === token)
-            await rm(path, { recursive: true });
-    };
-}
+const ownerOnly = assertPrivatePath;
 async function writeSynced(path, data) {
     const file = await open(path, "wx", 0o600);
     try {
@@ -182,12 +186,12 @@ export class GatewayStore {
         this.beforeWrite = beforeWrite;
     }
     static async open(directory, beforeWrite) {
-        await mkdir(directory, { recursive: true, mode: 0o700 });
-        await ownerOnly(directory, true);
-        const unlock = await lock(directory);
+        await preparePrivateDirectory(directory);
+        const unlock = await acquireGatewayLock(directory);
         try {
-            let state = { version: 1, routes: {} };
+            let state = { version: 2, routes: {} };
             try {
+                await validateExistingPrivatePaths([join(directory, "state.json")]);
                 await ownerOnly(join(directory, "state.json"), false);
                 state = validateState(JSON.parse(await readFile(join(directory, "state.json"), "utf8")));
             }
@@ -203,6 +207,8 @@ export class GatewayStore {
         }
     }
     snapshot() { return structuredClone(this.state); }
+    /** Internal read-only projection: copy only the requested view, not the whole retained-result archive. */
+    read(select) { return structuredClone(select(this.state)); }
     transaction(change) {
         if (this.closeFlight)
             return Promise.reject(new RouterError("storage_failed", "The gateway state writer is closed."));
@@ -214,8 +220,9 @@ export class GatewayStore {
             if (result instanceof Promise)
                 throw new RouterError("state_invalid", "A gateway state transaction must be synchronous.");
             const cutoff = Date.now() - SEEN_RETENTION_MS;
-            for (const route of Object.values(draft.routes))
-                route.seenMessages = route.seenMessages.filter((seen) => seen.receivedAtMs >= cutoff);
+            for (const route of Object.values(draft.routes)) {
+                route.receipts = route.receipts.filter(r => r.reservedBytes !== undefined ? !r.expiresAtMs || r.expiresAtMs > Date.now() : r.receivedAtMs >= cutoff);
+            }
             validateState(draft);
             await this.beforeWrite?.();
             const temp = join(this.directory, `state-${randomUUID()}.tmp`);
@@ -224,13 +231,7 @@ export class GatewayStore {
                 await writeSynced(temp, JSON.stringify(draft));
                 await rename(temp, join(this.directory, "state.json"));
                 renamed = true;
-                const directory = await open(this.directory, constants.O_RDONLY);
-                try {
-                    await directory.sync();
-                }
-                finally {
-                    await directory.close();
-                }
+                await syncDirectory(this.directory);
                 this.state = draft;
             }
             catch (cause) {
@@ -286,5 +287,21 @@ export function resolveEffect(state, routeId, effectId, resolution, providerHand
     else
         throw new RouterError("effect_not_found", "The unresolved effect was not found.");
     return { type: "resolved", routeId, effectId, resolution, ...(resolution === "accepted" ? { providerHandle } : {}) };
+}
+/** Persist activation before network intake; existing checkpoints never reset at startup. */
+export function initializePolling(state, config, now) {
+    const polling = state.polling ??= {};
+    for (const account of config.sendblue) {
+        if (account.mode === "webhook")
+            continue;
+        const initial = account.pollStart === undefined ? now : Date.parse(account.pollStart);
+        if (!Number.isSafeInteger(initial) || initial < 0 || initial > now)
+            throw new RouterError("config_invalid", "Polling start must not be in the future.");
+        const existing = polling[account.id];
+        const poll = polling[account.id] ??= { activationAtMs: initial, completedThroughMs: initial, routeActivationAtMs: {} };
+        for (const route of config.routes.filter(route => route.sendblueId === account.id)) {
+            poll.routeActivationAtMs[route.id] ??= existing ? now : initial;
+        }
+    }
 }
 //# sourceMappingURL=gateway-state.js.map

@@ -12,6 +12,7 @@ export type FailureCode =
   | "input_invalid"
   | "interrupted"
   | "output_too_large"
+  | "thread_busy"
   | "thread_unavailable"
   | "timeout"
   | "turn_failed"

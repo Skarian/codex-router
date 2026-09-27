@@ -1,11 +1,12 @@
 #!/usr/bin/env node
+import { readGatewayStatus } from "./gateway-diagnostics.js";
 import { resolve } from "node:path";
 import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
 import { runGateway } from "./gateway-server.js";
 import { runDoctor } from "./doctor.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
-import { cancelTurn, sendTurn } from "./turn-session.js";
-import { GatewayStore, bindRoutes, unresolved, resolveEffect } from "./gateway-state.js";
+import { cancelTurn, sendTurn } from "./execution-commands.js";
+import { GatewayStore, bindRoutes, resolveEffect } from "./gateway-state.js";
 let stdoutClosed = false;
 let activeAbortController;
 function handleStdoutError(error) {
@@ -25,6 +26,7 @@ function usage() {
         "  codex-router [--config PATH] cancel AGENT_ID [--json]",
         "  codex-router [--config PATH] gateway",
         "  codex-router [--config PATH] gateway status [--json]",
+        "  codex-router [--config PATH] gateway polling-reset ACCOUNT_ID SINCE_UTC [--json]",
         "  codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID failed [--json]",
         "  codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE [--json]",
     ].join("\n");
@@ -122,6 +124,31 @@ async function main() {
             }
             return;
         }
+        if (first === "gateway" && second === "polling-reset" && !parsed.stdin && !parsed.stream) {
+            const [, , accountId, since, extra] = parsed.command;
+            const time = since ? Date.parse(since) : NaN;
+            const account = config.gateway?.sendblue.find(account => account.id === accountId && account.mode !== "webhook");
+            if (!account || !config.gateway || !since || extra !== undefined || !Number.isSafeInteger(time)
+                || new Date(time).toISOString() !== since || time > Date.now() || time < Date.now() - 29 * 86400000) {
+                throw new RouterError("input_invalid", "Use a polling account and a UTC timestamp within the last 29 days, for example 2026-09-27T00:00:00.000Z.");
+            }
+            const store = await GatewayStore.open(config.gateway.stateDir);
+            try {
+                await store.transaction(state => {
+                    bindRoutes(state, config.gateway);
+                    (state.polling ??= {})[accountId] = { activationAtMs: time, completedThroughMs: time,
+                        routeActivationAtMs: Object.fromEntries(config.gateway.routes.filter(route => route.sendblueId === accountId).map(route => [route.id, time])) };
+                });
+                if (parsed.json)
+                    printJson({ account: accountId, pollingFrom: since });
+                else
+                    writeStdout(`Polling for ${accountId} will resume from ${since}. Existing message receipts were retained.\n`);
+            }
+            finally {
+                await store.close();
+            }
+            return;
+        }
         if (first === "gateway" && (second === "status" || second === "resolve") && !parsed.stdin && !parsed.stream) {
             const [, , routeId, effectId, resolution, handle, extra] = parsed.command;
             if ((second === "status" && third !== undefined) || (second === "resolve" &&
@@ -131,26 +158,33 @@ async function main() {
             }
             if (!config.gateway)
                 throw new RouterError("config_invalid", "The gateway configuration is missing.");
+            if (second === "status") {
+                const status = await readGatewayStatus(config.gateway.stateDir);
+                if (parsed.json)
+                    printJson(status);
+                else {
+                    writeStdout(`Gateway status: ${status.runtime.state}.\n`);
+                    if (status.runtime.polling)
+                        for (const poll of status.runtime.polling)
+                            writeStdout(`${poll.accountId}: ${poll.state}${poll.code ? ` (${poll.code})` : ""}\n`);
+                    if (status.runtime.routes)
+                        for (const route of status.runtime.routes)
+                            writeStdout(`${route.routeId}: ${route.state}${route.code ? ` (${route.code})` : ""}\n`);
+                    for (const effect of status.unresolved)
+                        writeStdout(`${effect.routeId}  ${effect.kind}  ${effect.effectId}\n`);
+                }
+                if (["unavailable", "stale"].includes(status.runtime.state))
+                    process.exitCode = 1;
+                return;
+            }
             const store = await GatewayStore.open(config.gateway.stateDir);
             try {
                 bindRoutes(store.snapshot(), config.gateway);
-                if (second === "status") {
-                    const status = unresolved(store.snapshot());
-                    if (parsed.json)
-                        printJson(status);
-                    else if (!status.unresolved.length)
-                        writeStdout("No unresolved effects.\n");
-                    else
-                        for (const effect of status.unresolved)
-                            writeStdout(`${effect.routeId}  ${effect.kind}  ${effect.effectId}\n`);
-                }
-                else {
-                    const result = await store.transaction((state) => resolveEffect(state, routeId, effectId, resolution, handle));
-                    if (parsed.json)
-                        printJson(result);
-                    else
-                        writeStdout(`Resolved ${effectId} as ${resolution}.\n`);
-                }
+                const result = await store.transaction((state) => resolveEffect(state, routeId, effectId, resolution, handle));
+                if (parsed.json)
+                    printJson(result);
+                else
+                    writeStdout(`Resolved ${effectId} as ${resolution}.\n`);
             }
             finally {
                 await store.close();

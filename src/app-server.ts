@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { RouterError } from "./errors.js";
 import { JsonRpcClient } from "./json-rpc.js";
@@ -30,18 +30,35 @@ async function codexHome(): Promise<string> {
   }
 }
 
-async function socketState(path: string): Promise<"absent" | "socket" | "other"> {
+export async function localControlSocketState(path: string): Promise<"absent" | "socket" | "other"> {
+  let entry;
   try {
-    const stat = await lstat(path);
-    return stat.isSocket() ? "socket" : "other";
+    entry = await lstat(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
     throw new RouterError("app_server_connect_failed", "The Codex control socket could not be inspected.", { cause: error });
   }
+  if (!entry.isSocket() && !entry.isSymbolicLink()) return "other";
+  try {
+    const resolved = await realpath(path);
+    const endpoint = await stat(resolved);
+    if (!endpoint.isSocket()) return "other";
+    const uid = process.getuid?.();
+    const parents = await Promise.all([stat(dirname(path)), stat(dirname(resolved))]);
+    if (uid === undefined || entry.uid !== uid || endpoint.uid !== uid || (endpoint.mode & 0o077) !== 0
+      || parents.some((parent) => !parent.isDirectory() || parent.uid !== uid || (parent.mode & 0o022) !== 0)) {
+      throw new RouterError("app_server_connect_failed", "The Codex control socket must belong to the current user and have protected permissions.");
+    }
+    return "socket";
+  } catch (error) {
+    if (error instanceof RouterError) throw error;
+    // A broken rendezvous is not proof that no server owns this host.
+    throw new RouterError("app_server_connect_failed", "The Codex control socket could not be resolved safely.", { cause: error });
+  }
 }
 
 export async function remoteControlSocketState(sshHost: string): Promise<RemoteSocketState> {
-  const script = 'codex_home=${CODEX_HOME:-"$HOME/.codex"}; socket="$codex_home/app-server-control/app-server-control.sock"; if test -S "$socket"; then printf socket; elif test -e "$socket"; then printf other; else printf absent; fi';
+  const script = 'codex_home=${CODEX_HOME:-"$HOME/.codex"}; socket="$codex_home/app-server-control/app-server-control.sock"; if test -S "$socket"; then printf socket; elif test -e "$socket" || test -L "$socket"; then printf other; else printf absent; fi';
   const spec = sshProcessSpec(sshHost, ["sh", "-c", script]);
   try {
     const { stdout } = await execFileAsync(spec.command, spec.args, {
@@ -167,7 +184,7 @@ export async function connectLocalAppServer(operations?: LocalAppServerOperation
   const defaults: LocalAppServerOperations = operations ?? {
     probe: async () => {
       const socketPath = join(await codexHome(), "app-server-control", "app-server-control.sock");
-      return socketState(socketPath);
+      return localControlSocketState(socketPath);
     },
     connectProxy: () => connectTransport(new ProxyTransport()),
     connectStdio: () => connectTransport(new StdioTransport()),
@@ -178,12 +195,7 @@ export async function connectLocalAppServer(operations?: LocalAppServerOperation
     throw new RouterError("app_server_connect_failed", "The Codex control-socket path exists but is not a Unix socket.");
   }
   if (state === "absent") return defaults.connectStdio();
-  try {
-    return await defaults.connectProxy();
-  } catch (error) {
-    if (!(error instanceof RouterError) || error.code !== "app_server_connect_failed") throw error;
-    return defaults.connectStdio();
-  }
+  return defaults.connectProxy();
 }
 
 export interface RemoteProxyOperations {

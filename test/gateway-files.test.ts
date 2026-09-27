@@ -3,9 +3,10 @@ import test from "node:test";
 import { mkdtemp, realpath, mkdir, readdir, lstat, readFile, writeFile, rm, symlink, open, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { RouterError } from "../src/errors.js";
 import { randomUUID } from "node:crypto";
 import { GatewayFilePlane, copyLocal, hashFile, inspectLocal } from "../src/gateway-files.js";
-import type { GatewaySession, GatewayConnector } from "../src/gateway.js";
+import type { GatewaySession, SendblueProvider } from "../src/gateway.js";
 import type { GatewayRoute } from "../src/config.js";
 import type { CodexWork, GatewayState, Batch } from "../src/gateway-state.js";
 
@@ -27,10 +28,10 @@ async function fixture() {
     },
   };
   const uploads: Array<{ path: string; name: string; mediaType: string }> = [];
-  const connector: GatewayConnector = { signingSecret: "secret", inbound() { return undefined; }, callback() { return { status: "SENT" }; }, async send() { return { status: "accepted", providerHandle: "handle" }; }, async typing() {},
+  const connector: SendblueProvider = { signingSecret: "secret", inbound() { return undefined; }, callback() { return { status: "SENT" }; }, async send() { return { status: "accepted", providerHandle: "handle" }; }, async typing() {},
     async upload(path, name, mediaType) { uploads.push({ path, name, mediaType }); return `https://cdn.example/${uploads.length}`; },
   };
-  const files = new GatewayFilePlane(spool); const state: GatewayState = { version: 1, routes: {} }; const signal = new AbortController().signal;
+  const files = new GatewayFilePlane(spool); const state: GatewayState = { version: 2, routes: {} }; const signal = new AbortController().signal;
   await files.cleanup(state); await files.reconcile(route, state, session, signal);
   const id = randomUUID(); const publication = await files.publication(route, id, session, signal);
   const work: CodexWork = { kind: "codex", ownerBatchId: "batch", joinedBatchIds: [], batches: [], turnId: "turn", publicationIds: [id], artifactBaseline: [] };
@@ -47,7 +48,7 @@ test("published and native artifacts deduplicate by bytes and preserve outside n
     await f.files.release(f.route, f.work, f.session);
     assert.deepEqual(await readFile(outside), PNG);
     assert.deepEqual(await readFile(f.uploads[0]!.path), PNG);
-    await f.files.release(f.route, { kind: "delivery", id: "delivery", batchIds: [], parts });
+    await f.files.release(f.route, { kind: "delivery", sourceId: "sendblue:account", id: "delivery", batchIds: [], parts });
     await assert.rejects(lstat(f.uploads[0]!.path));
   } finally { await f.close(); }
 });
@@ -132,7 +133,7 @@ test("inbound preparation streams bytes and preserves advertised-image mismatche
   t.mock.method(globalThis, "fetch", async () => new Response("ordinary text", { headers: { "content-type": "image/png" } }));
   try {
     const now = Date.now();
-    const batch: Batch = { id: "batch", openedAtMs: now, quietDeadlineMs: now, maximumDeadlineMs: now, events: [{ messageHandle: "full-handle", providerTimeMs: now, receiptSequence: 0, text: "", attachment: { state: "pending", sourceUrl: "https://provider.example/media", name: "../../photo.png" } }] };
+    const batch: Batch = { sourceId: "sendblue:account", id: "batch", openedAtMs: now, quietDeadlineMs: now, maximumDeadlineMs: now, events: [{ messageHandle: "full-handle", providerTimeMs: now, receiptSequence: 0, text: "", attachment: { state: "pending", sourceUrl: "https://provider.example/media", name: "../../photo.png" } }] };
     const result = await f.files.prepareBatch(f.route, batch, f.session, f.signal);
     const attachment = result.events[0]!.attachment;
     if (attachment?.state !== "ready") assert.fail("attachment omitted");
@@ -150,16 +151,16 @@ test("restart cleanup preserves active inputs and publications across routes unt
     const hostOne = join(f.home, "codex-router-gateway/inbox/one"); const hostTwo = join(f.home, "codex-router-gateway/inbox/two");
     for (const path of [one, two, hostOne, hostTwo]) await writeFile(path, "input");
     const secondId = randomUUID(); const secondPublication = await f.files.publication(f.route, secondId, f.session, f.signal);
-    const batch = (id: string, localPath: string, hostPath: string): Batch => ({ id, openedAtMs: 0, quietDeadlineMs: 1, maximumDeadlineMs: 2, events: [{ messageHandle: id, providerTimeMs: 0, receiptSequence: 0, text: "", attachment: { state: "ready", name: "input", mediaType: "text/plain", inputKind: "file", localPath, hostPath } }] });
-    const route = (work: CodexWork) => ({ binding: { sendblueId: "account", sender: "+15125550100", sendblueNumber: "+15125550200", target: { sshHost: null, threadId: "thread", cwd: f.root } }, nextSequence: 1, queue: [], seenMessages: [], active: work });
-    const state: GatewayState = { version: 1, routes: {
+    const batch = (id: string, localPath: string, hostPath: string): Batch => ({ id, sourceId: "sendblue:account", openedAtMs: 0, quietDeadlineMs: 1, maximumDeadlineMs: 2, events: [{ messageHandle: id, providerTimeMs: 0, receiptSequence: 0, text: "", attachment: { state: "ready", name: "input", mediaType: "text/plain", inputKind: "file", localPath, hostPath } }] });
+    const route = (work: CodexWork) => ({ binding: { sources: [{ kind: "sendblue" as const, id: "sendblue:account", accountId: "account", sender: "+15125550100", sendblueNumber: "+15125550200" }], target: { sshHost: null, threadId: "thread", cwd: f.root } }, nextSequence: 1, queue: [], receipts: [], active: work });
+    const state: GatewayState = { version: 2, routes: {
       one: route({ ...f.work, batches: [batch("one", one, hostOne)] }),
       two: route({ ...f.work, publicationIds: [secondId], batches: [batch("two", two, hostTwo)] }),
     } };
     const restart = new GatewayFilePlane(f.spool); await restart.cleanup(state); await restart.reconcile(f.route, state, f.session, f.signal);
     for (const path of [one, two, hostOne, hostTwo, f.publication, secondPublication]) await lstat(path);
     const output = join(f.spool, "outbox", "frozen"); await writeFile(output, "output");
-    state.routes.one!.active = { kind: "delivery", id: "frozen", batchIds: ["one"], parts: [{ id: "part", status: "ready", payload: { kind: "media", localPath: output, name: "output", mediaType: "text/plain", mediaUrl: "https://cdn.example/frozen" } }] };
+    state.routes.one!.active = { kind: "delivery", sourceId: "sendblue:account", id: "frozen", batchIds: ["one"], parts: [{ id: "part", status: "ready", payload: { kind: "media", localPath: output, name: "output", mediaType: "text/plain", mediaUrl: "https://cdn.example/frozen" } }] };
     const afterFreeze = new GatewayFilePlane(f.spool); await afterFreeze.cleanup(state); await afterFreeze.reconcile(f.route, state, f.session, f.signal);
     for (const path of [one, hostOne, f.publication]) await assert.rejects(lstat(path));
     for (const path of [two, hostTwo, secondPublication, output]) await lstat(path);
@@ -239,4 +240,57 @@ test("missing or unsafe publication preserves text and native artifacts", async 
       assert.deepEqual(await readFile(native), PNG);
     } finally { await f.close(); }
   }
+});
+
+
+test("release cleans publication files after its execution session closes", async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.publication, "result.txt"), "ready");
+    f.session.filesystem = async () => { throw new Error("session is closed"); };
+    await f.files.release(f.route, f.work, f.session);
+    await assert.rejects(lstat(f.publication), { code: "ENOENT" });
+    await f.files.release(f.route, f.work, f.session);
+  } finally { await f.close(); }
+});
+
+test("release refuses publication symlinks without deleting their target", async () => {
+  const f = await fixture();
+  try {
+    const outside = join(f.root, "outside");
+    await mkdir(outside); await writeFile(join(outside, "keep.txt"), "keep");
+    await rm(f.publication, { recursive: true }); await symlink(outside, f.publication);
+    await assert.rejects(f.files.release(f.route, f.work, f.session));
+    assert.equal(await readFile(join(outside, "keep.txt"), "utf8"), "keep");
+  } finally { await f.close(); }
+});
+
+
+test("concurrent reconciliation shares a failure and a healthy retry preserves retained publications", async () => {
+  const f = await fixture();
+  try {
+    const files = new GatewayFilePlane(f.spool);
+    let rejectRequest!: (error: Error) => void; let failedCalls = 0;
+    const failedSession: GatewaySession = { ...f.session, filesystem: async () => {
+      failedCalls++; return new Promise((_resolve, reject) => { rejectRequest = reject; });
+    } };
+    const state: GatewayState = { version: 2, routes: { route: {
+      binding: { sources: [{ kind: "sendblue", id: "sendblue:account", accountId: "account", sender: f.route.sender!, sendblueNumber: f.route.sendblueNumber! }],
+        target: { sshHost: null, threadId: f.route.agent.threadId, cwd: f.route.agent.cwd } },
+      nextSequence: 0, receipts: [], queue: [], active: f.work,
+    } } };
+    const first = files.reconcile(f.route, state, failedSession, f.signal);
+    const concurrent = files.reconcile(f.route, state, f.session, f.signal);
+    assert.equal(first, concurrent);
+    const checks = [assert.rejects(first, { code: "app_server_disconnected" }), assert.rejects(concurrent, { code: "app_server_disconnected" })];
+    while (!rejectRequest) await new Promise(resolve => setImmediate(resolve));
+    rejectRequest(new RouterError("app_server_disconnected", "transient setup failure"));
+    await Promise.all(checks); assert.equal(failedCalls, 1);
+    await writeFile(join(f.publication, "retained.txt"), "retained");
+    await files.reconcile(f.route, state, f.session, f.signal);
+    assert.equal(await readFile(join(f.publication, "retained.txt"), "utf8"), "retained");
+    // A successful reconciliation remains cached, including across sessions.
+    await files.reconcile(f.route, state, failedSession, f.signal);
+    assert.equal(failedCalls, 1);
+  } finally { await f.close(); }
 });

@@ -1,0 +1,22 @@
+menu "Codex Router example"
+config ROUTER_ORIGIN
+    string "HTTPS origin (no trailing slash)"
+    default "https://router.example.com"
+config ROUTER_PRIVATE_CA
+    bool "Trust a private CA from main/router_ca.pem"
+    default n
+    help
+        Embed the PEM CA certificate for a LAN gateway. Server hostname
+        verification remains enabled. Copy only the CA certificate into
+        main/router_ca.pem; never copy a private key. When disabled, the
+        client uses the ESP certificate bundle.
+config ROUTER_ROUTE
+    string "Configured route ID"
+    default "assistant"
+config ROUTER_TOKEN
+    string "HTTPS bearer token (development only; secure provisioning for deployment)"
+    default "REPLACE_ME"
+config ROUTER_PROMPT
+    string "Prompt submitted once (up to 1024 UTF-8 bytes)"
+    default "Explain the current project status."
+endmenu

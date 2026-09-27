@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   connectLocalAppServer,
+  localControlSocketState,
   ensureRemoteProxy,
   parseDaemonStartResult,
   parseRemoteControlSocketState,
@@ -98,39 +103,47 @@ test("daemon start must expose a socket before proxy connection", async () => {
   );
 });
 
-test("local app-server falls back to owned stdio only for an unreachable socket proxy", async () => {
-  const fallbackCalls: string[] = [];
-  const fallback = await connectLocalAppServer({
-    probe: async () => "socket",
-    connectProxy: async () => {
-      fallbackCalls.push("proxy");
-      throw new RouterError("app_server_connect_failed", "stale socket");
-    },
-    connectStdio: async () => {
-      fallbackCalls.push("stdio");
-      return { ...connection(), transportKind: "stdio" };
-    },
-  });
-  assert.equal(fallback.transportKind, "stdio");
-  assert.deepEqual(fallbackCalls, ["proxy", "stdio"]);
-
-  for (const code of ["app_server_protocol_failed", "timeout", "codex_unavailable"] as const) {
+test("an existing proxy failure never starts a competing owned server", async () => {
+  for (const code of ["app_server_connect_failed", "app_server_protocol_failed", "timeout", "codex_unavailable"] as const) {
     const calls: string[] = [];
     await assert.rejects(
       connectLocalAppServer({
         probe: async () => "socket",
-        connectProxy: async () => {
-          calls.push("proxy");
-          throw new RouterError(code, "definite failure");
-        },
-        connectStdio: async () => {
-          calls.push("stdio");
-          return { ...connection(), transportKind: "stdio" };
-        },
+        connectProxy: async () => { calls.push("proxy"); throw new RouterError(code, "failed"); },
+        connectStdio: async () => { calls.push("stdio"); return connection(); },
       }),
       (error: unknown) => error instanceof RouterError && error.code === code,
     );
     assert.deepEqual(calls, ["proxy"]);
+  }
+});
+
+test("local socket discovery accepts protected rendezvous symlinks and rejects unsafe endpoints", { skip: process.platform === "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cr-sock-"));
+  const endpoint = join(directory, "owner.sock");
+  const alias = join(directory, "control.sock");
+  const server = createServer();
+  try {
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(endpoint, resolve); });
+    await chmod(endpoint, 0o600);
+    await symlink(endpoint, alias);
+    assert.equal(await localControlSocketState(endpoint), "socket");
+    assert.equal(await localControlSocketState(alias), "socket");
+    await chmod(endpoint, 0o666);
+    await assert.rejects(localControlSocketState(alias), { code: "app_server_connect_failed" });
+    await chmod(endpoint, 0o600);
+    await chmod(directory, 0o777);
+    await assert.rejects(localControlSocketState(alias), { code: "app_server_connect_failed" });
+    await chmod(directory, 0o700);
+    await symlink(join(directory, "missing"), join(directory, "broken"));
+    await assert.rejects(localControlSocketState(join(directory, "broken")), { code: "app_server_connect_failed" });
+    await writeFile(join(directory, "file"), "not a socket");
+    await symlink(join(directory, "file"), join(directory, "file-link"));
+    assert.equal(await localControlSocketState(join(directory, "file-link")), "other");
+    assert.equal(await localControlSocketState(join(directory, "absent")), "absent");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
   }
 });
 

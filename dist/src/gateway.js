@@ -1,8 +1,11 @@
 import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { RouterError } from "./errors.js";
 import { RpcRequestError } from "./json-rpc.js";
-import { TurnSession, TurnEndedError } from "./turn-session.js";
-import { ADMISSION_FAILURE, bindRoutes, settlePart } from "./gateway-state.js";
+import { TurnEndedError } from "./turn-session.js";
+import { executionBinding, openExecutionSession, verifyExecutionBinding } from "./execution-session.js";
+import { matchIncoming, sourceAdapters } from "./gateway-adapters.js";
+import { ProgressHub } from "./gateway-progress.js";
+import { bindRoutes, settlePart } from "./gateway-state.js";
 export function delay(ms, signal) {
     return new Promise((resolve, reject) => {
         const finish = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); };
@@ -55,6 +58,8 @@ export class Gateway {
     store;
     operations;
     ready = false;
+    progress = new ProgressHub();
+    adapters = new Map();
     abort = new AbortController();
     workers = new Map();
     live = new Map();
@@ -66,43 +71,144 @@ export class Gateway {
         this.store = store;
         this.operations = operations;
         this.now = operations.now ?? Date.now;
-        for (const route of config.routes)
+        for (const route of config.routes) {
             this.workers.set(route.id, { again: false });
+            this.adapters.set(route.id, sourceAdapters(config, route, operations.files, operations.connector));
+        }
+    }
+    /** Scheduling and file cleanup need identities and work, never retained response text. */
+    executionState() {
+        return this.store.read(state => ({ ...state, routes: Object.fromEntries(Object.entries(state.routes).map(([id, route]) => [id, {
+                    ...route, receipts: route.receipts.map(r => ({ ...r, ...(r.result ? { result: { ...r.result, text: "" } } : {}) })),
+                }])) }));
     }
     async start() {
         await this.store.transaction((state) => bindRoutes(state, this.config));
-        await this.operations.files.cleanup(this.store.snapshot());
+        await this.operations.files.cleanup(this.executionState());
         this.ready = true;
         for (const route of this.config.routes)
             this.wake(route.id);
     }
+    source(route, sourceId) {
+        const adapters = this.adapters.get(route.id);
+        const adapter = adapters.find(a => a.binding.id === sourceId);
+        if (!adapter)
+            throw new RouterError("state_invalid", "The work source is unavailable.");
+        return adapter;
+    }
+    activeSource(route) {
+        const state = this.executionState().routes[route.id];
+        const active = state?.active;
+        const sourceId = active?.kind === "codex" ? (active.batches.find(batch => this.source(route, batch.sourceId).typing)?.sourceId ?? active.batches[0]?.sourceId) : active?.sourceId;
+        if (sourceId)
+            return this.source(route, sourceId);
+        const batch = state?.queue[0] ?? state?.openBatch;
+        return batch ? this.source(route, batch.sourceId) : this.adapters.get(route.id)?.[0];
+    }
     async receive(accountId, message) {
+        const match = matchIncoming(this.config, accountId, message);
+        if (!match)
+            return;
+        await this.submit(match.route.id, { sourceId: match.sourceId, externalId: message.messageHandle,
+            input: { text: message.text, ...(message.attachment ? { attachment: message.attachment } : {}) }, providerTimeMs: message.providerTimeMs });
+    }
+    async submit(routeId, submission) {
         if (!this.ready)
             throw new RouterError("storage_failed", "Gateway intake is not ready.");
-        const route = this.config.routes.find((route) => route.sendblueId === accountId && route.sender === message.sender && route.sendblueNumber === message.sendblueNumber);
+        const route = this.config.routes.find(r => r.id === routeId);
         if (!route)
-            return;
+            throw new RouterError("input_invalid", "Unknown route.");
+        const adapter = this.source(route, submission.sourceId);
         const now = this.now();
-        const accepted = await this.store.transaction((state) => {
-            if (Object.values(state.routes).some((route) => route.seenMessages.some((seen) => seen.sendblueId === accountId && seen.messageHandle === message.messageHandle)))
-                return false;
+        const activeTurn = this.store.read(state => state.routes[routeId]?.active?.kind === "codex");
+        const { quietMs, maximumMs } = activeTurn || adapter.policy.batching === "immediate" ? { quietMs: 0, maximumMs: 0 } : adapter.policy.batching;
+        const lookup = (state) => adapter.policy.duplicateBehavior === "exact"
+            ? state.routes[route.id].receipts.find(r => r.sourceId === submission.sourceId && r.externalId === submission.externalId && (!r.expiresAtMs || r.expiresAtMs > now))
+            : Object.values(state.routes).flatMap(r => r.receipts).find(r => r.sourceId === submission.sourceId && r.externalId === submission.externalId && r.receivedAtMs > now - 30 * 24 * 60 * 60 * 1000);
+        const verify = (receipt) => {
+            if (adapter.policy.duplicateBehavior === "exact" && receipt.payloadHash !== submission.payloadHash)
+                throw new SubmissionFailure(409, "request_conflict");
+            return receipt;
+        };
+        // A committed duplicate is read-only. First admission still rechecks identity inside the writer.
+        const committed = this.store.read(lookup);
+        if (committed)
+            return verify(committed);
+        let added = false;
+        const receipt = await this.store.transaction(state => {
             const target = state.routes[route.id];
-            if (target.openBatch && Math.min(target.openBatch.quietDeadlineMs, target.openBatch.maximumDeadlineMs) <= now) {
+            const existing = lookup(state);
+            if (existing)
+                return verify(existing);
+            let reservedBytes;
+            if (adapter.policy.retainTerminalResult) {
+                for (const r of Object.values(state.routes))
+                    r.receipts = r.receipts.filter(x => !x.expiresAtMs || x.expiresAtMs > now);
+                const retained = Object.values(state.routes).flatMap(r => r.receipts).filter(r => r.reservedBytes !== undefined);
+                reservedBytes = Buffer.byteLength(JSON.stringify(submission.input)) + 6 * 256 * 1024 + 16 * 1024;
+                if (retained.length >= (this.config.maxRequests ?? 1024) || retained.reduce((n, r) => n + r.reservedBytes, 0) + reservedBytes > (this.config.retainedBytes ?? 8 * 1024 * 1024))
+                    throw new SubmissionFailure(429, "capacity_exceeded");
+            }
+            if (target.openBatch && (target.openBatch.sourceId !== submission.sourceId || quietMs === 0
+                || Math.min(target.openBatch.quietDeadlineMs, target.openBatch.maximumDeadlineMs) <= now)) {
                 target.queue.push(target.openBatch);
                 delete target.openBatch;
             }
-            target.openBatch ??= { id: randomUUID(), openedAtMs: now, quietDeadlineMs: now + 5000, maximumDeadlineMs: now + 30000, events: [] };
-            const event = { messageHandle: message.messageHandle, providerTimeMs: message.providerTimeMs, receiptSequence: target.nextSequence++, text: message.text,
-                ...(message.attachment ? { attachment: { state: "pending", ...message.attachment } } : {}) };
-            target.openBatch.events.push(event);
-            target.openBatch.quietDeadlineMs = now + 5000;
-            target.seenMessages.push({ sendblueId: accountId, messageHandle: message.messageHandle, receivedAtMs: now });
-            return true;
+            const batch = target.openBatch ?? { id: randomUUID(), sourceId: submission.sourceId, openedAtMs: now,
+                quietDeadlineMs: now + quietMs, maximumDeadlineMs: now + maximumMs, events: [] };
+            batch.events.push({ messageHandle: submission.externalId, providerTimeMs: submission.providerTimeMs ?? now,
+                receiptSequence: target.nextSequence++, text: submission.input.text,
+                ...(submission.input.attachment ? { attachment: { state: "pending", ...submission.input.attachment } } : {}) });
+            batch.quietDeadlineMs = now + quietMs;
+            if (quietMs)
+                target.openBatch = batch;
+            else
+                target.queue.push(batch);
+            const receipt = { sourceId: submission.sourceId, externalId: submission.externalId, receivedAtMs: now,
+                batchId: batch.id, ...(submission.payloadHash ? { payloadHash: submission.payloadHash } : {}), ...(reservedBytes === undefined ? {} : { reservedBytes }) };
+            target.receipts.push(receipt);
+            added = true;
+            return receipt;
         });
-        if (accepted) {
+        if (added) {
+            this.readReceipt(adapter);
             this.typing(route, true);
             this.wake(route.id);
         }
+        return receipt;
+    }
+    request(routeId, sourceId, requestId) {
+        return this.store.read(state => {
+            const route = state.routes[routeId];
+            const receipt = route?.receipts.find(r => r.sourceId === sourceId && r.externalId === requestId && (!r.expiresAtMs || r.expiresAtMs > this.now()));
+            if (!receipt)
+                return undefined;
+            const active = route.active;
+            const worker = this.workers.get(routeId);
+            const ours = active?.kind === "codex" && active.batches.some(b => b.id === receipt.batchId);
+            return { request_id: requestId, status: receipt.result?.status ?? (ours ? active.pendingAdmission ? "unresolved" : "running" : "queued"),
+                ...(receipt.result ? { result: receipt.result, expires_at: receipt.expiresAtMs } : {}),
+                ...(receipt.turnId ? { turn_id: receipt.turnId } : {}),
+                ...(!receipt.result && worker?.error ? { processing: { state: "blocked", code: worker.error instanceof RouterError ? worker.error.code : "gateway_unavailable" } }
+                    : !receipt.result && worker?.retryAt !== undefined ? { processing: { state: "retrying", code: worker.retryCode } } : {}),
+                ...(ours && this.workers.get(routeId)?.session?.capabilities?.commentary ? { commentary: this.workers.get(routeId).session.capabilities.commentary } : {}),
+                ...(!receipt.result && !ours && active?.kind === "delivery" ? { blocked_by: "delivery" } : {}) };
+        });
+    }
+    requestKey(routeId, sourceId, requestId) { return JSON.stringify([routeId, sourceId, requestId]); }
+    notifyWork(route, work) {
+        const state = this.executionState().routes[route.id];
+        for (const receipt of state.receipts) {
+            if (!work || work.batches.some(b => b.id === receipt.batchId))
+                this.progress.notify(this.requestKey(route.id, receipt.sourceId, receipt.externalId));
+        }
+    }
+    readReceipt(adapter) {
+        // Presence is best effort: provider failures must never affect the reply.
+        void Promise.resolve().then(() => {
+            if (!this.abort.signal.aborted)
+                return adapter.readReceipt?.(this.abort.signal);
+        }).catch(() => undefined);
     }
     typing(route, active) {
         const worker = this.workers.get(route.id);
@@ -114,16 +220,25 @@ export class Gateway {
             clearTimeout(worker.typingTimer);
             delete worker.typingTimer;
         }
-        void this.operations.connector(route.sendblueId).typing(route, active ? "start" : "stop", this.abort.signal).catch(() => undefined);
+        const adapter = active ? this.activeSource(route) : worker.typingSource;
+        if (!active)
+            delete worker.typingSource;
+        if (!adapter?.typing)
+            return;
+        void adapter.typing(active, this.abort.signal).catch(() => undefined);
         if (active) {
+            worker.typingSource = adapter;
             worker.typingTimer = setTimeout(() => { delete worker.typingTimer; this.typing(route, true); }, 240000);
             worker.typingTimer.unref();
         }
     }
     wake(routeId) {
         const worker = this.workers.get(routeId);
-        if (this.abort.signal.aborted || worker.error)
+        if (this.abort.signal.aborted || worker.error || (worker.retryAt !== undefined && Date.now() < worker.retryAt))
             return;
+        delete worker.retryAt;
+        clearTimeout(worker.retryTimer);
+        delete worker.retryTimer;
         worker.again = true;
         if (worker.running)
             return;
@@ -133,24 +248,106 @@ export class Gateway {
                 worker.again = false;
                 await this.step(route, worker);
             }
-        })().catch((error) => { worker.error = error; this.typing(route, false); })
+        })().catch((error) => this.failure(route, worker, error))
             .finally(() => { delete worker.running; if (worker.again && !worker.error)
             this.wake(route.id); });
     }
+    retry(route, worker, code) {
+        worker.again = false;
+        worker.retryCode = code;
+        const attempt = worker.retryAttempt ?? 0;
+        worker.retryAttempt = attempt + 1;
+        const ms = this.operations.retryDelayMs?.(attempt) ?? Math.min(250 * 2 ** Math.min(attempt, 5), 5000);
+        worker.retryAt = Date.now() + ms;
+        clearTimeout(worker.retryTimer);
+        const tick = () => {
+            if (this.abort.signal.aborted || worker.retryAt === undefined)
+                return;
+            const remaining = worker.retryAt - Date.now();
+            if (remaining <= 0)
+                this.wake(route.id);
+            else {
+                worker.retryTimer = setTimeout(tick, remaining);
+                worker.retryTimer.unref();
+            }
+        };
+        worker.retryTimer = setTimeout(tick, ms);
+        worker.retryTimer.unref();
+        this.typing(route, false);
+        this.notifyWork(route);
+    }
+    async failure(route, worker, error) {
+        worker.again = false;
+        const session = worker.session;
+        const current = this.executionState().routes[route.id];
+        for (const receipt of current.receipts)
+            if (!receipt.result && receipt.reservedBytes !== undefined)
+                this.progress.reset(this.requestKey(route.id, receipt.sourceId, receipt.externalId));
+        delete worker.session;
+        delete worker.observation;
+        delete worker.outcome;
+        delete worker.observationError;
+        await session?.close().catch(() => undefined);
+        if (this.abort.signal.aborted)
+            return;
+        // These retries only reopen and restore persisted work. No retry path calls
+        // admit for an unresolved UUID, even when the original request lost its ACK.
+        if (error instanceof RouterError && ["thread_busy", "app_server_connect_failed", "app_server_disconnected", "timeout"].includes(error.code)) {
+            this.retry(route, worker, error.code);
+        }
+        else {
+            worker.error = error;
+            this.typing(route, false);
+            this.notifyWork(route);
+        }
+    }
     async session(route, worker) {
         if (!worker.session) {
-            worker.session = await (this.operations.openSession?.(route, this.abort.signal) ?? TurnSession.open(route.agent, undefined, this.abort.signal));
-            await this.operations.files.reconcile(route, this.store.snapshot(), worker.session, this.abort.signal);
+            const active = this.executionState().routes[route.id].active;
+            const binding = active?.kind === "codex" ? active.binding : undefined;
+            const session = await (this.operations.openSession?.(route, this.abort.signal)
+                ?? openExecutionSession(route.agent, this.abort.signal, binding));
+            worker.session = session;
+            if (binding)
+                verifyExecutionBinding(binding, executionBinding(route.agent, session));
+            await this.operations.files.reconcile(route, this.executionState(), session, this.abort.signal);
         }
         return worker.session;
     }
     observe(route, worker, turnId) {
         if (worker.observation)
             return;
-        worker.observation = worker.session.observe(turnId).then((outcome) => { worker.outcome = outcome; this.wake(route.id); }, (error) => { worker.error = error; this.typing(route, false); });
+        const session = worker.session;
+        worker.observation = session.observe(turnId, message => {
+            if (message.type !== "commentary" || !message.itemId || worker.session !== session || this.abort.signal.aborted)
+                return;
+            const state = this.executionState().routes[route.id];
+            const work = state.active;
+            if (work?.kind !== "codex" || work.turnId !== turnId)
+                return;
+            for (const receipt of state.receipts)
+                if (receipt.reservedBytes !== undefined && work.batches.some(b => b.id === receipt.batchId)) {
+                    try {
+                        this.progress.publish(this.requestKey(route.id, receipt.sourceId, receipt.externalId), { id: `${turnId}:${message.itemId}`, kind: "commentary", text: message.text });
+                    }
+                    catch { /* Progress never fails execution. */ }
+                }
+        }).then((outcome) => {
+            if (worker.session !== session || this.abort.signal.aborted)
+                return;
+            worker.outcome = outcome;
+            this.wake(route.id);
+        }, (error) => {
+            if (worker.session !== session || this.abort.signal.aborted)
+                return;
+            worker.observationError = error;
+            this.wake(route.id);
+        });
     }
     async step(route, worker) {
-        let stored = this.store.snapshot().routes[route.id];
+        if (worker.observationError)
+            throw worker.observationError;
+        let stored = this.executionState().routes[route.id];
         if (worker.timer) {
             clearTimeout(worker.timer);
             delete worker.timer;
@@ -165,7 +362,7 @@ export class Gateway {
                         delete target.openBatch;
                     }
                 });
-                stored = this.store.snapshot().routes[route.id];
+                stored = this.executionState().routes[route.id];
             }
             else {
                 worker.timer = setTimeout(() => this.wake(route.id), remaining);
@@ -193,7 +390,7 @@ export class Gateway {
             else {
                 await this.store.transaction((state) => { delete state.routes[route.id].active; });
                 this.release(route, active, worker.session);
-                await worker.session?.close();
+                await worker.session?.close().catch(() => undefined);
                 delete worker.session;
                 delete worker.observation;
                 delete worker.outcome;
@@ -206,7 +403,8 @@ export class Gateway {
         }
         if (active?.kind === "codex") {
             if (active.admissionFailed && !active.turnId) {
-                await this.freeze(route, active, [{ id: randomUUID(), status: "ready", payload: { kind: "text", text: ADMISSION_FAILURE } }]);
+                const session = await this.session(route, worker);
+                await this.finish(route, active, { turnId: "", status: "failed", finalText: "", imageGenerations: [] }, session);
                 worker.again = true;
                 return;
             }
@@ -214,7 +412,7 @@ export class Gateway {
             if (!worker.observation) {
                 const intent = active.pendingAdmission;
                 const turnId = await session.restore(active.turnId, intent ? { clientUserMessageId: intent.clientUserMessageId,
-                    ...(intent.expectedTurnId ? { expectedTurnId: intent.expectedTurnId } : {}) } : undefined, active.artifactBaseline);
+                    ...(intent.expectedTurnId ? { expectedTurnId: intent.expectedTurnId } : {}) } : undefined, active.artifactBaseline, active.clientUserMessageId);
                 await this.store.transaction((state) => {
                     const work = state.routes[route.id].active;
                     work.turnId = turnId;
@@ -222,18 +420,22 @@ export class Gateway {
                         work.joinedBatchIds.push(work.pendingAdmission.batchId);
                     delete work.pendingAdmission;
                 });
+                worker.retryAttempt = 0;
+                delete worker.retryCode;
+                this.notifyWork(route);
                 this.observe(route, worker, turnId);
-                stored = this.store.snapshot().routes[route.id];
+                stored = this.executionState().routes[route.id];
             }
             const work = stored.active;
             if (worker.outcome && !work.pendingAdmission) {
-                const parts = await this.operations.files.delivery(route, work, worker.outcome, session, this.operations.connector(route.sendblueId), this.abort.signal);
-                await this.freeze(route, work, parts);
+                await this.finish(route, work, worker.outcome, session);
                 worker.again = true;
                 return;
             }
             if (work.admissionFailed || work.pendingAdmission || !stored.queue.length)
                 return;
+            if (session.capabilities?.steer === false)
+                throw new RouterError("thread_unavailable", "This connection cannot steer the active turn.");
         }
         else if (!stored.queue.length) {
             if (!stored.openBatch)
@@ -241,33 +443,43 @@ export class Gateway {
             return;
         }
         const session = await this.session(route, worker);
-        const resumed = await session.resume();
-        const expectedTurnId = active?.kind === "codex" ? active.turnId : resumed.activeTurn?.id;
+        let resumed = session.backend === "desktop" ? undefined : await session.resume();
         const first = stored.queue[0];
-        const batch = await this.operations.files.prepareBatch(route, first, session, this.abort.signal);
+        const adapter = this.source(route, first.sourceId);
+        const batch = await adapter.prepare(first, session, this.abort.signal);
         if (worker.outcome) {
             worker.again = true;
             return;
         }
-        const intent = { batchId: batch.id, clientUserMessageId: randomUUID(), publicationId: randomUUID(), ...(expectedTurnId ? { expectedTurnId } : {}) };
+        // Desktop preflight can fail without sending input. Complete it before the
+        // durable admission intent, after potentially slow attachment preparation.
+        resumed ??= await session.resume();
+        if (session.capabilities?.steer === false && resumed.activeTurn)
+            throw new RouterError("thread_unavailable", "This connection cannot steer the active turn.");
+        const currentWork = stored.active;
+        const expectedTurnId = currentWork?.kind === "codex" ? currentWork.turnId : resumed.activeTurn?.id;
+        const { publicationId, instructions } = await adapter.instructions(session, this.abort.signal);
+        const intent = { batchId: batch.id, clientUserMessageId: randomUUID(), ...(publicationId ? { publicationId } : {}), ...(expectedTurnId ? { expectedTurnId } : {}) };
+        if (this.abort.signal.aborted)
+            return;
         await this.store.transaction((state) => {
             const target = state.routes[route.id];
             if (target.queue[0]?.id !== batch.id)
                 throw new RouterError("state_invalid", "The admission queue changed unexpectedly.");
             target.queue.shift();
             const firstAdmission = !target.active;
-            target.active ??= { kind: "codex", ownerBatchId: batch.id, joinedBatchIds: [], batches: [], publicationIds: [], artifactBaseline: session.artifactBaseline };
+            target.active ??= { kind: "codex", ownerBatchId: batch.id, joinedBatchIds: [], batches: [], publicationIds: [], artifactBaseline: session.artifactBaseline, binding: executionBinding(route.agent, session), clientUserMessageId: intent.clientUserMessageId };
             const work = target.active;
             work.batches.push(batch);
-            work.publicationIds.push(intent.publicationId);
+            if (intent.publicationId)
+                work.publicationIds.push(intent.publicationId);
             work.pendingAdmission = intent;
-            if (firstAdmission && resumed.activeTurn && Array.isArray(resumed.activeTurn.items)) {
+            if (firstAdmission && session.backend !== "desktop" && resumed.activeTurn && Array.isArray(resumed.activeTurn.items)) {
                 work.artifactBaseline = resumed.activeTurn.items.flatMap((item) => item.type === "imageGeneration" && item.id ? [item.id] : []);
             }
         });
-        const publication = await this.operations.files.publication(route, intent.publicationId, session, this.abort.signal);
         try {
-            const turnId = await session.admit(batchInput(batch, this.operations.connector(route.sendblueId).agentInstructions?.(publication)), intent);
+            const turnId = await session.admit(batchInput(batch, instructions), intent);
             await this.store.transaction((state) => {
                 const work = state.routes[route.id].active;
                 work.turnId = turnId;
@@ -275,18 +487,23 @@ export class Gateway {
                     work.joinedBatchIds.push(batch.id);
                 delete work.pendingAdmission;
             });
+            worker.retryAttempt = 0;
+            delete worker.retryCode;
+            this.notifyWork(route);
             this.observe(route, worker, turnId);
         }
         catch (error) {
-            if (!(error instanceof RpcRequestError) && !(error instanceof TurnEndedError))
+            const busy = error instanceof RouterError && error.code === "thread_busy" && !error.ambiguous;
+            if (!busy && !(error instanceof RpcRequestError) && !(error instanceof TurnEndedError))
                 throw error;
             await this.store.transaction((state) => {
                 const target = state.routes[route.id];
                 const work = target.active;
                 delete work.pendingAdmission;
-                if (expectedTurnId && (staleSteer(error) || error instanceof TurnEndedError)) {
+                if (busy || (expectedTurnId && (staleSteer(error) || error instanceof TurnEndedError))) {
                     work.batches = work.batches.filter((value) => value.id !== batch.id);
-                    work.publicationIds = work.publicationIds.filter((value) => value !== intent.publicationId);
+                    if (intent.publicationId)
+                        work.publicationIds = work.publicationIds.filter((value) => value !== intent.publicationId);
                     target.queue.unshift(batch);
                     if (!work.turnId)
                         delete target.active;
@@ -294,22 +511,66 @@ export class Gateway {
                 else
                     work.admissionFailed = true;
             });
-            if (!this.store.snapshot().routes[route.id].active) {
+            if (!this.executionState().routes[route.id].active) {
                 await session.close();
                 delete worker.session;
+            }
+            if (busy) {
+                this.retry(route, worker, "thread_busy");
+                return;
             }
         }
         this.typing(route, true);
         worker.again = true;
     }
-    async freeze(route, work, parts) {
-        await this.store.transaction((state) => {
-            const current = state.routes[route.id].active;
-            if (current?.kind !== "codex" || current.pendingAdmission)
-                throw new RouterError("state_invalid", "The response still has an unresolved admission.");
-            state.routes[route.id].active = { kind: "delivery", id: randomUUID(), batchIds: work.batches.map((batch) => batch.id), parts };
+    async finish(route, work, outcome, session) {
+        const completions = [];
+        for (const sourceId of new Set(work.batches.map(batch => batch.sourceId))) {
+            const adapter = this.source(route, sourceId);
+            completions.push({ sourceId, plan: await adapter.complete(work, outcome, session, this.abort.signal) });
+        }
+        // A route currently has at most one outbound-delivery connector (Sendblue).
+        const deliveries = completions.filter(completion => completion.plan.kind === "deliver");
+        if (deliveries.length > 1)
+            throw new RouterError("state_invalid", "Multiple outbound delivery sources are unsupported.");
+        this.typing(route, false);
+        await this.store.transaction(state => {
+            const target = state.routes[route.id];
+            if (target.active?.kind !== "codex" || target.active.ownerBatchId !== work.ownerBatchId || target.active.pendingAdmission)
+                throw new RouterError("state_invalid", "Result has no settled execution.");
+            for (const completion of completions) {
+                if (completion.plan.kind !== "retain")
+                    continue;
+                for (const receipt of target.receipts)
+                    if (receipt.sourceId === completion.sourceId && work.batches.some(batch => batch.id === receipt.batchId)) {
+                        receipt.result = completion.plan.result;
+                        if (outcome.turnId)
+                            receipt.turnId = outcome.turnId;
+                        receipt.expiresAtMs = this.now() + 30 * 24 * 60 * 60 * 1000;
+                        receipt.reservedBytes = Buffer.byteLength(JSON.stringify(receipt));
+                    }
+            }
+            const delivery = deliveries[0];
+            if (delivery?.plan.kind === "deliver")
+                target.active = { kind: "delivery", id: randomUUID(), sourceId: delivery.sourceId,
+                    batchIds: work.batches.map(batch => batch.id), parts: delivery.plan.parts };
+            else
+                delete target.active;
         });
-        this.release(route, work, this.workers.get(route.id).session);
+        for (const receipt of this.store.read(state => state.routes[route.id].receipts.filter(receipt => receipt.result && work.batches.some(batch => batch.id === receipt.batchId))))
+            if (receipt.result) {
+                try {
+                    this.progress.publish(this.requestKey(route.id, receipt.sourceId, receipt.externalId), { id: receipt.externalId, kind: "terminal", text: receipt.result.text, metadata: { status: receipt.result.status, notices: receipt.result.notices } });
+                }
+                catch { /* Durable result remains retrievable. */ }
+            }
+        this.release(route, work, session);
+        const worker = this.workers.get(route.id);
+        delete worker.session;
+        delete worker.observation;
+        delete worker.outcome;
+        await session.close().catch(() => undefined);
+        this.notifyWork(route);
     }
     release(route, active, session) {
         const operation = this.operations.files.release?.(route, active, session);
@@ -319,7 +580,7 @@ export class Gateway {
         this.cleanups.add(cleanup);
     }
     currentPart(partId) {
-        const state = this.store.snapshot();
+        const state = this.executionState();
         for (const route of this.config.routes) {
             const delivery = state.routes[route.id]?.active;
             if (delivery?.kind !== "delivery")
@@ -332,13 +593,13 @@ export class Gateway {
     }
     callbackState(account, partId, token) {
         const current = this.currentPart(partId);
-        if (!current || current.route.sendblueId !== account || current.part.status !== "sending")
+        if (!current || this.source(current.route, current.delivery.sourceId).binding.accountId !== account || current.part.status !== "sending")
             return "stale";
         return secretEqual(current.part.callbackToken, token) ? "current" : "unauthorized";
     }
     async callback(account, partId, token, callback) {
         const current = this.currentPart(partId);
-        if (!current || current.route.sendblueId !== account || current.part.status !== "sending")
+        if (!current || this.source(current.route, current.delivery.sourceId).binding.accountId !== account || current.part.status !== "sending")
             return true;
         if (!secretEqual(current.part.callbackToken, token))
             return false;
@@ -378,18 +639,22 @@ export class Gateway {
         }).then(() => { entry.durable = true; }).catch((error) => { delete entry.persistence; throw error; });
         return entry.persistence;
     }
-    async lineSlot(number, signal) {
+    async lineSlot(number, limit, signal) {
         while (true) {
             if (signal.aborted)
                 throw new RouterError("interrupted", "The send operation stopped.");
             const starts = (this.lineStarts.get(number) ?? []).filter((time) => time > this.now() - 1000);
             this.lineStarts.set(number, starts);
-            if (starts.length < 10)
+            if (starts.length < limit)
                 return;
             await delay(starts[0] + 1000 - this.now(), signal);
         }
     }
     async sendPart(route, partId) {
+        const delivery = this.executionState().routes[route.id].active;
+        const outbound = this.source(route, delivery.sourceId).outbound;
+        if (!outbound)
+            throw new RouterError("state_invalid", "Delivery source has no outbound transport.");
         const live = { attemptsStarted: 0, abort: new AbortController(), durable: false, running: true };
         this.live.set(partId, live);
         const onAbort = () => live.abort.abort();
@@ -397,23 +662,22 @@ export class Gateway {
             onAbort();
         else
             this.abort.signal.addEventListener("abort", onAbort, { once: true });
-        let uncertain = false;
         try {
             for (let attempt = 0; attempt < 3; attempt++) {
-                await this.lineSlot(route.sendblueNumber, live.abort.signal);
+                await this.lineSlot(outbound.line, outbound.maxPerSecond, live.abort.signal);
                 const current = this.currentPart(partId);
                 if (!current || current.part.status !== "sending" || live.abort.signal.aborted || live.settlement)
                     break;
                 // No await separates limiter reservation, eligibility, and the physical request.
-                const starts = this.lineStarts.get(route.sendblueNumber);
-                if (starts.length >= 10) {
+                const starts = this.lineStarts.get(outbound.line);
+                if (starts.length >= outbound.maxPerSecond) {
                     attempt--;
                     continue;
                 }
                 starts.push(this.now());
                 live.attemptsStarted++;
-                const callbackUrl = `${this.config.publicUrl}/callbacks/sendblue/${route.sendblueId}/${partId}/${current.part.callbackToken}`;
-                const request = this.operations.connector(route.sendblueId).send(route, current.part, callbackUrl, live.abort.signal);
+                const callbackUrl = outbound.callbackUrl(partId, current.part.callbackToken);
+                const request = outbound.send(current.part, callbackUrl, live.abort.signal);
                 const result = await request.catch(() => ({ status: "uncertain", retryable: true }));
                 if (live.settlement)
                     break;
@@ -421,13 +685,18 @@ export class Gateway {
                     await this.settle(partId, result);
                     break;
                 }
-                if (!uncertain && result.status === "rejected" && !result.retryable) {
+                if (result.status === "rejected" && !result.retryable) {
                     await this.settle(partId, { status: "failed" });
                     break;
                 }
-                uncertain = true;
-                if (!result.retryable || attempt === 2)
+                // A lost response may hide a successful send. Without provider idempotency,
+                // another physical attempt could deliver the same reply twice.
+                if (result.status === "uncertain")
                     break;
+                if (!result.retryable || attempt === 2) {
+                    await this.settle(partId, { status: "failed" });
+                    break;
+                }
                 await delay(result.retryAfterMs ?? 500 * 2 ** attempt, live.abort.signal);
             }
         }
@@ -447,14 +716,28 @@ export class Gateway {
             await Promise.all([...this.workers.values()].map((worker) => worker.running));
         }
     }
+    processingStatus() {
+        const state = this.executionState();
+        return [...this.workers].map(([routeId, worker]) => {
+            const active = state.routes[routeId]?.active;
+            const pending = active?.kind === "codex" && !!active.pendingAdmission;
+            const unresolvedSend = active?.kind === "delivery" && active.parts.some(part => part.status === "sending" && !this.live.get(part.id)?.running);
+            const errorCode = worker.error instanceof RouterError ? worker.error.code : worker.error ? "unknown" : undefined;
+            return { routeId, state: worker.error ? (pending || unresolvedSend ? "unresolved" : "blocked") : worker.retryAt !== undefined ? "retrying"
+                    : unresolvedSend ? "unresolved" : active || state.routes[routeId]?.queue.length ? "running" : "idle",
+                ...(errorCode || worker.retryCode ? { code: errorCode ?? worker.retryCode } : {}) };
+        });
+    }
     errors() { return [...this.workers].filter(([, worker]) => worker.error).map(([id]) => id); }
     async close() {
         this.ready = false;
+        this.progress.close();
         for (const route of this.config.routes)
             this.typing(route, false);
         this.abort.abort();
         for (const worker of this.workers.values()) {
             clearTimeout(worker.timer);
+            clearTimeout(worker.retryTimer);
             clearTimeout(worker.typingTimer);
         }
         await Promise.all([...this.workers.values()].map((worker) => worker.session?.close()));
@@ -464,5 +747,14 @@ export class Gateway {
 }
 export function secretEqual(left, right) {
     return timingSafeEqual(createHash("sha256").update(left).digest(), createHash("sha256").update(right).digest());
+}
+export class SubmissionFailure extends Error {
+    status;
+    code;
+    constructor(status, code) {
+        super(code);
+        this.status = status;
+        this.code = code;
+    }
 }
 //# sourceMappingURL=gateway.js.map

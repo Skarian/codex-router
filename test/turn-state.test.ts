@@ -7,6 +7,8 @@ import {
   acceptedTurnId,
   findCorrelatedTurn,
   resumedThreadState,
+  scopeCommentary,
+  type TurnState,
   waitForOutcome,
   type SemanticMessage,
 } from "../src/turn-state.js";
@@ -140,7 +142,7 @@ test("waitForOutcome does not re-emit items restored after reconnect", async () 
   assert.deepEqual(emitted, [{ type: "reasoning", text: "Once" }]);
 });
 
-test("waitForOutcome deduplicates replayed semantic content even when persisted item ids change", async () => {
+test("waitForOutcome preserves distinct completed native items even when text is identical", async () => {
   const transport = new EventTransport();
   const client = new JsonRpcClient(transport);
   const emitted: SemanticMessage[] = [];
@@ -153,7 +155,7 @@ test("waitForOutcome deduplicates replayed semantic content even when persisted 
     ] } } },
   ], state);
   assert.deepEqual(await result, { turnId: "turn", status: "completed", finalText: "Done", imageGenerations: [] });
-  assert.deepEqual(emitted, [{ type: "commentary", text: "Same progress" }]);
+  assert.deepEqual(emitted, [{ type: "commentary", text: "Same progress" }, { type: "commentary", text: "Same progress" }]);
 });
 
 test("findCorrelatedTurn uses the stable client user message id when turn/start response is lost", () => {
@@ -193,4 +195,34 @@ test("terminal statuses without final text remain outcomes but preserve one-shot
     assert.throws(() => textResult(outcome), (error: unknown) => error instanceof RouterError
       && error.code === (status === "interrupted" ? "interrupted" : "turn_failed"));
   }
+});
+
+test("commentary native identities remain internal and observer failure cannot fail the turn", async () => {
+  const transport = new EventTransport(); const client = new JsonRpcClient(transport);
+  const messages: SemanticMessage[] = [];
+  const result = waitForOutcome(client, "thread", "turn", message => { messages.push(message); throw new Error("observer failed"); }, undefined, [
+    { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "native", type: "agentMessage", phase: "commentary", text: "progress" } } },
+    { method: "item/completed", params: { threadId: "thread", turnId: "turn", item: { id: "native", type: "agentMessage", phase: "commentary", text: "progress" } } },
+    { method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed", items: [] } } },
+  ]);
+  assert.equal((await result).status, "completed"); assert.equal(messages.length, 1);
+  assert.equal(messages[0]!.itemId, "native");
+  assert.equal(JSON.stringify(messages[0]), '{"type":"commentary","text":"progress"}');
+});
+test("recovered commentary respects the persisted input UUID boundary", async () => {
+  const transport = new EventTransport(); const client = new JsonRpcClient(transport); const messages: SemanticMessage[] = [];
+  const result = waitForOutcome(client, "thread", "turn", message => messages.push(message), undefined, [
+    { method: "turn/completed", params: { threadId: "thread", turn: { id: "turn", status: "completed", items: [
+      { id: "before", type: "agentMessage", phase: "commentary", text: "same" },
+      { id: "input", type: "userMessage", clientId: "ours" },
+      { id: "after", type: "agentMessage", phase: "commentary", text: "same" },
+    ] } } },
+  ], { inputUuid: "ours", seenItemIds: new Set(), seenSemanticUnits: new Set() });
+  await result; assert.equal(messages.length, 1); assert.equal(messages[0]!.itemId, "after");
+});
+
+test("recovery without the saved UUID cannot reuse a previous boundary confirmation", () => {
+  const state: TurnState = { inputUuid: "ours", inputSeen: true, seenItemIds: new Set(), seenSemanticUnits: new Set() };
+  scopeCommentary({ id: "turn", items: [{ id: "unrelated", type: "agentMessage", phase: "commentary", text: "not ours" }] }, state, "ours");
+  assert.equal(state.inputSeen, false);
 });

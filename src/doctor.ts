@@ -98,7 +98,8 @@ export async function runDoctor(config: RouterConfig): Promise<DoctorCheck[]> {
   const remoteAgents = config.agents.filter(({ sshHost }) => sshHost !== undefined);
   if (localAgents.length > 0 || config.agents.length === 0) {
     try {
-      const { stdout } = await execFileAsync("codex", ["--version"], { timeout: 5_000 });
+      const spec = codexProcessSpec(["--version"]);
+      const { stdout } = await execFileAsync(spec.command, spec.args, { timeout: 5_000 });
       checks.push({ name: "codex", ok: true, text: stdout.trim() || "Codex executable is available." });
     } catch {
       checks.push({ name: "codex", ok: false, text: "Codex executable is unavailable." });

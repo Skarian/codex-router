@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { isAbsolute } from "node:path";
 import { Duplex } from "node:stream";
 import { createInterface } from "node:readline";
 import WebSocket from "ws";
@@ -45,9 +46,13 @@ class BaseTransport {
     }
 }
 export function codexProcessSpec(args, sshHost) {
-    return sshHost === undefined
-        ? { command: "codex", args }
-        : sshProcessSpec(sshHost, ["codex", ...args]);
+    if (sshHost !== undefined)
+        return sshProcessSpec(sshHost, ["codex", ...args]);
+    const executable = process.env.CODEX_ROUTER_CODEX_EXECUTABLE;
+    if (executable !== undefined && !isAbsolute(executable)) {
+        throw new RouterError("config_invalid", "CODEX_ROUTER_CODEX_EXECUTABLE must be an absolute executable path.");
+    }
+    return { command: executable ?? "codex", args };
 }
 function spawnCodex(args, sshHost) {
     const spec = codexProcessSpec(args, sshHost);

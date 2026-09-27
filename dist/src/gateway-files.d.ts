@@ -1,5 +1,5 @@
 import type { GatewayRoute } from "./config.js";
-import { type GatewayConnector, type GatewayFiles, type GatewaySession } from "./gateway.js";
+import { type SendblueProvider, type GatewayFiles, type GatewaySession } from "./gateway.js";
 import { type Batch, type CodexWork, type Delivery, type DeliveryPart, type GatewayState } from "./gateway-state.js";
 import type { TurnOutcome } from "./turn-state.js";
 export declare function safeFilename(value: string): string;
@@ -22,6 +22,6 @@ export declare class GatewayFilePlane implements GatewayFiles {
     private reconcileHost;
     prepareBatch(route: GatewayRoute, batch: Batch, session: GatewaySession, signal: AbortSignal): Promise<Batch>;
     publication(route: GatewayRoute, id: string, session: GatewaySession, signal: AbortSignal): Promise<string>;
-    delivery(route: GatewayRoute, work: CodexWork, outcome: TurnOutcome, session: GatewaySession, connector: GatewayConnector, signal: AbortSignal): Promise<DeliveryPart[]>;
+    delivery(route: GatewayRoute, work: CodexWork, outcome: TurnOutcome, session: GatewaySession, connector: SendblueProvider, signal: AbortSignal): Promise<DeliveryPart[]>;
     release(route: GatewayRoute, active: CodexWork | Delivery, session?: GatewaySession): Promise<void>;
 }

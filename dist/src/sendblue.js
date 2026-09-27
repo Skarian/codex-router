@@ -1,4 +1,5 @@
 import { openAsBlob } from "node:fs";
+import SendblueAPI from "sendblue";
 import { delay } from "./gateway.js";
 import { RouterError } from "./errors.js";
 function object(value) {
@@ -37,14 +38,24 @@ export function retryPolicy(status, headers, now = Date.now()) {
     }
     return { retryable, ...(wait !== undefined && Number.isFinite(wait) ? { retryAfterMs: wait } : {}) };
 }
+export class SendblueRequestError extends Error {
+    retryable;
+    retryAfterMs;
+    constructor(retryable, retryAfterMs) {
+        super("The Sendblue request failed.");
+        this.retryable = retryable;
+        this.retryAfterMs = retryAfterMs;
+    }
+}
 export class Sendblue {
     operations;
     signingSecret;
-    headers;
+    client;
     constructor(credentials, operations = {}) {
         this.operations = operations;
-        this.signingSecret = credentials.signingSecret;
-        this.headers = { "sb-api-key-id": credentials.apiKeyId, "sb-api-secret-key": credentials.apiSecretKey };
+        this.signingSecret = credentials.signingSecret ?? "";
+        this.client = new SendblueAPI({ apiKey: credentials.apiKeyId, apiSecret: credentials.apiSecretKey,
+            baseURL: operations.baseUrl ?? "https://api.sendblue.com", maxRetries: 0, logLevel: "off" });
     }
     agentInstructions(outputDirectory) {
         return `You are chatting with the user through Sendblue over iMessage, RCS, or SMS. Prefer short, conversational replies unless the user asks for detail. Your final text response is sent automatically as a message.
@@ -78,7 +89,7 @@ To send an image or other file as an attachment, save it in ${JSON.stringify(out
         const event = object(value);
         return { status: string(event.status), ...(event.message_handle ? { providerHandle: string(event.message_handle) } : {}) };
     }
-    async request(path, body, signal, timeout) {
+    async request(operation, signal, timeout, responseLimit = 256 * 1024) {
         const controller = new AbortController();
         const abort = () => controller.abort();
         if (signal.aborted)
@@ -87,64 +98,85 @@ To send an image or other file as an attachment, save it in ${JSON.stringify(out
             signal.addEventListener("abort", abort, { once: true });
         const timer = setTimeout(abort, timeout);
         timer.unref();
-        try {
-            const response = await (this.operations.fetch ?? fetch)(`${this.operations.baseUrl ?? "https://api.sendblue.com"}${path}`, {
-                method: "POST", headers: { ...this.headers, ...(typeof body === "string" ? { "content-type": "application/json" } : {}) },
-                body, signal: controller.signal, redirect: "error",
-            });
-            // Keep the deadline active through response consumption. Never log provider bodies.
+        let status = 0, headers = new Headers();
+        const boundedFetch = async (url, init) => {
+            const response = await (this.operations.fetch ?? fetch)(url, { ...init, redirect: "error" });
+            status = response.status;
+            headers = response.headers;
             const reader = response.body?.getReader();
             const chunks = [];
             let size = 0;
-            let bodyFailed = false;
-            if (reader)
+            if (reader) {
+                const cancel = () => { void reader.cancel().catch(() => undefined); };
+                controller.signal.addEventListener("abort", cancel, { once: true });
                 try {
+                    controller.signal.throwIfAborted();
                     while (true) {
                         const next = await reader.read();
+                        controller.signal.throwIfAborted();
                         if (next.done)
                             break;
                         size += next.value.length;
-                        if (size > 256 * 1024) {
+                        if (size > responseLimit) {
                             await reader.cancel();
-                            break;
+                            throw new Error("Response limit exceeded.");
                         }
                         chunks.push(next.value);
                     }
                 }
-                catch {
-                    size = 256 * 1024 + 1;
-                    bodyFailed = true;
-                }
                 finally {
+                    controller.signal.removeEventListener("abort", cancel);
+                    if (controller.signal.aborted)
+                        await reader.cancel().catch(() => undefined);
                     reader.releaseLock();
                 }
-            let value;
-            if (size <= 256 * 1024)
-                try {
-                    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-                }
-                catch { /* Unusable response remains uncertain. */ }
-            return { status: response.status, headers: response.headers, value, bodyFailed };
+            }
+            controller.signal.throwIfAborted();
+            return new Response(response.status === 204 || response.status === 205 || response.status === 304 ? null : Buffer.concat(chunks), { status, headers });
+        };
+        try {
+            controller.signal.throwIfAborted();
+            // The SDK timeout ends at headers. Keep our deadline and response cap through parsing.
+            const { data } = await operation(this.client.withOptions({ fetch: boundedFetch, timeout }), controller.signal).withResponse();
+            controller.signal.throwIfAborted();
+            return { status, headers, value: data, bodyFailed: false };
+        }
+        catch {
+            return { status, headers, value: undefined, bodyFailed: true };
         }
         finally {
             clearTimeout(timer);
             signal.removeEventListener("abort", abort);
         }
     }
+    checked(response) {
+        if (!response.bodyFailed && response.status >= 200 && response.status < 300)
+            return response.value;
+        const policy = retryPolicy(response.bodyFailed && response.status >= 200 && response.status < 300 ? 503 : response.status || 503, response.headers);
+        throw new SendblueRequestError(policy.retryable, policy.retryAfterMs);
+    }
+    async list(query, signal) {
+        return this.checked(await this.request((client, signal) => client.messages.list(query, { signal }), signal, this.operations.requestTimeoutMs ?? 60000, 2 * 1024 * 1024));
+    }
+    async getStatus(handle, signal) {
+        return this.checked(await this.request((client, signal) => client.messages.getStatus({ handle }, { signal }), signal, this.operations.requestTimeoutMs ?? 60000));
+    }
     async send(route, part, callbackUrl, signal) {
-        const payload = { number: route.sender, from_number: route.sendblueNumber, status_callback: callbackUrl,
+        const payload = { number: route.sender, from_number: route.sendblueNumber, ...(callbackUrl ? { status_callback: callbackUrl } : {}),
             ...(part.payload.kind === "text" ? { content: part.payload.text } : { media_url: part.payload.mediaUrl }) };
         try {
-            const response = await this.request("/api/send-message", JSON.stringify(payload), signal, this.operations.requestTimeoutMs ?? 60000);
-            const policy = retryPolicy(response.bodyFailed ? 503 : response.status, response.headers);
+            const response = await this.request((client, signal) => client.messages.send(payload, { signal }), signal, this.operations.requestTimeoutMs ?? 60000);
+            const policy = retryPolicy(response.status || 503, response.headers);
             if (response.status >= 200 && response.status < 300) {
                 const handle = response.value && typeof response.value === "object" ? response.value.message_handle : undefined;
-                return typeof handle === "string" && handle ? { status: "accepted", providerHandle: handle } : { status: "uncertain", ...policy };
+                return typeof handle === "string" && handle ? { status: "accepted", providerHandle: handle } : { status: "uncertain", ...policy, retryable: false };
             }
-            return { status: policy.retryable || response.status >= 500 || response.status === 408 ? "uncertain" : "rejected", ...policy };
+            // A rate-limit rejection is safe to retry; a lost or server-error response is not.
+            const rejected = response.status === 429 || (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 409);
+            return rejected ? { status: "rejected", ...policy } : { status: "uncertain", ...policy, retryable: false };
         }
         catch {
-            return { status: "uncertain", retryable: !signal.aborted };
+            return { status: "uncertain", retryable: false };
         }
     }
     async upload(path, name, mediaType, signal) {
@@ -157,7 +189,7 @@ To send an image or other file as an attachment, save it in ${JSON.stringify(out
                     throw new RouterError("output_too_large", "The artifact exceeds the Sendblue upload limit.");
                 const form = new FormData();
                 form.set("file", file, name);
-                const response = await this.request("/api/upload-file", form, signal, this.operations.uploadTimeoutMs ?? 600000);
+                const response = await this.request((client, signal) => client.post("/api/upload-file", { body: form, signal }), signal, this.operations.uploadTimeoutMs ?? 600000);
                 policy = retryPolicy(response.bodyFailed ? 503 : response.status, response.headers);
                 if (response.status >= 200 && response.status < 300) {
                     try {
@@ -178,9 +210,14 @@ To send an image or other file as an attachment, save it in ${JSON.stringify(out
         }
         throw new RouterError("turn_failed", "The Sendblue upload failed.");
     }
+    async readReceipt(route, signal) {
+        this.checked(await this.request((client, signal) => client.post("/api/mark-read", {
+            body: { number: route.sender, from_number: route.sendblueNumber }, signal
+        }), signal, this.operations.requestTimeoutMs ?? 60000));
+    }
     async typing(route, state, signal) {
-        await this.request("/api/send-typing-indicator", JSON.stringify({ number: route.sender, from_number: route.sendblueNumber, state,
-            ...(state === "start" ? { max_duration_ms: 300000 } : {}) }), signal, this.operations.requestTimeoutMs ?? 60000);
+        this.checked(await this.request((client, signal) => client.typingIndicators.send({ number: route.sender, from_number: route.sendblueNumber, state,
+            ...(state === "start" ? { max_duration_ms: 300000 } : {}) }, { signal }), signal, this.operations.requestTimeoutMs ?? 60000));
     }
 }
 export function sendblueCredentials(account, env = process.env) {
@@ -194,7 +231,7 @@ export function sendblueCredentials(account, env = process.env) {
     return {
         apiKeyId: secret(account.apiKeyId, account.apiKeyIdEnv),
         apiSecretKey: secret(account.apiSecretKey, account.apiSecretKeyEnv),
-        signingSecret: secret(account.webhookSecret, account.webhookSecretEnv),
+        ...(account.mode === "webhook" ? { signingSecret: secret(account.webhookSecret, account.webhookSecretEnv) } : {}),
     };
 }
 export function sendblueConnectors(config, env = process.env) {

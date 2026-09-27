@@ -1,5 +1,5 @@
 import * as v from "valibot";
-import type { GatewayConfig, GatewayRoute } from "./config.js";
+import { type GatewayConfig, type GatewayRoute } from "./config.js";
 declare const attachmentSchema: v.VariantSchema<"state", [v.StrictObjectSchema<{
     readonly state: v.LiteralSchema<"pending", undefined>;
     readonly sourceUrl: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
@@ -40,6 +40,7 @@ declare const eventSchema: v.StrictObjectSchema<{
 }, undefined>;
 declare const batchSchema: v.StrictObjectSchema<{
     readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
     readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
     readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
     readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -69,7 +70,7 @@ declare const batchSchema: v.StrictObjectSchema<{
 declare const intentSchema: v.StrictObjectSchema<{
     readonly batchId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
     readonly clientUserMessageId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-    readonly publicationId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    readonly publicationId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     readonly expectedTurnId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
 }, undefined>;
 declare const workSchema: v.StrictObjectSchema<{
@@ -78,6 +79,7 @@ declare const workSchema: v.StrictObjectSchema<{
     readonly joinedBatchIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     readonly batches: v.ArraySchema<v.StrictObjectSchema<{
         readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
         readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
         readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
         readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -108,9 +110,16 @@ declare const workSchema: v.StrictObjectSchema<{
     readonly pendingAdmission: v.OptionalSchema<v.StrictObjectSchema<{
         readonly batchId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
         readonly clientUserMessageId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-        readonly publicationId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly publicationId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         readonly expectedTurnId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     }, undefined>, undefined>;
+    readonly binding: v.OptionalSchema<v.StrictObjectSchema<{
+        readonly backend: v.PicklistSchema<["desktop", "proxy", "stdio"], undefined>;
+        readonly host: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly codexHome: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly threadId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    }, undefined>, undefined>;
+    readonly clientUserMessageId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     readonly publicationIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     readonly artifactBaseline: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     readonly admissionFailed: v.OptionalSchema<v.LiteralSchema<true, undefined>, undefined>;
@@ -134,6 +143,7 @@ declare const partSchema: v.StrictObjectSchema<{
 declare const deliverySchema: v.StrictObjectSchema<{
     readonly kind: v.LiteralSchema<"delivery", undefined>;
     readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
     readonly batchIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     readonly parts: v.ArraySchema<v.StrictObjectSchema<{
         readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
@@ -152,10 +162,38 @@ declare const deliverySchema: v.StrictObjectSchema<{
         readonly providerHandle: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     }, undefined>, undefined>;
 }, undefined>;
+declare const resultSchema: v.StrictObjectSchema<{
+    readonly status: v.PicklistSchema<["completed", "failed", "interrupted"], undefined>;
+    readonly text: v.StringSchema<undefined>;
+    readonly notices: v.ArraySchema<v.StringSchema<undefined>, undefined>;
+}, undefined>;
+declare const receiptSchema: v.StrictObjectSchema<{
+    readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    readonly externalId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    readonly receivedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
+    readonly payloadHash: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
+    readonly batchId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
+    readonly result: v.OptionalSchema<v.StrictObjectSchema<{
+        readonly status: v.PicklistSchema<["completed", "failed", "interrupted"], undefined>;
+        readonly text: v.StringSchema<undefined>;
+        readonly notices: v.ArraySchema<v.StringSchema<undefined>, undefined>;
+    }, undefined>, undefined>;
+    readonly expiresAtMs: v.OptionalSchema<v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>, undefined>;
+    readonly reservedBytes: v.OptionalSchema<v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>, undefined>;
+    readonly turnId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
+}, undefined>;
 declare const bindingSchema: v.StrictObjectSchema<{
-    readonly sendblueId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-    readonly sender: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-    readonly sendblueNumber: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    readonly sources: v.ArraySchema<v.VariantSchema<"kind", [v.StrictObjectSchema<{
+        readonly kind: v.LiteralSchema<"sendblue", undefined>;
+        readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly accountId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly sender: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly sendblueNumber: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    }, undefined>, v.StrictObjectSchema<{
+        readonly kind: v.LiteralSchema<"https", undefined>;
+        readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly accountId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    }, undefined>], undefined>, undefined>;
     readonly target: v.StrictObjectSchema<{
         readonly sshHost: v.NullableSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         readonly threadId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
@@ -164,9 +202,17 @@ declare const bindingSchema: v.StrictObjectSchema<{
 }, undefined>;
 declare const routeSchema: v.StrictObjectSchema<{
     readonly binding: v.StrictObjectSchema<{
-        readonly sendblueId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-        readonly sender: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-        readonly sendblueNumber: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly sources: v.ArraySchema<v.VariantSchema<"kind", [v.StrictObjectSchema<{
+            readonly kind: v.LiteralSchema<"sendblue", undefined>;
+            readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly accountId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly sender: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly sendblueNumber: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        }, undefined>, v.StrictObjectSchema<{
+            readonly kind: v.LiteralSchema<"https", undefined>;
+            readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly accountId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        }, undefined>], undefined>, undefined>;
         readonly target: v.StrictObjectSchema<{
             readonly sshHost: v.NullableSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             readonly threadId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
@@ -174,13 +220,24 @@ declare const routeSchema: v.StrictObjectSchema<{
         }, undefined>;
     }, undefined>;
     readonly nextSequence: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
-    readonly seenMessages: v.ArraySchema<v.StrictObjectSchema<{
-        readonly sendblueId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-        readonly messageHandle: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+    readonly receipts: v.ArraySchema<v.StrictObjectSchema<{
+        readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly externalId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
         readonly receivedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
+        readonly payloadHash: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
+        readonly batchId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
+        readonly result: v.OptionalSchema<v.StrictObjectSchema<{
+            readonly status: v.PicklistSchema<["completed", "failed", "interrupted"], undefined>;
+            readonly text: v.StringSchema<undefined>;
+            readonly notices: v.ArraySchema<v.StringSchema<undefined>, undefined>;
+        }, undefined>, undefined>;
+        readonly expiresAtMs: v.OptionalSchema<v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>, undefined>;
+        readonly reservedBytes: v.OptionalSchema<v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>, undefined>;
+        readonly turnId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
     }, undefined>, undefined>;
     readonly openBatch: v.OptionalSchema<v.StrictObjectSchema<{
         readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
         readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
         readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
         readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -209,6 +266,7 @@ declare const routeSchema: v.StrictObjectSchema<{
     }, undefined>, undefined>;
     readonly queue: v.ArraySchema<v.StrictObjectSchema<{
         readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
         readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
         readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
         readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -241,6 +299,7 @@ declare const routeSchema: v.StrictObjectSchema<{
         readonly joinedBatchIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         readonly batches: v.ArraySchema<v.StrictObjectSchema<{
             readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
             readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
             readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
             readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -271,15 +330,23 @@ declare const routeSchema: v.StrictObjectSchema<{
         readonly pendingAdmission: v.OptionalSchema<v.StrictObjectSchema<{
             readonly batchId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
             readonly clientUserMessageId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-            readonly publicationId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly publicationId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             readonly expectedTurnId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         }, undefined>, undefined>;
+        readonly binding: v.OptionalSchema<v.StrictObjectSchema<{
+            readonly backend: v.PicklistSchema<["desktop", "proxy", "stdio"], undefined>;
+            readonly host: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly codexHome: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly threadId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        }, undefined>, undefined>;
+        readonly clientUserMessageId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         readonly publicationIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         readonly artifactBaseline: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         readonly admissionFailed: v.OptionalSchema<v.LiteralSchema<true, undefined>, undefined>;
     }, undefined>, v.StrictObjectSchema<{
         readonly kind: v.LiteralSchema<"delivery", undefined>;
         readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
         readonly batchIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         readonly parts: v.ArraySchema<v.StrictObjectSchema<{
             readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
@@ -300,12 +367,20 @@ declare const routeSchema: v.StrictObjectSchema<{
     }, undefined>], undefined>, undefined>;
 }, undefined>;
 declare const stateSchema: v.StrictObjectSchema<{
-    readonly version: v.LiteralSchema<1, undefined>;
+    readonly version: v.LiteralSchema<2, undefined>;
     readonly routes: v.RecordSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, v.StrictObjectSchema<{
         readonly binding: v.StrictObjectSchema<{
-            readonly sendblueId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-            readonly sender: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-            readonly sendblueNumber: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly sources: v.ArraySchema<v.VariantSchema<"kind", [v.StrictObjectSchema<{
+                readonly kind: v.LiteralSchema<"sendblue", undefined>;
+                readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly accountId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly sender: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly sendblueNumber: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            }, undefined>, v.StrictObjectSchema<{
+                readonly kind: v.LiteralSchema<"https", undefined>;
+                readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly accountId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            }, undefined>], undefined>, undefined>;
             readonly target: v.StrictObjectSchema<{
                 readonly sshHost: v.NullableSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
                 readonly threadId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
@@ -313,13 +388,24 @@ declare const stateSchema: v.StrictObjectSchema<{
             }, undefined>;
         }, undefined>;
         readonly nextSequence: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
-        readonly seenMessages: v.ArraySchema<v.StrictObjectSchema<{
-            readonly sendblueId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-            readonly messageHandle: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+        readonly receipts: v.ArraySchema<v.StrictObjectSchema<{
+            readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly externalId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
             readonly receivedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
+            readonly payloadHash: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
+            readonly batchId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
+            readonly result: v.OptionalSchema<v.StrictObjectSchema<{
+                readonly status: v.PicklistSchema<["completed", "failed", "interrupted"], undefined>;
+                readonly text: v.StringSchema<undefined>;
+                readonly notices: v.ArraySchema<v.StringSchema<undefined>, undefined>;
+            }, undefined>, undefined>;
+            readonly expiresAtMs: v.OptionalSchema<v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>, undefined>;
+            readonly reservedBytes: v.OptionalSchema<v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>, undefined>;
+            readonly turnId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
         }, undefined>, undefined>;
         readonly openBatch: v.OptionalSchema<v.StrictObjectSchema<{
             readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
             readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
             readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
             readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -348,6 +434,7 @@ declare const stateSchema: v.StrictObjectSchema<{
         }, undefined>, undefined>;
         readonly queue: v.ArraySchema<v.StrictObjectSchema<{
             readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
             readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
             readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
             readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -380,6 +467,7 @@ declare const stateSchema: v.StrictObjectSchema<{
             readonly joinedBatchIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             readonly batches: v.ArraySchema<v.StrictObjectSchema<{
                 readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
                 readonly openedAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
                 readonly quietDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
                 readonly maximumDeadlineMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
@@ -410,15 +498,23 @@ declare const stateSchema: v.StrictObjectSchema<{
             readonly pendingAdmission: v.OptionalSchema<v.StrictObjectSchema<{
                 readonly batchId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
                 readonly clientUserMessageId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
-                readonly publicationId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly publicationId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
                 readonly expectedTurnId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             }, undefined>, undefined>;
+            readonly binding: v.OptionalSchema<v.StrictObjectSchema<{
+                readonly backend: v.PicklistSchema<["desktop", "proxy", "stdio"], undefined>;
+                readonly host: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly codexHome: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+                readonly threadId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            }, undefined>, undefined>;
+            readonly clientUserMessageId: v.OptionalSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             readonly publicationIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             readonly artifactBaseline: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             readonly admissionFailed: v.OptionalSchema<v.LiteralSchema<true, undefined>, undefined>;
         }, undefined>, v.StrictObjectSchema<{
             readonly kind: v.LiteralSchema<"delivery", undefined>;
             readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
+            readonly sourceId: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
             readonly batchIds: v.ArraySchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, undefined>;
             readonly parts: v.ArraySchema<v.StrictObjectSchema<{
                 readonly id: v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>;
@@ -438,7 +534,14 @@ declare const stateSchema: v.StrictObjectSchema<{
             }, undefined>, undefined>;
         }, undefined>], undefined>, undefined>;
     }, undefined>, undefined>;
+    readonly polling: v.OptionalSchema<v.RecordSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, v.StrictObjectSchema<{
+        readonly activationAtMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
+        readonly completedThroughMs: v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>;
+        readonly routeActivationAtMs: v.RecordSchema<v.SchemaWithPipe<readonly [v.StringSchema<undefined>, v.MinLengthAction<string, 1, undefined>]>, v.SchemaWithPipe<readonly [v.NumberSchema<undefined>, v.SafeIntegerAction<number, undefined>, v.MinValueAction<number, 0, undefined>]>, undefined>;
+    }, undefined>, undefined>, undefined>;
 }, undefined>;
+export type Receipt = v.InferOutput<typeof receiptSchema>;
+export type RetainedResult = v.InferOutput<typeof resultSchema>;
 export type GatewayState = v.InferOutput<typeof stateSchema>;
 export type RouteState = v.InferOutput<typeof routeSchema>;
 export type RouteBinding = v.InferOutput<typeof bindingSchema>;
@@ -466,6 +569,8 @@ export declare class GatewayStore {
     private constructor();
     static open(directory: string, beforeWrite?: () => Promise<void>): Promise<GatewayStore>;
     snapshot(): GatewayState;
+    /** Internal read-only projection: copy only the requested view, not the whole retained-result archive. */
+    read<T>(select: (state: GatewayState) => T): T;
     transaction<T>(change: (draft: GatewayState) => T): Promise<T>;
     close(): Promise<void>;
 }
@@ -489,4 +594,6 @@ export declare function resolveEffect(state: GatewayState, routeId: string, effe
     effectId: string;
     resolution: "failed" | "accepted";
 };
+/** Persist activation before network intake; existing checkpoints never reset at startup. */
+export declare function initializePolling(state: GatewayState, config: GatewayConfig, now: number): void;
 export {};

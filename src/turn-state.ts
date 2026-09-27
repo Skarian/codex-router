@@ -4,6 +4,9 @@ import type { JsonRpcClient } from "./json-rpc.js";
 const MAX_OUTPUT_BYTES = 256 * 1024;
 
 export interface TurnState {
+  inputUuid?: string | undefined;
+  inputSeen?: boolean;
+  excludedCommentaryIds?: Set<string>;
   finalText?: string;
   imageGenerations?: Map<string, TurnOutcome["imageGenerations"][number]>;
   artifactBaseline?: ReadonlySet<string>;
@@ -31,6 +34,29 @@ export interface ResumedThreadState {
 export interface SemanticMessage {
   type: "reasoning" | "commentary" | "completed";
   text: string;
+  readonly itemId?: string;
+  readonly turnId?: string;
+}
+
+/** Native metadata stays internal; CLI JSON remains exactly type and text. */
+export function semanticMessage(type: SemanticMessage["type"], text: string, itemId?: string, turnId?: string): SemanticMessage {
+  const message: SemanticMessage = { type, text };
+  Object.defineProperties(message, { itemId: { value: itemId }, turnId: { value: turnId } });
+  return message;
+}
+export function emitSafely(emit: (message: SemanticMessage) => void, message: SemanticMessage): void {
+  try { emit(message); } catch { /* Progress observers cannot invalidate execution. */ }
+}
+export function scopeCommentary(turn: Record<string, unknown>, state: TurnState, uuid: string): void {
+  state.inputUuid = uuid;
+  state.excludedCommentaryIds ??= new Set();
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  const boundary = items.findIndex(raw => object(raw)?.type === "userMessage" && object(raw)?.clientId === uuid);
+  if (typeof turn.id === "string") state.inputSeen = boundary >= 0;
+  if (boundary >= 0) {
+    state.inputSeen = true;
+    for (const raw of items.slice(0, boundary)) { const item = object(raw); if (typeof item?.id === "string") state.excludedCommentaryIds.add(item.id); }
+  }
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -86,6 +112,14 @@ export function waitForOutcome(
       try {
         const params = object(rawParams);
         if (!params || params.threadId !== threadId) return;
+        if (method === "item/started" && params.turnId === turnId && state.inputUuid) {
+          const item = object(params.item);
+          if (item?.type === "userMessage" && item.clientId === state.inputUuid) state.inputSeen = true;
+          else if (!state.inputSeen && typeof item?.id === "string") {
+            state.excludedCommentaryIds ??= new Set(); state.excludedCommentaryIds.add(item.id);
+          }
+          return;
+        }
         if (method === "item/completed" && params.turnId === turnId) {
           const item = object(params.item);
           if (item) applyCompletedItem(item, state, emit);
@@ -134,6 +168,7 @@ export function terminalOutcome(turn: Record<string, unknown>, state: TurnState)
 
 function applyCompletedItem(item: Record<string, unknown>, state: TurnState, emit: (message: SemanticMessage) => void): void {
   const itemId = typeof item.id === "string" ? item.id : undefined;
+  if (item.type === "userMessage" && item.clientId === state.inputUuid) state.inputSeen = true;
   if (itemId !== undefined) {
     if (state.seenItemIds.has(itemId)) return;
     state.seenItemIds.add(itemId);
@@ -152,16 +187,18 @@ function applyCompletedItem(item: Record<string, unknown>, state: TurnState, emi
     const semanticKey = `reasoning\0${text}`;
     if (text && !state.seenSemanticUnits.has(semanticKey)) {
       state.seenSemanticUnits.add(semanticKey);
-      emit({ type: "reasoning", text });
+      emitSafely(emit, { type: "reasoning", text });
     }
   }
   if (item.type === "agentMessage" && typeof item.text === "string") {
     if (item.phase === "commentary") {
       const text = bounded(item.text);
-      const semanticKey = `commentary\0${text}`;
-      if (!state.seenSemanticUnits.has(semanticKey)) {
-        state.seenSemanticUnits.add(semanticKey);
-        emit({ type: "commentary", text });
+      if ((!state.inputUuid || state.inputSeen) && !(itemId && state.excludedCommentaryIds?.has(itemId))) {
+        const semanticKey = `commentary\0${text}`;
+        if (itemId || !state.seenSemanticUnits.has(semanticKey)) {
+          if (!itemId) state.seenSemanticUnits.add(semanticKey);
+          emitSafely(emit, semanticMessage("commentary", text, itemId));
+        }
       }
     }
     if (item.phase === "final_answer") state.finalText = bounded(item.text);
@@ -170,6 +207,7 @@ function applyCompletedItem(item: Record<string, unknown>, state: TurnState, emi
 
 export function applyTurnItems(turn: Record<string, unknown>, state: TurnState, emit: (message: SemanticMessage) => void): void {
   if (!Array.isArray(turn.items)) return;
+  if (state.inputUuid) scopeCommentary(turn, state, state.inputUuid);
   for (const rawItem of turn.items) {
     const item = object(rawItem);
     if (item) applyCompletedItem(item, state, emit);
@@ -196,7 +234,8 @@ export function baselineTurnItems(turn: Record<string, unknown>, state: TurnStat
       if (text) state.seenSemanticUnits.add(`reasoning\0${text}`);
     }
     if (item?.type === "agentMessage" && item.phase === "commentary" && typeof item.text === "string") {
-      state.seenSemanticUnits.add(`commentary\0${bounded(item.text)}`);
+      if (typeof item.id === "string") { state.excludedCommentaryIds ??= new Set(); state.excludedCommentaryIds.add(item.id); }
+      else state.seenSemanticUnits.add(`commentary\0${bounded(item.text)}`);
     }
   }
 }
