@@ -20,6 +20,7 @@ export interface IncomingMessage {
 export interface StatusCallback { status: string; providerHandle?: string }
 export interface GatewayConnector {
   readonly signingSecret: string;
+  agentInstructions?(outputDirectory: string): string;
   inbound(value: unknown): IncomingMessage | undefined;
   callback(value: unknown): StatusCallback;
   send(route: GatewayRoute, part: DeliveryPart, callbackUrl: string, signal: AbortSignal): Promise<SendOutcome>;
@@ -75,7 +76,7 @@ export function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function batchInput(batch: Batch, publication: string): TurnInput[] {
+function batchInput(batch: Batch, instructions?: string): TurnInput[] {
   const input: TurnInput[] = [];
   for (const event of [...batch.events].sort((a, b) => a.providerTimeMs - b.providerTimeMs || a.receiptSequence - b.receiptSequence)) {
     if (event.text) input.push({ type: "text", text: event.text, text_elements: [] });
@@ -85,7 +86,7 @@ function batchInput(batch: Batch, publication: string): TurnInput[] {
       else input.push({ type: "text", text: `Attached file: ${JSON.stringify(file.name)} (${file.mediaType}) at ${JSON.stringify(file.hostPath)}.`, text_elements: [] });
     } else if (file?.state === "omitted") input.push({ type: "text", text: `Attachment omitted: ${JSON.stringify(file.name)} (${file.reason}).`, text_elements: [] });
   }
-  input.push({ type: "text", text: `Put intentional response files in ${JSON.stringify(publication)}. Only files in this directory and native generated images will be delivered.`, text_elements: [] });
+  if (instructions) input.push({ type: "text", text: instructions, text_elements: [] });
   return input;
 }
 
@@ -259,7 +260,7 @@ export class Gateway {
     });
     const publication = await this.operations.files.publication(route, intent.publicationId, session, this.abort.signal);
     try {
-      const turnId = await session.admit(batchInput(batch, publication), intent);
+      const turnId = await session.admit(batchInput(batch, this.operations.connector(route.sendblueId).agentInstructions?.(publication)), intent);
       await this.store.transaction((state) => {
         const work = state.routes[route.id]!.active as CodexWork;
         work.turnId = turnId;

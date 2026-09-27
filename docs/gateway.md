@@ -2,11 +2,14 @@
 
 The gateway connects a Sendblue conversation to an existing Codex task. Send text, images, or files from your messaging app. Codex can reply with text and files.
 
+Sendblue adds guidance for short conversational replies, automatic text delivery, and optional attachments. Other connectors can supply their own instructions.
+The gateway adds no default instructions. CLI `send` passes input unchanged.
+
 Each conversation has a fixed route. Messages collect until five seconds pass without another message, or the batch reaches 30 seconds. New messages join an active turn. That turn produces one shared response.
 
 ## Configure a conversation
 
-Add these tables after your agent entries in `~/.codex-router.toml`:
+Add these tables after your agent entries in `~/.codex-router/config.toml`:
 
 ```toml
 [gateway]
@@ -32,7 +35,7 @@ agent = "home"
 Use your registered Sendblue line for `sendblue_number`. Use your own messaging number for `sender`. Both numbers must use E.164 format, including `+` and the country code.
 
 Replace the three credential placeholders with your Sendblue values. Use the signing secret configured in your Sendblue account.
-Set owner-only permissions with `chmod 600 ~/.codex-router.toml`.
+Set owner-only permissions with `chmod 600 ~/.codex-router/config.toml`.
 
 Environment variables remain supported. To use one, replace its direct field with the corresponding `_env` field, such as `api_key_id_env = "SENDBLUE_API_KEY_ID"`.
 Set exactly one source for each credential. The router does not load a separate credentials file.

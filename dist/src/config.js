@@ -5,7 +5,7 @@ import { parse } from "smol-toml";
 import { RouterError } from "./errors.js";
 const ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 export function defaultConfigPath() {
-    return resolve(homedir(), ".codex-router.toml");
+    return resolve(homedir(), ".codex-router/config.toml");
 }
 function requiredString(record, field, agentName) {
     const value = record[field];

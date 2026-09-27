@@ -14,7 +14,7 @@ codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE 
 ```
 
 `--config PATH` selects a TOML file. The default is
-`~/.codex-router.toml`.
+`~/.codex-router/config.toml`.
 
 ## Configuration
 

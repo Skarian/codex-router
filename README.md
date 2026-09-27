@@ -23,7 +23,7 @@ npm install --global git+https://github.com/Skarian/codex-router.git
 
 ## Configure
 
-Create `~/.codex-router.toml`:
+Create the `~/.codex-router` directory, then create `~/.codex-router/config.toml`:
 
 ```toml
 [[agents]]

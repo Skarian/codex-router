@@ -46,6 +46,11 @@ export class Sendblue {
         this.signingSecret = credentials.signingSecret;
         this.headers = { "sb-api-key-id": credentials.apiKeyId, "sb-api-secret-key": credentials.apiSecretKey };
     }
+    agentInstructions(outputDirectory) {
+        return `You are chatting with the user through Sendblue over iMessage, RCS, or SMS. Prefer short, conversational replies unless the user asks for detail. Your final text response is sent automatically as a message.
+
+To send an image or other file as an attachment, save it in ${JSON.stringify(outputDirectory)}. The gateway uploads and sends files from that directory. Images created with the image-generation tool are attached automatically.`;
+    }
     inbound(value) {
         const event = object(value);
         if (event.is_outbound !== false || event.status !== "RECEIVED" || event.message_type === "group" || event.group_id)

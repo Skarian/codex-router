@@ -27,7 +27,7 @@ export function delay(ms, signal) {
             signal.addEventListener("abort", abort, { once: true });
     });
 }
-function batchInput(batch, publication) {
+function batchInput(batch, instructions) {
     const input = [];
     for (const event of [...batch.events].sort((a, b) => a.providerTimeMs - b.providerTimeMs || a.receiptSequence - b.receiptSequence)) {
         if (event.text)
@@ -42,7 +42,8 @@ function batchInput(batch, publication) {
         else if (file?.state === "omitted")
             input.push({ type: "text", text: `Attachment omitted: ${JSON.stringify(file.name)} (${file.reason}).`, text_elements: [] });
     }
-    input.push({ type: "text", text: `Put intentional response files in ${JSON.stringify(publication)}. Only files in this directory and native generated images will be delivered.`, text_elements: [] });
+    if (instructions)
+        input.push({ type: "text", text: instructions, text_elements: [] });
     return input;
 }
 function staleSteer(error) {
@@ -266,7 +267,7 @@ export class Gateway {
         });
         const publication = await this.operations.files.publication(route, intent.publicationId, session, this.abort.signal);
         try {
-            const turnId = await session.admit(batchInput(batch, publication), intent);
+            const turnId = await session.admit(batchInput(batch, this.operations.connector(route.sendblueId).agentInstructions?.(publication)), intent);
             await this.store.transaction((state) => {
                 const work = state.routes[route.id].active;
                 work.turnId = turnId;

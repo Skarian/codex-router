@@ -27,6 +27,7 @@ export interface StatusCallback {
 }
 export interface GatewayConnector {
     readonly signingSecret: string;
+    agentInstructions?(outputDirectory: string): string;
     inbound(value: unknown): IncomingMessage | undefined;
     callback(value: unknown): StatusCallback;
     send(route: GatewayRoute, part: DeliveryPart, callbackUrl: string, signal: AbortSignal): Promise<SendOutcome>;

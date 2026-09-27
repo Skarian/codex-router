@@ -22,7 +22,7 @@ export interface RouterConfig {
 const ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 
 export function defaultConfigPath(): string {
-  return resolve(homedir(), ".codex-router.toml");
+  return resolve(homedir(), ".codex-router/config.toml");
 }
 
 function requiredString(record: Record<string, unknown>, field: string, agentName: string): string {

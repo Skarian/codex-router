@@ -126,7 +126,7 @@ test("maximum batch age closes continuous input after thirty seconds", async () 
     await f.gateway.start();
     for (let i = 0; i < 8; i++) { await f.receive(String(i)); f.advance(4000); await f.gateway.idle(); }
     assert.equal(f.session.admissions.length, 1);
-    assert.equal((f.session.admissions[0] as { input: unknown[] }).input.length, 9);
+    assert.equal((f.session.admissions[0] as { input: unknown[] }).input.length, 8);
   } finally { await f.close(); }
 });
 
@@ -539,4 +539,20 @@ test("Sendblue credentials support direct, environment, and mixed configuration"
   assert.throws(() => sendblueCredentials(parseConfig(source).gateway!.sendblue[0]!, {}));
   assert.throws(() => sendblueCredentials(parseConfig(source).gateway!.sendblue[0]!, { ...env, SECRET: "private\nvalue" }),
     (error: unknown) => error instanceof RouterError && !error.message.includes("private"));
+});
+
+
+test("gateway adds only connector-provided instructions to new and steered batches", async () => {
+  const f = await fixture();
+  try {
+    await f.gateway.start(); await f.receive("plain"); f.advance(5000); await f.gateway.idle();
+    assert.deepEqual((f.session.admissions[0] as { input: unknown[] }).input,
+      [{ type: "text", text: "plain", text_elements: [] }]);
+    f.connector.agentInstructions = (directory) => `Connector guidance: ${directory}`;
+    await f.receive("steered"); f.advance(5000); await f.gateway.idle();
+    assert.deepEqual((f.session.admissions[1] as { input: unknown[] }).input, [
+      { type: "text", text: "steered", text_elements: [] },
+      { type: "text", text: "Connector guidance: /tmp/publication", text_elements: [] },
+    ]);
+  } finally { await f.close(); }
 });

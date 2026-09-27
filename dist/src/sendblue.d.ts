@@ -21,6 +21,7 @@ export declare class Sendblue implements GatewayConnector {
     readonly signingSecret: string;
     private readonly headers;
     constructor(credentials: Credentials, operations?: SendblueOperations);
+    agentInstructions(outputDirectory: string): string;
     inbound(value: unknown): IncomingMessage | undefined;
     callback(value: unknown): StatusCallback;
     private request;
