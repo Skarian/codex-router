@@ -1,6 +1,6 @@
 # Release qualification
 
-## Version 0.2.0
+## Version 0.2.1
 
 Date: 2026-09-27 (America/Chicago). These checks cover the shared runtime, HTTP connector, and final fixes.
 
@@ -134,3 +134,6 @@ The retired public Quick Tunnel buffered SSE. Native LAN TLS passed commentary, 
 ESP32 host parser tests passed with AddressSanitizer and UndefinedBehaviorSanitizer.
 They covered byte splits, CRLF, reconnect, reset, duplicates, bounded input, and a 256 KiB result.
 Physical-device and ESP-IDF firmware qualification remain separate.
+
+The initial `v0.2.0` publication stopped at a test race before upload.
+The cleanup test now waits for asynchronous cleanup with a bounded timeout. Runtime behavior is unchanged.

@@ -168,7 +168,8 @@ test("completed delivery jobs release transient send tracking", async () => {
       f.sessions.at(-1)!.finish("done");
       await until(() => !!f.runtime.request("agent", "phone", id)?.result);
       await until(() => f.store.snapshot().routes.agent!.outbox.length === 0);
-      assert.equal((f.runtime as unknown as {live: Map<string, unknown>}).live.size, 0);
+      // The saved outbox changes before the transaction promise resumes cleanup.
+      await until(() => (f.runtime as unknown as {live: Map<string, unknown>}).live.size === 0);
     }
     assert.equal(f.sent.length, 4);
   } finally { await f.close(); }

@@ -13,7 +13,7 @@ Follow-ups steer an active turn. Idle chats start a new turn.
 The optional gateway saves accepted input and pending responses across restarts.
 The CLI works without a gateway, network listener, or proxy.
 
-Version `0.2.0` introduces the shared request runtime and HTTP API.
+Version `0.2.1` introduces the shared request runtime and HTTP API.
 Earlier test installations need a [configuration and state reset](docs/gateway.md#replace-a-test-installation).
 
 ## Install
