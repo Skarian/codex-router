@@ -1,10 +1,11 @@
+import { initializePolling } from "../src/gateway-adapters.js";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateState, initializePolling, type GatewayState } from "../src/gateway-state.js";
+import { validateState, type GatewayState } from "../src/gateway-state.js";
 
 function state(): GatewayState {
-  return { version: 2, routes: { route: {
-    binding: { sources: [{ kind: "sendblue", id: "sendblue:sendblue", accountId: "sendblue", sender: "+1", sendblueNumber: "+2" }], target: { sshHost: null, threadId: "thread", cwd: "/work" } },
+  return { version: 3, nextDeliverySequence: 0, routes: { route: {
+    completions: {}, outbox: [], binding: { sources: [{ id: "sendblue:sendblue", namespace: "sendblue" }], target: { sshHost: null, threadId: "thread", cwd: "/work" } },
     nextSequence: 1, receipts: [], queue: [], active: {
       kind: "codex", ownerBatchId: "batch", joinedBatchIds: [], publicationIds: ["publication"], artifactBaseline: [],
       batches: [{ id: "batch", sourceId: "sendblue:sendblue", openedAtMs: 0, quietDeadlineMs: 1, maximumDeadlineMs: 2,
@@ -42,12 +43,12 @@ test("Desktop execution cannot be bound to an SSH route", () => {
 
 
 test("poll activation survives restart, adds routes at activation, and validates stored checkpoints", () => {
-  const data: GatewayState = { version: 2, routes: {} };
-  const config = { sendblue: [{ id: "account", mode: "poll", pollStart: new Date(1000).toISOString() }], routes: [{ id: "one", sendblueId: "account" }] } as import("../src/config.js").GatewayConfig;
+  const data: GatewayState = { version: 3, nextDeliverySequence: 0, routes: {} };
+  const config = { sendblue: [{ id: "account", mode: "poll", pollStart: new Date(1000).toISOString(), conversations: [{ id: "one" }] }] } as unknown as import("../src/config.js").GatewayConfig;
   initializePolling(data, config, 2000);
   assert.deepEqual(data.polling!.account, { activationAtMs: 1000, completedThroughMs: 1000, routeActivationAtMs: { one: 1000 } });
   data.polling!.account!.completedThroughMs = 3000;
-  config.routes.push({ id: "two", sendblueId: "account" } as import("../src/config.js").GatewayRoute);
+  config.sendblue[0]!.conversations.push({ id: "two" } as import("../src/config.js").SendblueConversation);
   initializePolling(data, config, 4000);
   assert.equal(data.polling!.account!.completedThroughMs, 3000);
   assert.deepEqual(data.polling!.account!.routeActivationAtMs, { one: 1000, two: 4000 });
@@ -57,8 +58,8 @@ test("poll activation survives restart, adds routes at activation, and validates
 });
 
 test("fresh polling activation is saved once and future migration boundaries are rejected", () => {
-  const data: GatewayState = { version: 2, routes: {} };
-  const config = { sendblue: [{ id: "account", mode: "poll" }], routes: [] } as unknown as import("../src/config.js").GatewayConfig;
+  const data: GatewayState = { version: 3, nextDeliverySequence: 0, routes: {} };
+  const config = { sendblue: [{ id: "account", mode: "poll", conversations: [] }] } as unknown as import("../src/config.js").GatewayConfig;
   initializePolling(data, config, 2000); initializePolling(data, config, 3000);
   assert.equal(data.polling!.account!.activationAtMs, 2000);
   config.sendblue[0]!.pollStart = new Date(4000).toISOString();

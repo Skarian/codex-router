@@ -1,6 +1,6 @@
 # SendBlue setup
 
-The SendBlue connector routes messages from one phone number to a configured Codex chat.
+The SendBlue connector maps configured conversations to existing Codex chats.
 It accepts text, images, and files. Replies can contain text and attachments.
 
 The default mode polls SendBlue through outbound HTTPS. No public tunnel, webhook, or inbound internet access is required.
@@ -22,15 +22,15 @@ Open [phone line management](https://dashboard.sendblue.com/settings/phone-line-
 | `sender` | Your phone number, from which you send messages |
 | `sendblue_number` | The SendBlue line that receives those messages |
 | Account `id` | A local name you choose, such as `personal` |
-| Route `id` | A local name you choose, such as `home-messages` |
-| Route `agent` | An agent ID from the router configuration |
+| Conversation `agent` | An agent ID from the router configuration |
 | Agent `thread_id` | An existing Codex chat ID |
 
 Both phone numbers require E.164 format: `+`, country code, and number.
-Account and route IDs are local names. They are not IDs from the SendBlue dashboard.
+Account IDs are local names, not IDs from the SendBlue dashboard.
+Each conversation selects an agent through its sender and receiving line.
 Polling does not require a webhook secret.
 
-## Configure the route
+## Configure a conversation
 
 Create or edit `~/.codex-router/config.toml`.
 On Windows, use `%USERPROFILE%\.codex-router\config.toml`.
@@ -43,25 +43,21 @@ cwd = "/absolute/path/to/project"
 thread_id = "REPLACE_WITH_EXISTING_CHAT_ID"
 model = "REPLACE_WITH_AVAILABLE_MODEL"
 
-[gateway]
-listen_port = 8787
-
 [[gateway.sendblue]]
 id = "personal"
 mode = "poll"
 api_key_id = "REPLACE_WITH_SENDBLUE_API_KEY_ID"
 api_secret_key = "REPLACE_WITH_SENDBLUE_API_SECRET_KEY"
 
-[[gateway.routes]]
-id = "home-messages"
-sendblue = "personal"
+[[gateway.sendblue.conversations]]
 sender = "+15555550100"
 sendblue_number = "+15555550200"
 agent = "home"
 ```
 
 Replace the placeholders and phone numbers. If the agent already exists, add only the gateway tables.
-If `[gateway]` already exists, extend it instead of creating a second table.
+Add each conversation directly beneath its corresponding `[[gateway.sendblue]]` account.
+Multiple conversations can select one agent. Each account, sender, and line combination must be unique.
 For Windows paths, use a TOML literal string such as `cwd = 'C:\projects\home'`.
 
 Keep credentials directly in this configuration file. On macOS or Linux, restrict its permissions:
@@ -127,14 +123,19 @@ Typing and read receipts are best effort. Their failures do not stop the reply.
 SendBlue adds agent guidance for short replies and output attachments. The CLI adds no connector instructions.
 Images become image inputs. Other attachments become files available to Codex.
 Replies send text before files. Upload failures produce omission notices.
-The router limits each SendBlue upload to 100,000,000 bytes.
+A completion permits at most 16 files and 100,000,000 bytes in total.
+Staging has a 60-second deadline and a shared 512 MiB spool limit. Excess files produce omission notices.
+Provider uploads and delivery follow durable model completion. A blocked delivery does not stop HTTP results or later execution.
+Deliveries retain order within each conversation.
 
 ## Polling recovery
 
 Restarts retain the polling checkpoint and message receipts.
+An exhausted delivery budget rejects new intake before admission. The account checkpoint does not advance past that message.
+This can pause other conversations in the same polling account. HTTP clients remain independent.
 Each sweep reads every page and saves its checkpoint only after durable admission.
 Overlapping scans cover 24 hours, with checkpoint advances of at most 12 hours.
-Messages older than the route activation boundary or 29 days are excluded.
+Messages older than the conversation activation boundary or 29 days are excluded.
 These bounds do not guarantee recovery from arbitrary provider indexing delays.
 
 To include earlier messages on first startup, add an account field such as:
@@ -159,11 +160,11 @@ This operation retains existing receipts. A checkpoint gap beyond 29 days requir
 
 | Symptom | Inspect |
 | --- | --- |
-| Message never enters the route | Exact sender and SendBlue numbers, account reference, and activation time |
+| Message never enters the gateway | Exact sender and SendBlue numbers, selected agent, and activation time |
 | Read receipt is slow | Poll interval, provider latency, and polling health |
 | Polling is degraded or blocked | Stderr `sendblue_poll` records and API credential validity |
-| Gateway is ready but no reply arrives | Route state, Codex authentication, chat ID, and execution owner |
-| Route is unresolved | The provider or Codex record before [manual resolution](gateway.md#recover-an-uncertain-operation) |
+| Gateway is ready but no reply arrives | Agent state, delivery state, Codex authentication, and chat ID |
+| Admission or delivery is unresolved | The provider or Codex record before [manual resolution](gateway.md#recover-an-uncertain-operation) |
 | Message reaches Codex but an attachment is absent | The omission notice and file upload limit |
 
 Do not delete the state directory to resolve delivery uncertainty. It contains receipts that prevent duplicate submissions.
@@ -171,8 +172,36 @@ Do not delete the state directory to resolve delivery uncertainty. It contains r
 ## Optional webhook mode
 
 Polling is sufficient for ordinary use. Webhooks require an explicitly deployed public HTTPS receiver.
-For webhook mode, set `mode = "webhook"`, `gateway.public_url`, and the account's `webhook_secret` or `webhook_secret_env`.
-Register `<public_url>/webhooks/sendblue/<account-id>` using [SendBlue webhook configuration](https://docs.sendblue.com/getting-started/webhooks/).
+For webhook mode, configure the account and an optional webhook-only listener:
 
-Webhook mode enables inbound handlers and outbound status callbacks. Poll mode disables both.
-LAN HTTPS clients are independent of this setting. See [HTTPS setup](https.md).
+```toml
+[gateway.http]
+port = 8788
+api = false
+
+[[gateway.sendblue]]
+id = "personal"
+mode = "webhook"
+public_url = "https://messages.example.com"
+api_key_id = "REPLACE_WITH_SENDBLUE_API_KEY_ID"
+api_secret_key = "REPLACE_WITH_SENDBLUE_API_SECRET_KEY"
+webhook_secret = "REPLACE_WITH_SIGNING_SECRET"
+
+[[gateway.sendblue.conversations]]
+sender = "+15555550100"
+sendblue_number = "+15555550200"
+agent = "home"
+```
+
+`public_url` belongs to this account. It must be an HTTPS origin without a path, query, or credentials.
+Register `<public_url>/webhooks/sendblue/<account-id>` through [SendBlue webhook configuration](https://docs.sendblue.com/getting-started/webhooks/).
+The account accepts exactly one of `webhook_secret` and `webhook_secret_env`.
+
+The external proxy terminates TLS and forwards to `127.0.0.1:8788` with the matching backend Host header.
+For Caddy, use `header_up Host {upstream_hostport}`.
+Forward `/webhooks/sendblue/personal` and `/callbacks/sendblue/personal/*` to the backend.
+These paths require the SendBlue signing secret. They must not require Basic authentication from the provider.
+If `api = true`, separately protect `/v1/*` with edge authentication. Do not expose that API through an unauthenticated provider path.
+
+Webhook mode enables inbound handlers and outbound callbacks. Polling mode disables both for that account.
+The [HTTP API and LAN HTTPS](https.md) remain optional and independent of polling.

@@ -8,17 +8,35 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import { fileTypeFromFile } from "file-type";
-import type { GatewayRoute } from "./config.js";
+import type { RuntimeTarget as GatewayRoute } from "./request-runtime.js";
 import { RouterError } from "./errors.js";
-import { delay, type SendblueProvider, type GatewayFiles, type GatewaySession } from "./gateway.js";
-import { ADMISSION_FAILURE, type Batch, type CodexWork, type Delivery, type DeliveryPart, type GatewayState, type InboundAttachment } from "./gateway-state.js";
+import type { GatewayFiles, GatewaySession } from "./gateway.js";
+import { delay } from "./request-runtime.js";
+import { ADMISSION_FAILURE, type Batch, type CodexWork, type GatewayState, type InboundAttachment, type StagedCompletion, type StagedArtifact } from "./gateway-state.js";
 import type { TurnOutcome } from "./turn-state.js";
 import { sshProcessSpec } from "./transport.js";
 
 const exec = promisify(execFile);
 const MAX_SENDBLUE_BYTES = 100000000;
 class FileOmission extends Error {
-  constructor(readonly reason: "unsafe_file" | "changing_file" | "copy_failed" | "download_failed" | "invalid_media") { super(reason); }
+  constructor(readonly reason: "unsafe_file" | "changing_file" | "copy_failed" | "download_failed" | "invalid_media" | "capacity" | "connector_limit" | "deadline") { super(reason); }
+}
+function boundedNotices(notices: string[]): string[] {
+  const result: string[] = [];
+  const omitted = "Additional file notices omitted.";
+  for (const notice of notices) {
+    if (result.length >= 15 || Buffer.byteLength(JSON.stringify([...result, notice, omitted])) > 4096) { result.push(omitted); break; }
+    result.push(notice);
+  }
+  return result;
+}
+function abortableRead<T>(request: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    signal.addEventListener("abort", stop, { once: true });
+    if (signal.aborted) stop();
+    request.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+  });
 }
 export function safeFilename(value: string): string {
   const name = value.replace(/[\\/\u0000-\u001f\u007f]/g, "_").slice(0, 180);
@@ -61,27 +79,28 @@ async function promote(temp: string, destination: string): Promise<void> {
   } catch (error) { throw localStorage(error); }
 }
 
-async function streamToLocal(source: NodeJS.ReadableStream, destination: string, signal: AbortSignal): Promise<void> {
+async function streamToLocal(source: NodeJS.ReadableStream, destination: string, signal: AbortSignal, meter?: (bytes: number) => void): Promise<void> {
   const temp = `${destination}.part-${randomUUID()}`;
   const output = createWriteStream(temp, { flags: "wx", mode: 0o600 });
   let writeFailure: unknown;
   output.on("error", (error) => { writeFailure = error; });
   try {
-    await pipeline(source, output, { signal });
+    const limit = new Transform({ transform(chunk, _encoding, callback) { try { meter?.(chunk.length); callback(null, chunk); } catch (error) { callback(error as Error); } } });
+    await pipeline(source, limit, output, { signal });
     await promote(temp, destination);
   } catch (error) {
-    if (error instanceof RouterError) throw error;
+    if (error instanceof RouterError || error instanceof FileOmission) throw error;
     const failure = writeFailure as NodeJS.ErrnoException & { path?: string } | undefined;
     if (failure && (failure.syscall === "write" || failure.path === temp
       || ["ENOSPC", "EDQUOT", "EMFILE", "ENFILE"].includes(failure.code ?? ""))) throw localStorage(failure);
     if (signal.aborted) throw new RouterError("interrupted", "The gateway file operation stopped.");
     throw new FileOmission("copy_failed");
-  } finally { await rm(temp, { force: true }).catch(() => undefined); }
+  } finally { try { await rm(temp, { force: true }); } catch (error) { throw localStorage(error); } }
 }
 
-export async function copyLocal(source: string, destination: string, signal: AbortSignal): Promise<void> {
+export async function copyLocal(source: string, destination: string, signal: AbortSignal, meter?: (bytes: number) => void): Promise<void> {
   const before = await inspectLocal(source);
-  await streamToLocal((await open(source, constants.O_RDONLY | noFollowFlag)).createReadStream(), destination, signal);
+  await streamToLocal((await open(source, constants.O_RDONLY | noFollowFlag)).createReadStream(), destination, signal, meter);
   const after = await inspectLocal(source);
   if (before.identity !== after.identity || (await inspectLocal(destination)).size !== before.size) {
     await rm(destination, { force: true }); throw new FileOmission("changing_file");
@@ -156,7 +175,7 @@ async function remoteUpload(route: GatewayRoute, source: string, destination: st
   }
 }
 
-async function remoteDownload(route: GatewayRoute, source: string, destination: string, session: GatewaySession, signal: AbortSignal): Promise<void> {
+async function remoteDownload(route: GatewayRoute, source: string, destination: string, session: GatewaySession, signal: AbortSignal, meter?: (bytes: number) => void): Promise<void> {
   const before = await remoteMetadata(route, source, session, signal);
   if (!before) throw new FileOmission("unsafe_file");
   const spec = sshProcessSpec(route.agent.sshHost!, ["cat", "--", source]);
@@ -165,7 +184,7 @@ async function remoteDownload(route: GatewayRoute, source: string, destination: 
     child.once("error", reject); child.once("close", (code) => code === 0 ? resolve() : reject(new FileOmission("copy_failed")));
   });
   try {
-    await Promise.all([streamToLocal(child.stdout!, destination, signal), exited]);
+    await Promise.all([streamToLocal(child.stdout!, destination, signal, meter), exited]);
     const after = await remoteMetadata(route, source, session, signal);
     if (before.identity !== after?.identity || (await inspectLocal(destination)).size !== before.size) throw new FileOmission("changing_file");
   } catch (error) {
@@ -175,12 +194,12 @@ async function remoteDownload(route: GatewayRoute, source: string, destination: 
   }
 }
 
-async function download(url: string, destination: string, signal: AbortSignal): Promise<void> {
+async function download(url: string, destination: string, signal: AbortSignal, reserve: (bytes: number) => void, release: (bytes: number) => void): Promise<void> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const abort = new AbortController(); const stop = () => abort.abort();
     signal.addEventListener("abort", stop, { once: true }); if (signal.aborted) stop();
     let timer = setTimeout(stop, 60000); timer.unref();
-    let retryable = true;
+    let retryable = true; let written = 0; let complete = false; let discardable = true;
     try {
       let target = new URL(url); let response: Response | undefined;
       for (let redirect = 0; redirect <= 5; redirect++) {
@@ -201,13 +220,14 @@ async function download(url: string, destination: string, signal: AbortSignal): 
       const activity = new Transform({ transform(chunk, _encoding, callback) { reset(); callback(null, chunk); } });
       const source = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
       const transfer = pipeline(source, activity, { signal: abort.signal });
-      await Promise.all([transfer, streamToLocal(activity, destination, abort.signal)]);
-      return;
+      await Promise.all([transfer, streamToLocal(activity, destination, abort.signal, bytes => { if (written + bytes > MAX_SENDBLUE_BYTES) throw new FileOmission("connector_limit"); reserve(bytes); written += bytes; })]);
+      complete = true; return;
     } catch (error) {
-      if (error instanceof RouterError && error.code === "storage_failed") throw error;
+      if (error instanceof FileOmission && (error.reason === "capacity" || error.reason === "connector_limit")) throw error;
+      if (error instanceof RouterError && error.code === "storage_failed") { discardable = false; throw error; }
       if (signal.aborted) throw new RouterError("interrupted", "The attachment download stopped.");
       if (!retryable || attempt === 2) throw new FileOmission("download_failed");
-    } finally { clearTimeout(timer); signal.removeEventListener("abort", stop); abort.abort(); }
+    } finally { if (!complete && discardable) release(written); clearTimeout(timer); signal.removeEventListener("abort", stop); abort.abort(); }
     await delay(250 * 2 ** attempt, signal);
   }
 }
@@ -221,7 +241,8 @@ function references(state: GatewayState) {
       local.add(event.attachment.localPath); host.add(event.attachment.hostPath);
     }
     if (active?.kind === "codex") for (const id of active.publicationIds) publications.add(id);
-    if (active?.kind === "delivery") for (const part of active.parts) if (part.payload.kind === "media") local.add(part.payload.localPath);
+    for (const completion of Object.values(route.completions)) for (const artifact of completion.artifacts) local.add(artifact.localPath);
+    for (const job of route.outbox) for (const part of job.parts) if (part.payload.kind === "media") local.add(part.payload.localPath);
   }
   return { local, host, publications };
 }
@@ -229,6 +250,7 @@ function references(state: GatewayState) {
 export class GatewayFilePlane implements GatewayFiles {
   private readonly reconciled = new Map<string, Promise<void>>();
   private root: string;
+  private spoolBytes = 0;
   constructor(readonly directory: string) { this.root = directory; }
   private spool(kind: "inbox" | "outbox"): string { return join(this.root, kind); }
   private home(session: GatewaySession): string {
@@ -240,6 +262,7 @@ export class GatewayFilePlane implements GatewayFiles {
     await preparePrivateDirectory(this.directory);
     this.root = await realpath(this.directory);
     const keep = references(state).local;
+    this.spoolBytes = 0;
     for (const name of await readdir(this.root)) {
       if (/^state-[a-f0-9-]{36}\.tmp$/.test(name)) await rm(join(this.root, name), { force: true });
     }
@@ -251,6 +274,7 @@ export class GatewayFilePlane implements GatewayFiles {
       for (const name of await readdir(directory)) {
         const path = join(directory, name);
         if (!keep.has(path)) await rm(path, { recursive: true, force: true });
+        else this.spoolBytes += (await inspectLocal(path)).size;
       }
     }
   }
@@ -320,7 +344,7 @@ export class GatewayFilePlane implements GatewayFiles {
       const hostPath = join(this.home(session), "inbox", id);
       let result: InboundAttachment;
       try {
-        if (!await lstat(localPath).catch(() => undefined)) await download(attachment.sourceUrl, localPath, signal);
+        if (!await lstat(localPath).catch(() => undefined)) await download(attachment.sourceUrl, localPath, signal, bytes => { if (this.spoolBytes + bytes > 512 * 1024 * 1024) throw new FileOmission("capacity"); this.spoolBytes += bytes; }, bytes => { this.spoolBytes -= bytes; });
         await inspectLocal(localPath);
         let type;
         try { type = await fileTypeFromFile(localPath); } catch { throw new FileOmission("invalid_media"); }
@@ -343,22 +367,36 @@ export class GatewayFilePlane implements GatewayFiles {
     await this.directoryOnHost(route, path, session, signal);
     return path;
   }
-  async delivery(route: GatewayRoute, work: CodexWork, outcome: TurnOutcome, session: GatewaySession, connector: SendblueProvider, signal: AbortSignal): Promise<DeliveryPart[]> {
+  async stage(route: GatewayRoute, work: CodexWork, outcome: TurnOutcome, session: GatewaySession, callerSignal: AbortSignal): Promise<StagedCompletion> {
+    callerSignal.throwIfAborted();
+    const signal = AbortSignal.any([callerSignal, AbortSignal.timeout(60_000)]);
+    if (!work.batches.some(batch => route.binding.sources.find(source => source.id === batch.sourceId)?.destination)) {
+      return { result: { status: outcome.status, text: outcome.finalText ?? "", notices: outcome.imageGenerations.length ? ["attachments_omitted"] : [] }, artifacts: [] };
+    }
     const notices: string[] = [];
-    const media: DeliveryPart[] = [];
+    const media: StagedArtifact[] = [];
+    let completionBytes = 0;
     const hashes = new Set<string>();
     const collect = async (name: string, source: { path: string } | { base64: string }) => {
       const localPath = join(this.spool("outbox"), randomUUID());
-      let retained = false;
+      callerSignal.throwIfAborted();
+      if (media.length >= 16 || signal.aborted) { notices.push("Files omitted: staging limit."); return; }
+      let retained = false; let discardable = true;
+      let written = 0;
+      const meter = (bytes: number) => {
+        if (completionBytes + written + bytes > MAX_SENDBLUE_BYTES) throw new FileOmission("connector_limit");
+        if (this.spoolBytes + bytes > 512 * 1024 * 1024) throw new FileOmission("capacity");
+        written += bytes; this.spoolBytes += bytes;
+      };
       try {
         if ("path" in source) {
-          if (route.agent.sshHost) await remoteDownload(route, source.path, localPath, session, signal);
-          else await copyLocal(source.path, localPath, signal);
+          if (route.agent.sshHost) await remoteDownload(route, source.path, localPath, session, signal, meter);
+          else await copyLocal(source.path, localPath, signal, meter);
         } else {
           const encoded = source.base64;
           if (encoded.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new FileOmission("invalid_media");
           async function* decode() { for (let i = 0; i < encoded.length; i += 65536) yield Buffer.from(encoded.slice(i, i + 65536), "base64"); }
-          await streamToLocal(Readable.from(decode()), localPath, signal);
+          await streamToLocal(Readable.from(decode()), localPath, signal, meter);
         }
         const hash = await hashFile(localPath, signal);
         if (hashes.has(hash)) return;
@@ -366,16 +404,13 @@ export class GatewayFilePlane implements GatewayFiles {
         if ((await inspectLocal(localPath)).size > MAX_SENDBLUE_BYTES) { notices.push(`File omitted: ${JSON.stringify(name)} (connector limit).`); return; }
         const type = await fileTypeFromFile(localPath).catch(() => undefined);
         const mediaType = type?.mime ?? "application/octet-stream";
-        let mediaUrl: string;
-        try { mediaUrl = await connector.upload(localPath, name, mediaType, signal); }
-        catch (error) { if (signal.aborted) throw error; notices.push(`File omitted: ${JSON.stringify(name)} (upload failed).`); return; }
-        media.push({ id: randomUUID(), status: "ready", payload: { kind: "media", localPath, name, mediaType, mediaUrl } }); retained = true;
+        media.push({ localPath, name, mediaType, size: written }); retained = true; completionBytes += written;
       } catch (error) {
-        if (error instanceof RouterError || signal.aborted) throw error;
+        if (error instanceof RouterError && error.code === "storage_failed") { discardable = false; throw error; }
+        if (callerSignal.aborted) throw error;
         notices.push(`File omitted: ${JSON.stringify(name)} (${error instanceof FileOmission ? error.reason.replaceAll("_", " ") : "copy failed"}).`);
-      } finally { if (!retained) await rm(localPath, { force: true }).catch(() => undefined); }
+      } finally { if (!retained) { try { await rm(localPath, { force: true }); } catch (error) { throw localStorage(error); } if (discardable) this.spoolBytes -= written; } }
     };
-    let text: string;
     if (outcome.status === "completed") {
       for (const id of work.publicationIds) {
         const path = join(this.home(session), "outbox", component(id));
@@ -383,12 +418,12 @@ export class GatewayFilePlane implements GatewayFiles {
         try {
           if (route.agent.sshHost) await ssh(route, CHECK_PATH + 'test -d "$1" || exit 23', [path], signal);
           else { await assertNoSymlinks(path); if (!(await lstat(path)).isDirectory()) throw new FileOmission("unsafe_file"); }
-          listing = await session.filesystem("fs/readDirectory", { path }) as typeof listing;
+          listing = await abortableRead(session.filesystem("fs/readDirectory", { path }), signal) as typeof listing;
           if (!route.agent.sshHost && process.platform === "win32") await validateExistingPrivatePaths([
             path, ...listing.entries.filter(entry => entry.isFile && safeFilename(entry.fileName) === entry.fileName).map(entry => join(path, entry.fileName)),
           ]);
         } catch (error) {
-          if (signal.aborted) throw error;
+          if (callerSignal.aborted) throw error;
           notices.push("Files omitted: the response directory is unavailable or unsafe.");
           continue;
         }
@@ -403,34 +438,25 @@ export class GatewayFilePlane implements GatewayFiles {
         if (item.savedPath) await collect(safeFilename(basename(item.savedPath)), { path: item.savedPath });
         else if (item.result) await collect(`image-${safeFilename(item.id)}.png`, { base64: item.result });
       }
-      text = outcome.finalText ?? "";
-      if (!text && !notices.length && !media.length) text = "Codex finished without a response.";
-    } else text = outcome.status === "failed" ? "Codex could not finish this request." : "Codex stopped before finishing this request.";
-    if (work.admissionFailed) notices.push(ADMISSION_FAILURE);
-    text = [text, ...notices].filter(Boolean).join("\n\n");
-    const parts: DeliveryPart[] = [];
-    // Split by Unicode scalar value so a boundary cannot split a surrogate pair.
-    let chunk = "";
-    for (const point of text) {
-      if (chunk.length + point.length > 18995) { parts.push({ id: randomUUID(), status: "ready", payload: { kind: "text", text: chunk } }); chunk = ""; }
-      chunk += point;
     }
-    if (chunk) parts.push({ id: randomUUID(), status: "ready", payload: { kind: "text", text: chunk } });
-    return [...parts, ...media];
+    if (work.admissionFailed) notices.push(ADMISSION_FAILURE);
+    return { result: { status: outcome.status, text: outcome.finalText ?? "", notices: boundedNotices(notices) }, artifacts: media };
   }
-  async release(route: GatewayRoute, active: CodexWork | Delivery, session?: GatewaySession): Promise<void> {
+  async release(route: GatewayRoute, active: CodexWork | readonly StagedArtifact[], session?: GatewaySession): Promise<void> {
     const removeLocal = async (path: string, recursive = false): Promise<void> => {
       try { await lstat(path); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
       await assertNoSymlinks(path);
+      const bytes = !recursive && [this.spool("outbox"), this.spool("inbox")].includes(dirname(path)) ? (await lstat(path)).size : 0;
       await rm(path, { force: true, recursive });
+      this.spoolBytes = Math.max(0, this.spoolBytes - bytes);
     };
     const removeHost = async (path: string, recursive = false): Promise<void> => {
       if (!route.agent.sshHost) return removeLocal(path, recursive);
       await ssh(route, CHECK_PATH + (recursive ? 'rm -rf -- "$1"' : 'rm -f -- "$1"'), [path], AbortSignal.timeout(15000));
     };
-    if (active.kind === "delivery") {
-      for (const part of active.parts) if (part.payload.kind === "media" && dirname(part.payload.localPath) === this.spool("outbox")) await removeLocal(part.payload.localPath);
+    if (!("kind" in active)) {
+      for (const artifact of active) if (dirname(artifact.localPath) === this.spool("outbox")) await removeLocal(artifact.localPath);
       return;
     }
     // Cleanup owns its filesystem operations; the execution session may already

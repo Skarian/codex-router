@@ -1,71 +1,92 @@
 import { randomUUID } from "node:crypto";
-import { routeSources, type GatewayConfig, type GatewayRoute, type SourceBinding } from "./config.js";
-import type { SendblueProvider, GatewayFiles, GatewaySession, IncomingMessage, SendOutcome } from "./gateway.js";
-import type { Batch, CodexWork, DeliveryPart, RetainedResult } from "./gateway-state.js";
-import type { SourcePolicy, CompletionPlan } from "./gateway-connector.js";
-import type { TurnOutcome } from "./turn-state.js";
+import type { GatewayConfig, SendblueConfig, SendblueConversation } from "./config.js";
+import type { SendblueProvider, GatewayFiles, IncomingMessage } from "./gateway.js";
+import type { GatewayState, SourceBinding, RouteBinding, Destination } from "./gateway-state.js";
+import type { RequestAdapter, RuntimeTarget } from "./request-runtime.js";
+import { prepareSendblueDelivery } from "./sendblue-delivery.js";
+import { RouterError } from "./errors.js";
 
-export interface SourceAdapter {
-  readonly binding: SourceBinding;
-  readonly policy: SourcePolicy;
-  prepare(batch: Batch, session: GatewaySession, signal: AbortSignal): Promise<Batch>;
-  instructions(session: GatewaySession, signal: AbortSignal): Promise<{ publicationId?: string; instructions?: string }>;
-  complete(work: CodexWork, outcome: TurnOutcome, session: GatewaySession, signal: AbortSignal): Promise<CompletionPlan>;
-  typing?(active: boolean, signal: AbortSignal): Promise<void>;
-  readReceipt?(signal: AbortSignal): Promise<void>;
-  outbound?: {
-    line: string;
-    maxPerSecond: number;
-    callbackUrl(partId: string, token: string): string | undefined;
-    send(part: DeliveryPart, callbackUrl: string | undefined, signal: AbortSignal): Promise<SendOutcome>;
+export function sendblueBinding(account: SendblueConfig, conversation: SendblueConversation): SourceBinding {
+  const namespace = JSON.stringify(["sendblue", account.id]);
+  return { id: conversation.id, namespace, destination: { id: conversation.id, namespace,
+    properties: { accountId: account.id, sender: conversation.sender, sendblueNumber: conversation.sendblueNumber } } };
+}
+
+export function runtimeBindings(config: GatewayConfig): Array<{ id: string; binding: RouteBinding }> {
+  return config.agents.map(agent => ({ id: agent.id, binding: {
+    target: { sshHost: agent.sshHost ?? null, threadId: agent.threadId, cwd: agent.cwd },
+    sources: [ ...(config.http?.api ? [{ id: "http", namespace: "http" }] : []),
+      ...config.sendblue.flatMap(account => account.conversations.filter(conversation => conversation.agent.id === agent.id)
+        .map(conversation => sendblueBinding(account, conversation))) ],
+  } }));
+}
+
+export function outboundTransport(config: GatewayConfig, connector: (id: string) => SendblueProvider,
+  destination: Destination): NonNullable<RequestAdapter["outbound"]> {
+  const account = config.sendblue.find(account => account.id === destination.properties.accountId);
+  if (!account || destination.namespace !== JSON.stringify(["sendblue", account.id])
+    || !destination.properties.sender || !destination.properties.sendblueNumber) {
+    throw new RouterError("config_invalid", "The delivery account is unavailable.");
+  }
+  const provider = connector(account.id);
+  return {
+    callbackNamespace: account.id, line: destination.properties.sendblueNumber, maxPerSecond: 10,
+    prepare: (completion, _destination, signal) => prepareSendblueDelivery(completion, provider, signal),
+    callbackUrl: (partId, token) => account.mode === "webhook"
+      ? `${account.publicUrl}/callbacks/sendblue/${account.id}/${partId}/${token}` : undefined,
+    send: (part, callbackUrl, signal, savedDestination) => provider.send({
+      sender: savedDestination.properties.sender!, sendblueNumber: savedDestination.properties.sendblueNumber!,
+    }, part, callbackUrl, signal),
   };
 }
 
-/** Static composition: provider-specific behavior stops at this boundary. */
-export function sourceAdapters(config: GatewayConfig, route: GatewayRoute, files: GatewayFiles,
-  connector: (id: string) => SendblueProvider): SourceAdapter[] {
-  return routeSources(route).map(binding => {
-    if (binding.kind === "https") return {
-      binding, policy: { batching: "immediate", retainTerminalResult: true, duplicateBehavior: "exact" },
-      async prepare(batch) { return batch; },
-      async instructions() { return {}; },
-      async complete(_work, outcome) {
-        return { kind: "retain", result: { status: outcome.status, text: outcome.finalText ?? "",
-          notices: outcome.imageGenerations.length ? ["attachments_omitted"] : [] } };
-      },
-    };
-    const provider = connector(binding.accountId);
-    return {
-      binding, policy: { batching: { quietMs: config.sendblue.find(account => account.id === binding.accountId)?.batchQuietMs ?? 5000, maximumMs: 30000 }, retainTerminalResult: false, duplicateBehavior: "first" },
-      prepare: (batch, session, signal) => files.prepareBatch(route, batch, session, signal),
-      async instructions(session, signal) {
-        const publicationId = randomUUID();
-        const directory = await files.publication(route, publicationId, session, signal);
-        const instructions = provider.agentInstructions?.(directory);
-        return { publicationId, ...(instructions === undefined ? {} : { instructions }) };
-      },
-      async complete(work, outcome, session, signal) {
-        const parts = work.admissionFailed && !work.turnId
-          ? [{ id: randomUUID(), status: "ready" as const, payload: { kind: "text" as const, text: "Codex did not confirm the latest input. It was not sent again." } }]
-          : await files.delivery(route, work, outcome, session, provider, signal);
-        return { kind: "deliver", parts, result: { status: outcome.status, text: outcome.finalText ?? "", notices: [] } };
-      },
-      typing: (active, signal) => provider.typing(route, active ? "start" : "stop", signal),
-      readReceipt: async signal => { await provider.readReceipt?.(route, signal); },
-      outbound: {
-        line: binding.sendblueNumber, maxPerSecond: 10,
-        callbackUrl: (partId, token) => config.sendblue.find(account => account.id === binding.accountId)?.mode === "webhook"
-          ? `${config.publicUrl}/callbacks/sendblue/${binding.accountId}/${partId}/${token}` : undefined,
-        send: (part, callbackUrl, signal) => provider.send(route, part, callbackUrl, signal),
-      },
-    };
+export function runtimeTargets(config: GatewayConfig, files: GatewayFiles, connector: (id: string) => SendblueProvider): RuntimeTarget[] {
+  return runtimeBindings(config).map(({ id, binding }) => {
+    const agent = config.agents.find(agent => agent.id === id)!;
+    const target: RuntimeTarget = { id, agent, binding, adapters: [] };
+    target.adapters = binding.sources.map(source => {
+      if (!source.destination) return {
+        binding: source, policy: { batching: "immediate", duplicateBehavior: "exact" },
+        async prepare(batch) { return batch; }, async instructions() { return {}; },
+      } satisfies RequestAdapter;
+      const destination = source.destination;
+      const account = config.sendblue.find(account => account.id === destination.properties.accountId)!;
+      const conversation = account.conversations.find(conversation => conversation.id === destination.id)!;
+      const provider = connector(account.id);
+      return {
+        binding: source,
+        policy: { batching: { quietMs: account.batchQuietMs ?? 5000, maximumMs: 30000 }, duplicateBehavior: "first" },
+        prepare: (batch, session, signal) => files.prepareBatch(target, batch, session, signal),
+        async instructions(session, signal) {
+          const publicationId = randomUUID();
+          const directory = await files.publication(target, publicationId, session, signal);
+          const instructions = provider.agentInstructions?.(directory);
+          return { publicationId, ...(instructions === undefined ? {} : { instructions }) };
+        },
+        typing: (active, signal) => provider.typing(conversation, active ? "start" : "stop", signal),
+        readReceipt: signal => provider.readReceipt?.(conversation, signal) ?? Promise.resolve(),
+        outbound: outboundTransport(config, connector, destination),
+      } satisfies RequestAdapter;
+    });
+    return target;
   });
 }
 
-export function matchIncoming(config: GatewayConfig, accountId: string, message: IncomingMessage): { route: GatewayRoute; sourceId: string } | undefined {
-  for (const route of config.routes) {
-    const binding = routeSources(route).find(b => b.kind === "sendblue" && b.accountId === accountId && b.sender === message.sender && b.sendblueNumber === message.sendblueNumber);
-    if (binding) return { route, sourceId: binding.id };
+export function matchIncoming(config: GatewayConfig, accountId: string, message: IncomingMessage): { agentId: string; sourceId: string } | undefined {
+  const account = config.sendblue.find(account => account.id === accountId);
+  const conversation = account?.conversations.find(conversation => conversation.sender === message.sender && conversation.sendblueNumber === message.sendblueNumber);
+  return conversation ? { agentId: conversation.agent.id, sourceId: conversation.id } : undefined;
+}
+
+/** Persist activation before network intake; never reset existing checkpoints. */
+export function initializePolling(state: GatewayState, config: GatewayConfig, now: number): void {
+  const polling = state.polling ??= {};
+  for (const account of config.sendblue) {
+    if (account.mode === "webhook") continue;
+    const initial = account.pollStart === undefined ? now : Date.parse(account.pollStart);
+    if (!Number.isSafeInteger(initial) || initial < 0 || initial > now) throw new RouterError("config_invalid", "Polling start must not be in the future.");
+    const existing = polling[account.id];
+    const poll = polling[account.id] ??= { activationAtMs: initial, completedThroughMs: initial, routeActivationAtMs: {} };
+    for (const conversation of account.conversations) poll.routeActivationAtMs[conversation.id] ??= existing ? now : initial;
   }
-  return undefined;
 }

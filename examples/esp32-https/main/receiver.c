@@ -13,7 +13,7 @@ bool receiver_event(void *context, const char *event, const char *cursor, const 
         r->active = false; r->next_part = 0; r->cursor[0] = 0; return true;
     }
     if (!strcmp(event, "status")) return true;
-    if (strcmp(event, "commentary") && strcmp(event, "terminal")) return false;
+    if (strcmp(event, "reasoning") && strcmp(event, "commentary") && strcmp(event, "terminal")) return false;
     if (!cursor[0] || strlen(cursor) > SSE_ID_MAX) return false;
     if (!strcmp(cursor, r->cursor)) return true;
     // cJSON exposes strings without lengths. Fail explicitly instead of truncating embedded NUL.

@@ -1,10 +1,8 @@
 import { startDiagnostics, type DiagnosticView } from "./gateway-diagnostics.js";
 import { unresolved } from "./gateway-state.js";
-import { readFileSync } from "node:fs";
-import { createServer as createHttpsServer } from "node:https";
 import { RouterError } from "./errors.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { handleHttps, httpsCredentials, HTTPS_BODY_LIMIT, HttpFailure } from "./gateway-https.js";
+import { handleHttp, HTTP_BODY_LIMIT, HttpFailure } from "./gateway-http.js";
 import { Gateway, secretEqual } from "./gateway.js";
 
 const BODY_LIMIT = 256 * 1024;
@@ -37,28 +35,29 @@ async function body(request: IncomingMessage, limit = BODY_LIMIT): Promise<strin
 }
 
 export function createGatewayServer(gateway: Gateway): Server {
-  const tokens = httpsCredentials(gateway.config.https ?? []);
   const handler = (request: IncomingMessage, response: ServerResponse) => {
-    void handle(gateway, tokens, request, response).catch((error) => {
+    void handle(gateway, request, response).catch((error) => {
       if (response.headersSent) { response.end(); return; }
       const status = error instanceof HttpFailure ? error.status : 503;
       response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store", ...(status === 408 ? { connection: "close" } : {}) });
       response.end(JSON.stringify({ error: error instanceof HttpFailure ? error.code : "gateway_unavailable" }));
     });
   };
-  let server: Server;
-  try {
-    const tls = gateway.config.tls;
-    server = tls ? createHttpsServer({ cert: readFileSync(tls.certPath), key: readFileSync(tls.keyPath), minVersion: "TLSv1.2" }, handler) : createServer(handler);
-  } catch { throw new RouterError("config_invalid", "The gateway TLS certificate or key could not be loaded."); }
+  const server = createServer(handler);
   server.headersTimeout = 30000;
   server.requestTimeout = 0;
   server.keepAliveTimeout = 5000;
   return server;
 }
 
-async function handle(gateway: Gateway, tokens: ReadonlyMap<string, string>, request: IncomingMessage, response: ServerResponse): Promise<void> {
-  if (request.url?.startsWith("/v1/") && await handleHttps(gateway, tokens, request, response, () => body(request, HTTPS_BODY_LIMIT))) return;
+export function validateBackendHost(request: IncomingMessage): void {
+  const hosts = request.rawHeaders.filter((_, index) => index % 2 === 0 && request.rawHeaders[index]!.toLowerCase() === "host");
+  if (hosts.length !== 1 || request.headers.host !== `127.0.0.1:${request.socket.localPort}`) throw new HttpFailure(400, "invalid_host");
+}
+
+async function handle(gateway: Gateway, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  validateBackendHost(request);
+  if (request.url?.startsWith("/v1/") && await handleHttp(gateway, request, response, () => body(request, HTTP_BODY_LIMIT))) return;
   const path = (request.url ?? "").split("?")[0]!;
   const status = path === "/statusz";
   const health = path === "/healthz" || path === "/readyz";
@@ -76,9 +75,9 @@ async function handle(gateway: Gateway, tokens: ReadonlyMap<string, string>, req
     const accounts = typeof secret === "string" ? gateway.config.sendblue.filter((entry) => entry.mode === "webhook" &&
       secretEqual(secret, gateway.operations.connector(entry.id).signingSecret)).map((entry) => entry.id) : [];
     if (!accounts.length) throw new HttpFailure(401);
-    const routes = new Set(gateway.config.routes.filter((route) => route.sendblueId !== undefined && accounts.includes(route.sendblueId)).map((route) => route.id));
+    const agents = new Set(gateway.config.sendblue.filter(account => accounts.includes(account.id)).flatMap(account => account.conversations.map(conversation => conversation.agent.id)));
     response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-    response.end(JSON.stringify({ ready: gateway.ready, routes: gateway.processingStatus().filter((route) => routes.has(route.routeId)) }));
+    response.end(JSON.stringify({ ready: gateway.ready, agents: gateway.processingStatus().filter(state => agents.has(state.routeId)).map(({ routeId, ...state }) => ({ agentId: routeId, ...state })), deliveries: gateway.deliveryStatus().filter(job => agents.has(job.agentId)) }));
     return;
   }
   const account = (webhook ?? callback)![1]!;
@@ -109,10 +108,10 @@ async function handle(gateway: Gateway, tokens: ReadonlyMap<string, string>, req
   response.writeHead(204); response.end();
 }
 
-export async function listenGateway(server: Server, port: number, host = "127.0.0.1"): Promise<void> {
+export async function listenGateway(server: Server, port: number): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, host, () => { server.removeListener("error", reject); resolve(); });
+    server.listen(port, "127.0.0.1", () => { server.removeListener("error", reject); resolve(); });
   });
 }
 
@@ -125,11 +124,11 @@ export async function closeGatewayServer(server: Server): Promise<void> {
 
 export async function runGateway(config: import("./config.js").GatewayConfig, signal: AbortSignal): Promise<void> {
   const { sendblueConnectors } = await import("./sendblue.js");
-  const { GatewayStore, initializePolling } = await import("./gateway-state.js");
+  const { GatewayStore } = await import("./gateway-state.js");
+  const { initializePolling } = await import("./gateway-adapters.js");
   const { SendbluePoller } = await import("./sendblue-poller.js");
   const { GatewayFilePlane } = await import("./gateway-files.js");
   const connectors = sendblueConnectors(config);
-  httpsCredentials(config.https ?? []);
   const store = await GatewayStore.open(config.stateDir);
   const gateway = new Gateway(config, store, { connector: (id) => connectors.get(id)!, files: new GatewayFilePlane(config.stateDir) });
   const intakeAbort = new AbortController();
@@ -140,14 +139,13 @@ export async function runGateway(config: import("./config.js").GatewayConfig, si
   const polling = new Map<string, DiagnosticView["polling"][number]>();
   const diagnostics = startDiagnostics(config.stateDir, () => {
     const routes = gateway.processingStatus();
-    return { ready: gateway.ready, polling: [...polling.values()], routes,
-      unresolved: store.read(state => unresolved(state).unresolved.filter(effect => routes.some(route => route.routeId === effect.routeId && route.state === "unresolved"))) };
+    return { ready: gateway.ready, polling: [...polling.values()], routes, deliveries: gateway.deliveryStatus(),
+      unresolved: store.read(state => unresolved(state).unresolved) };
   },
     { report: failed => process.stderr.write(JSON.stringify({ type: "gateway_diagnostics", state: failed ? "unavailable" : "recovered" }) + "\n") });
   try {
     signal.throwIfAborted();
-    server = createGatewayServer(gateway);
-    await listenGateway(server, config.listenPort, config.listenHost);
+    if (config.http) { server = createGatewayServer(gateway); await listenGateway(server, config.http.port); }
     await gateway.start();
     await store.transaction(state => initializePolling(state, config, Date.now()));
     for (const account of config.sendblue.filter(account => account.mode !== "webhook")) {
@@ -156,7 +154,7 @@ export async function runGateway(config: import("./config.js").GatewayConfig, si
       polling.set(account.id, { accountId: account.id, state: "running" });
       const poller = new SendbluePoller({
         ...(account.pollIntervalMs === undefined ? {} : { intervalMs: account.pollIntervalMs }),
-        routes: config.routes.filter(route => route.sendblueId === account.id).map(route => ({ id: route.id, sender: route.sender!, sendblueNumber: route.sendblueNumber! })),
+        routes: account.conversations.map(conversation => ({ id: conversation.id, sender: conversation.sender, sendblueNumber: conversation.sendblueNumber })),
         state: () => store.read(state => state.polling![account.id]!),
         checkpoint: async completedThroughMs => { await store.transaction(state => { state.polling![account.id]!.completedThroughMs = completedThroughMs; }); },
         list: (query, abort) => connector.list(query, abort),
@@ -180,9 +178,9 @@ export async function runGateway(config: import("./config.js").GatewayConfig, si
     }
     const runningServer = server;
     await new Promise<void>((resolve, reject) => {
-      const stop = () => { runningServer.removeListener("error", fail); resolve(); };
+      const stop = () => { runningServer?.removeListener("error", fail); resolve(); };
       const fail = (error: Error) => { signal.removeEventListener("abort", stop); reject(error); };
-      runningServer.once("error", fail);
+      runningServer?.once("error", fail);
       if (signal.aborted) stop(); else signal.addEventListener("abort", stop, { once: true });
       for (const poller of pollers) void poller.catch(fail);
     });

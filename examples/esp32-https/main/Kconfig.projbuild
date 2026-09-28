@@ -10,11 +10,14 @@ config ROUTER_PRIVATE_CA
         verification remains enabled. Copy only the CA certificate into
         main/router_ca.pem; never copy a private key. When disabled, the
         client uses the ESP certificate bundle.
-config ROUTER_ROUTE
-    string "Configured route ID"
+config ROUTER_AGENT
+    string "Configured agent ID"
     default "assistant"
-config ROUTER_TOKEN
-    string "HTTPS bearer token (development only; secure provisioning for deployment)"
+config ROUTER_USERNAME
+    string "Proxy Basic username (development only)"
+    default "router"
+config ROUTER_PASSWORD
+    string "Proxy Basic password (development only; provision securely for deployment)"
     default "REPLACE_ME"
 config ROUTER_PROMPT
     string "Prompt submitted once (up to 1024 UTF-8 bytes)"

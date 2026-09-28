@@ -42,6 +42,9 @@ int main(void) {
     setup(); char oversized[4098]; memset(oversized, 'x', sizeof(oversized)); assert(!sse_feed(&parser, oversized, sizeof(oversized)));
     setup(); const char *bad = "id: x\nevent: commentary\ndata: {\"message_id\":\"m\",\"part\":2,\"end\":true,\"field\":\"text\",\"text\":\"bad\"}\n\n";
     assert(!sse_feed(&parser, bad, strlen(bad))); assert(!r.cursor[0]);
+    setup();
+    feed("id: summary\nevent: reasoning\ndata: {\"message_id\":\"summary\",\"part\":0,\"end\":true,\"field\":\"text\",\"text\":\"Published summary\"}\n\n");
+    assert(commits == 1 && !r.terminal && !strcmp(r.cursor, "summary"));
     // The receiver processes a full 256KiB result with fixed parser/sink memory.
     setup(); char frame[4096], text[1025]; memset(text, 'z', 1024); text[1024] = 0;
     for (int i = 0; i < 256; i++) {

@@ -1,18 +1,18 @@
 {
   "name": "@skarian/codex-router",
-  "version": "0.0.1",
-  "description": "Route messages to Codex chats through the CLI, SendBlue, or HTTPS with SSE.",
+  "version": "0.2.0",
+  "description": "Route messages to Codex chats through the CLI, SendBlue, or HTTP with SSE.",
   "type": "module",
   "bin": {
     "codex-router": "dist/src/cli.js"
   },
   "files": [
     "dist/src",
-    "docs",
+    "docs/*.md",
     "examples/esp32-https"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
     "test": "npm run build && node --test dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepare": "npm run build",

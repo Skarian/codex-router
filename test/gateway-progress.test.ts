@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { EventEmitter } from "node:events";
 import type { ServerResponse } from "node:http";
-import { encodeProgressFrames, ProgressHub, writeProgressStream, type ProgressFrame, type ProgressSubscription } from "../src/gateway-progress.js";
+import { encodeProgressFrames, ProgressHub, writeProgressStream, type ProgressFrame, type ProgressSubscription } from "../src/http-progress.js";
 
 function body(frame: ProgressFrame) { return JSON.parse(frame.data.split("\ndata: ")[1]!.trim()) as { message_id: string; part: number; end: boolean; field: string; text: string }; }
 function collect(sub: ProgressSubscription): ProgressFrame[] {

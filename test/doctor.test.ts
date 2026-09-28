@@ -21,6 +21,7 @@ test("remote doctor reports startup readiness without starting or connecting", a
   });
   assert.deepEqual(calls, ["probe", "capability"]);
   assert.equal(checks[0]?.ok, true);
-  assert.match(checks[0]?.text ?? "", /first send will start it/);
+  assert.match(checks[0]?.text ?? "", /startup is supported/);
+  assert.match(checks[0]?.text ?? "", /first send will attempt startup/);
   assert.deepEqual(checks[1], { name: "agent:remote:thread", ok: false, text: "Task was not checked." });
 });

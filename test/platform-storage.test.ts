@@ -1,3 +1,4 @@
+import { prepareSendblueDelivery } from "../src/sendblue-delivery.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, realpath, mkdir, rm, writeFile, readFile, symlink, chmod } from "node:fs/promises";
@@ -21,7 +22,7 @@ test("private native storage supports durable snapshots, exclusive ownership and
   try {
     store = await GatewayStore.open(f.root);
     await store.transaction(state => { state.polling = {}; });
-    assert.equal(JSON.parse(await readFile(join(f.root, "state.json"), "utf8")).version, 2);
+    assert.equal(JSON.parse(await readFile(join(f.root, "state.json"), "utf8")).version, 3);
     await assert.rejects(GatewayStore.open(f.root), { code: "gateway_running" });
     const diagnostics = startDiagnostics(f.root, () => ({ ready: true, polling: [], routes: [], unresolved: [] }));
     try {
@@ -99,24 +100,28 @@ test("native file plane publishes attachments and releases only its own files", 
         const s = await lstat(p.path); return { isFile: s.isFile(), isDirectory: s.isDirectory(), isSymlink: s.isSymbolicLink() };
       },
     };
-    const route: import("../src/config.js").GatewayRoute = { id: "route", agent: { id: "agent", label: "Agent", cwd: f.root, threadId: "thread", model: "test" } };
+    const route: import("../src/request-runtime.js").RuntimeTarget = { id: "route", agent: { id: "agent", label: "Agent", cwd: f.root, threadId: "thread", model: "test" }, binding: { target: { sshHost: null, threadId: "thread", cwd: f.root }, sources: [{ id: "provider", namespace: "provider", destination: { id: "destination", namespace: "provider", properties: {} } }] }, adapters: [] };
     const uploads: string[] = [];
     const connector: import("../src/gateway.js").SendblueProvider = {
       signingSecret: "test", inbound() { return undefined; }, callback() { return { status: "SENT" }; }, async typing() {},
       async send() { return { status: "accepted", providerHandle: "test" }; },
       async upload(path, name) { assert.equal(await readFile(path, "utf8"), "published bytes"); uploads.push(name); return "https://example.com/file"; },
     };
-    const files = new GatewayFilePlane(spool), state = { version: 2 as const, routes: {} }, signal = new AbortController().signal;
+    const files = new GatewayFilePlane(spool), state = { version: 3 as const, nextDeliverySequence: 0, routes: {} }, signal = new AbortController().signal;
     await files.cleanup(state); await files.reconcile(route, state, session, signal);
     const publication = await files.publication(route, "publication", session, signal);
     await writeFile(join(publication, "attachment.txt"), "published bytes", { mode: 0o600 });
-    const work: import("../src/gateway-state.js").CodexWork = { kind: "codex", ownerBatchId: "batch", joinedBatchIds: [], batches: [], publicationIds: ["publication"], artifactBaseline: [] };
-    const parts = await files.delivery(route, work, { turnId: "turn", status: "completed", finalText: "answer", imageGenerations: [] }, session, connector, signal);
+    const work: import("../src/gateway-state.js").CodexWork = { kind: "codex", ownerBatchId: "batch", joinedBatchIds: [], batches: [{ id: "batch", sourceId: "provider", openedAtMs: 0, quietDeadlineMs: 0, maximumDeadlineMs: 0, events: [{ messageHandle: "input", providerTimeMs: 0, receiptSequence: 0, text: "hello" }] }], publicationIds: ["publication"], artifactBaseline: [] };
+    const staged = await files.stage(route, work, { turnId: "turn", status: "completed", finalText: "answer", imageGenerations: [] }, session, signal);
+    const completion = { ...staged, id: "completion", expiresAtMs: Date.now() + 100000 };
+    const destination = { id: "destination", namespace: "provider", properties: {} };
+    const parts = await prepareSendblueDelivery(completion, connector, signal);
     assert.deepEqual(uploads, ["attachment.txt"]); assert.deepEqual(parts.map(p => p.payload.kind), ["text", "media"]);
     if (process.platform === "win32") {
       const published = join(publication, "attachment.txt");
       await execute("icacls.exe", [published, "/grant", "*S-1-1-0:R"], { windowsHide: true });
-      const rejected = await files.delivery(route, work, { turnId: "turn", status: "completed", finalText: "answer", imageGenerations: [] }, session, connector, signal);
+      const rejectedStage = await files.stage(route, work, { turnId: "turn", status: "completed", finalText: "answer", imageGenerations: [] }, session, signal);
+      const rejected = await prepareSendblueDelivery({ ...rejectedStage, id: "rejected", expiresAtMs: Date.now() }, connector, signal);
       assert.equal(uploads.length, 1);
       assert.ok(rejected.some(part => part.payload.kind === "text" && part.payload.text.includes("response directory is unavailable or unsafe")));
       assert.ok(rejected.every(part => part.payload.kind !== "media"));
@@ -125,13 +130,13 @@ test("native file plane publishes attachments and releases only its own files", 
       if (retained.kind === "media") {
         await execute("icacls.exe", [retained.localPath, "/grant", "*S-1-1-0:R"], { windowsHide: true });
         // cleanup consumes retained media references; unrelated state fields are immaterial here.
-        const retainedState = { version: 2, routes: { route: { queue: [], active: { kind: "delivery", parts } } } } as unknown as import("../src/gateway-state.js").GatewayState;
+        const retainedState = { version: 3, nextDeliverySequence: 1, routes: { route: { queue: [], completions: { completion }, outbox: [{ kind: "delivery", parts }] } } } as unknown as import("../src/gateway-state.js").GatewayState;
         await assert.rejects(files.cleanup(retainedState), { code: "state_invalid" });
       }
     }
     await files.release(route, work, session);
     await assert.rejects(lstat(publication), { code: "ENOENT" });
-    await files.release(route, { kind: "delivery", sourceId: "sendblue:account", id: "delivery", batchIds: [], parts });
+    await files.release(route, completion.artifacts);
     assert.deepEqual(await readdir(join(spool, "outbox")), []);
   } finally { await f.close(); }
 });

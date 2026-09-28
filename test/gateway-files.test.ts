@@ -1,3 +1,4 @@
+import { prepareSendblueDelivery } from "../src/sendblue-delivery.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, realpath, mkdir, readdir, lstat, readFile, writeFile, rm, symlink, open, utimes } from "node:fs/promises";
@@ -7,14 +8,17 @@ import { RouterError } from "../src/errors.js";
 import { randomUUID } from "node:crypto";
 import { GatewayFilePlane, copyLocal, hashFile, inspectLocal } from "../src/gateway-files.js";
 import type { GatewaySession, SendblueProvider } from "../src/gateway.js";
-import type { GatewayRoute } from "../src/config.js";
-import type { CodexWork, GatewayState, Batch } from "../src/gateway-state.js";
+import type { RuntimeTarget as GatewayRoute } from "../src/request-runtime.js";
+import type { TurnOutcome } from "../src/turn-state.js";
+import type { CodexWork, GatewayState, Batch, Completion } from "../src/gateway-state.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=", "base64");
 async function fixture() {
   const root = await realpath(await mkdtemp(join(tmpdir(), "gateway-files-")));
   const home = join(root, "codex"); const spool = join(root, "state"); await mkdir(home); await mkdir(spool, { mode: 0o700 });
-  const route: GatewayRoute = { id: "route", sendblueId: "account", sender: "+15125550100", sendblueNumber: "+15125550200", agent: { id: "one", label: "One", cwd: root, threadId: "thread", model: "test" } };
+  const destination = { id: "conversation", namespace: "sendblue", properties: { accountId: "account", sender: "+15125550100", sendblueNumber: "+15125550200" } };
+  const binding = { sources: [{ id: "sendblue:account", namespace: "sendblue", destination }], target: { sshHost: null, threadId: "thread", cwd: root } };
+  const route: GatewayRoute = { id: "route", binding, adapters: [], agent: { id: "one", label: "One", cwd: root, threadId: "thread", model: "test" } };
   const session: GatewaySession = {
     serverInfo: { codexHome: home, platformFamily: "unix", platformOs: "macos" }, artifactBaseline: [],
     async resume() { return { thread: {} }; }, async admit() { return "turn"; },
@@ -31,11 +35,14 @@ async function fixture() {
   const connector: SendblueProvider = { signingSecret: "secret", inbound() { return undefined; }, callback() { return { status: "SENT" }; }, async send() { return { status: "accepted", providerHandle: "handle" }; }, async typing() {},
     async upload(path, name, mediaType) { uploads.push({ path, name, mediaType }); return `https://cdn.example/${uploads.length}`; },
   };
-  const files = new GatewayFilePlane(spool); const state: GatewayState = { version: 2, routes: {} }; const signal = new AbortController().signal;
+  const files = new GatewayFilePlane(spool); const state: GatewayState = { version: 3, nextDeliverySequence: 1, routes: {} }; const signal = new AbortController().signal;
   await files.cleanup(state); await files.reconcile(route, state, session, signal);
   const id = randomUUID(); const publication = await files.publication(route, id, session, signal);
-  const work: CodexWork = { kind: "codex", ownerBatchId: "batch", joinedBatchIds: [], batches: [], turnId: "turn", publicationIds: [id], artifactBaseline: [] };
-  return { root, home, spool, route, session, uploads, connector, files, publication, work, signal, async close() { await rm(root, { recursive: true, force: true }); } };
+  const work: CodexWork = { kind: "codex", ownerBatchId: "batch", joinedBatchIds: [], batches: [{ id: "batch", sourceId: "sendblue:account", openedAtMs: 0, quietDeadlineMs: 0, maximumDeadlineMs: 0, events: [{ messageHandle: "input", providerTimeMs: 0, receiptSequence: 0, text: "prompt" }] }], turnId: "turn", publicationIds: [id], artifactBaseline: [] };
+  return { async deliver(target: GatewayRoute, work: CodexWork, outcome: TurnOutcome) {
+    const staged = await files.stage(target, work, outcome, session, signal);
+    return prepareSendblueDelivery({ id: "completion", ...staged, expiresAtMs: Date.now() + 1000 }, connector, signal);
+  }, root, home, spool, route, session, uploads, connector, files, publication, work, signal, destination, async close() { await rm(root, { recursive: true, force: true }); } };
 }
 
 test("published and native artifacts deduplicate by bytes and preserve outside native sources", async () => {
@@ -43,12 +50,12 @@ test("published and native artifacts deduplicate by bytes and preserve outside n
   try {
     await writeFile(join(f.publication, "published.png"), PNG);
     const outside = join(f.root, "native.png"); await writeFile(outside, PNG);
-    const parts = await f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [{ id: "image", savedPath: outside }] }, f.session, f.connector, f.signal);
+    const parts = await f.deliver(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [{ id: "image", savedPath: outside }] });
     assert.equal(parts.length, 1); assert.equal(parts[0]!.payload.kind, "media"); assert.equal(f.uploads.length, 1);
     await f.files.release(f.route, f.work, f.session);
     assert.deepEqual(await readFile(outside), PNG);
     assert.deepEqual(await readFile(f.uploads[0]!.path), PNG);
-    await f.files.release(f.route, { kind: "delivery", sourceId: "sendblue:account", id: "delivery", batchIds: [], parts });
+    await f.files.release(f.route, parts.flatMap(part => part.payload.kind === "media" ? [{ ...part.payload, size: PNG.length }] : []));
     await assert.rejects(lstat(f.uploads[0]!.path));
   } finally { await f.close(); }
 });
@@ -59,7 +66,7 @@ test("all uploads finish before text freezes and an upload failure adds an omiss
     await writeFile(join(f.publication, "a.txt"), "first"); await writeFile(join(f.publication, "b.txt"), "second");
     const upload = f.connector.upload;
     f.connector.upload = async (...args) => { if (args[1] === "b.txt") throw new Error("rejected"); return upload(...args); };
-    const parts = await f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", finalText: "Answer", imageGenerations: [] }, f.session, f.connector, f.signal);
+    const parts = await f.deliver(f.route, f.work, { turnId: "turn", status: "completed", finalText: "Answer", imageGenerations: [] });
     assert.equal(parts.length, 2);
     assert.equal(parts[0]!.payload.kind, "text");
     if (parts[0]!.payload.kind === "text") assert.match(parts[0]!.payload.text, /b\.txt.*upload failed/);
@@ -73,7 +80,7 @@ test("native saved-path failures produce omissions without falling back to base6
   try {
     const original = join(f.root, "original.png"); await writeFile(original, PNG);
     const link = join(f.root, "link.png"); await symlink(original, link);
-    const parts = await f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [{ id: "image", savedPath: link, result: PNG.toString("base64") }] }, f.session, f.connector, f.signal);
+    const parts = await f.deliver(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [{ id: "image", savedPath: link, result: PNG.toString("base64") }] });
     assert.equal(f.uploads.length, 0); assert.equal(parts[0]!.payload.kind, "text");
     if (parts[0]!.payload.kind === "text") assert.match(parts[0]!.payload.text, /unsafe file/);
     assert.deepEqual(await readFile(original), PNG);
@@ -84,10 +91,10 @@ test("native saved-path failures produce omissions without falling back to base6
 test("terminal outcomes cover base64-only, empty, failed, interrupted, and admission notices", async () => {
   const f = await fixture();
   try {
-    const image = await f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [{ id: "native", result: PNG.toString("base64") }] }, f.session, f.connector, f.signal);
+    const image = await f.deliver(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [{ id: "native", result: PNG.toString("base64") }] });
     assert.equal(image.length, 1); assert.equal(image[0]!.payload.kind, "media");
     for (const [status, text] of [["completed", "Codex finished without a response."], ["failed", "Codex could not finish this request."], ["interrupted", "Codex stopped before finishing this request."]] as const) {
-      const parts = await f.files.delivery(f.route, { ...f.work, admissionFailed: true }, { turnId: "turn", status, imageGenerations: [] }, f.session, f.connector, f.signal);
+      const parts = await f.deliver(f.route, { ...f.work, admissionFailed: true }, { turnId: "turn", status, imageGenerations: [] });
       if (parts[0]!.payload.kind !== "text") assert.fail("expected text");
       assert.ok(parts[0]!.payload.text.startsWith(text)); assert.match(parts[0]!.payload.text, /It was not sent again/);
     }
@@ -98,7 +105,7 @@ test("long Unicode text respects the provider bound without splitting surrogate 
   const f = await fixture();
   try {
     const text = "😀".repeat(20000);
-    const parts = await f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", finalText: text, imageGenerations: [] }, f.session, f.connector, f.signal);
+    const parts = await f.deliver(f.route, f.work, { turnId: "turn", status: "completed", finalText: text, imageGenerations: [] });
     const chunks = parts.map((part) => { if (part.payload.kind !== "text") assert.fail("expected text"); return part.payload.text; });
     assert.equal(chunks.join(""), text); assert.ok(chunks.every((chunk) => chunk.length < 18996 && Buffer.from(chunk).toString("utf8") === chunk));
   } finally { await f.close(); }
@@ -121,10 +128,10 @@ test("connector-limit artifacts are omitted before upload", async () => {
   const f = await fixture();
   try {
     const source = await open(join(f.publication, "large.bin"), "w", 0o600); await source.truncate(100000001); await source.close();
-    const parts = await f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [] }, f.session, f.connector, f.signal);
+    const parts = await f.deliver(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [] });
     assert.equal(f.uploads.length, 0);
     if (parts[0]!.payload.kind !== "text") assert.fail("expected notice");
-    assert.match(parts[0]!.payload.text, /connector limit/);
+    assert.match(parts[0]!.payload.text, /capacity|connector limit/);
   } finally { await f.close(); }
 });
 
@@ -152,15 +159,17 @@ test("restart cleanup preserves active inputs and publications across routes unt
     for (const path of [one, two, hostOne, hostTwo]) await writeFile(path, "input");
     const secondId = randomUUID(); const secondPublication = await f.files.publication(f.route, secondId, f.session, f.signal);
     const batch = (id: string, localPath: string, hostPath: string): Batch => ({ id, sourceId: "sendblue:account", openedAtMs: 0, quietDeadlineMs: 1, maximumDeadlineMs: 2, events: [{ messageHandle: id, providerTimeMs: 0, receiptSequence: 0, text: "", attachment: { state: "ready", name: "input", mediaType: "text/plain", inputKind: "file", localPath, hostPath } }] });
-    const route = (work: CodexWork) => ({ binding: { sources: [{ kind: "sendblue" as const, id: "sendblue:account", accountId: "account", sender: "+15125550100", sendblueNumber: "+15125550200" }], target: { sshHost: null, threadId: "thread", cwd: f.root } }, nextSequence: 1, queue: [], receipts: [], active: work });
-    const state: GatewayState = { version: 2, routes: {
+    const route = (work: CodexWork) => ({ completions: {}, outbox: [], binding: { sources: f.route.binding.sources, target: { sshHost: null, threadId: "thread", cwd: f.root } }, nextSequence: 1, queue: [], receipts: [], active: { ...work, ownerBatchId: work.batches[0]!.id } });
+    const state: GatewayState = { version: 3, nextDeliverySequence: 1, routes: {
       one: route({ ...f.work, batches: [batch("one", one, hostOne)] }),
       two: route({ ...f.work, publicationIds: [secondId], batches: [batch("two", two, hostTwo)] }),
     } };
     const restart = new GatewayFilePlane(f.spool); await restart.cleanup(state); await restart.reconcile(f.route, state, f.session, f.signal);
     for (const path of [one, two, hostOne, hostTwo, f.publication, secondPublication]) await lstat(path);
     const output = join(f.spool, "outbox", "frozen"); await writeFile(output, "output");
-    state.routes.one!.active = { kind: "delivery", sourceId: "sendblue:account", id: "frozen", batchIds: ["one"], parts: [{ id: "part", status: "ready", payload: { kind: "media", localPath: output, name: "output", mediaType: "text/plain", mediaUrl: "https://cdn.example/frozen" } }] };
+    delete state.routes.one!.active;
+    state.routes.one!.completions.completion = { id: "completion", result: { status: "completed", text: "", notices: [] }, artifacts: [], expiresAtMs: Date.now() + 86400000 };
+    state.routes.one!.outbox.push({ destination: f.route.binding.sources[0]!.destination!, completionId: "completion", sequence: 0, prepared: true, reservedBytes: 2097152, kind: "delivery", sourceId: "sendblue:account", id: "frozen", batchIds: ["one"], parts: [{ id: "part", status: "ready", payload: { kind: "media", localPath: output, name: "output", mediaType: "text/plain", mediaUrl: "https://cdn.example/frozen" } }] });
     const afterFreeze = new GatewayFilePlane(f.spool); await afterFreeze.cleanup(state); await afterFreeze.reconcile(f.route, state, f.session, f.signal);
     for (const path of [one, hostOne, f.publication]) await assert.rejects(lstat(path));
     for (const path of [two, hostTwo, secondPublication, output]) await lstat(path);
@@ -171,7 +180,7 @@ test("local spool write failures block artifact preparation instead of becoming 
   const { chmod } = await import("node:fs/promises"); const f = await fixture();
   try {
     await writeFile(join(f.publication, "output.txt"), "output"); await chmod(join(f.spool, "outbox"), 0o500);
-    await assert.rejects(f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [] }, f.session, f.connector, f.signal),
+    await assert.rejects(f.deliver(f.route, f.work, { turnId: "turn", status: "completed", imageGenerations: [] }),
       (error: unknown) => (error as { code?: string }).code === "storage_failed");
     assert.equal(f.uploads.length, 0); assert.equal(await readFile(join(f.publication, "output.txt"), "utf8"), "output");
   } finally { await chmod(join(f.spool, "outbox"), 0o700); await f.close(); }
@@ -232,7 +241,7 @@ test("missing or unsafe publication preserves text and native artifacts", async 
       await rm(f.publication, { recursive: true });
       if (replacement === "symlink") await symlink(f.root, f.publication);
       const native = join(f.root, "native.png"); await writeFile(native, PNG);
-      const parts = await f.files.delivery(f.route, f.work, { turnId: "turn", status: "completed", finalText: "Answer", imageGenerations: [{ id: "native", savedPath: native }] }, f.session, f.connector, f.signal);
+      const parts = await f.deliver(f.route, f.work, { turnId: "turn", status: "completed", finalText: "Answer", imageGenerations: [{ id: "native", savedPath: native }] });
       assert.equal(parts.length, 2);
       assert.equal(parts[0]!.payload.kind, "text");
       if (parts[0]!.payload.kind === "text") assert.match(parts[0]!.payload.text, /^Answer\n\nFiles omitted:/);
@@ -274,8 +283,8 @@ test("concurrent reconciliation shares a failure and a healthy retry preserves r
     const failedSession: GatewaySession = { ...f.session, filesystem: async () => {
       failedCalls++; return new Promise((_resolve, reject) => { rejectRequest = reject; });
     } };
-    const state: GatewayState = { version: 2, routes: { route: {
-      binding: { sources: [{ kind: "sendblue", id: "sendblue:account", accountId: "account", sender: f.route.sender!, sendblueNumber: f.route.sendblueNumber! }],
+    const state: GatewayState = { version: 3, nextDeliverySequence: 1, routes: { route: {
+      completions: {}, outbox: [], binding: { sources: f.route.binding.sources,
         target: { sshHost: null, threadId: f.route.agent.threadId, cwd: f.route.agent.cwd } },
       nextSequence: 0, receipts: [], queue: [], active: f.work,
     } } };
@@ -293,4 +302,83 @@ test("concurrent reconciliation shares a failure and a healthy retry preserves r
     await files.reconcile(f.route, state, failedSession, f.signal);
     assert.equal(failedCalls, 1);
   } finally { await f.close(); }
+});
+
+test("staging retains exact canonical output without calling the provider or retaining mutable source bytes", async () => {
+  const f = await fixture();
+  try {
+    const source = join(f.publication, "result.txt");
+    await writeFile(source, "original");
+    f.connector.upload = async () => { throw new Error("provider is unavailable"); };
+    const staged = await f.files.stage(f.route, f.work, { turnId: "turn", status: "completed", finalText: "", imageGenerations: [] }, f.session, f.signal);
+    assert.equal(staged.result.text, "");
+    assert.deepEqual(staged.result.notices, []);
+    assert.equal(staged.artifacts.length, 1);
+    assert.equal(staged.artifacts[0]!.size, 8);
+    assert.equal(f.uploads.length, 0);
+    await writeFile(source, "changed");
+    await f.files.release(f.route, f.work, f.session);
+    assert.equal(await readFile(staged.artifacts[0]!.localPath, "utf8"), "original");
+    const completion: Completion = { id: "completion", ...staged, expiresAtMs: Date.now() + 86400000 };
+    const parts = await prepareSendblueDelivery(completion, f.connector, f.signal);
+    assert.equal(staged.result.text, "");
+    assert.deepEqual(staged.result.notices, []);
+    assert.equal(parts[0]!.payload.kind, "text");
+    if (parts[0]!.payload.kind === "text") assert.match(parts[0]!.payload.text, /upload failed/);
+  } finally { await f.close(); }
+});
+
+test("staging file count is bounded and reports omitted excess without provider calls", async () => {
+  const f = await fixture();
+  try {
+    for (let i = 0; i < 19; i++) await writeFile(join(f.publication, `${String(i).padStart(2, "0")}.txt`), `unique-${i}`);
+    const staged = await f.files.stage(f.route, f.work, { turnId: "turn", status: "completed", finalText: "answer", imageGenerations: [] }, f.session, f.signal);
+    assert.equal(staged.artifacts.length, 16);
+    assert.equal((await readdir(join(f.spool, "outbox"))).length, 16);
+    assert.ok(staged.result.notices.some(notice => /limit/.test(notice)));
+    assert.equal(staged.result.text, "answer");
+    assert.equal(f.uploads.length, 0);
+  } finally { await f.close(); }
+});
+
+test("staging aggregate byte limit omits a second individually valid file and removes its partial copy", async () => {
+  const f = await fixture();
+  try {
+    for (const name of ["a.bin", "b.bin"]) {
+      const source = await open(join(f.publication, name), "w", 0o600);
+      await source.truncate(60000000); await source.write(name, 0); await source.close();
+    }
+    const staged = await f.files.stage(f.route, f.work, { turnId: "turn", status: "completed", finalText: "answer", imageGenerations: [] }, f.session, f.signal);
+    assert.equal(staged.artifacts.length, 1);
+    assert.equal(staged.artifacts[0]!.size, 60000000);
+    assert.equal((await readdir(join(f.spool, "outbox"))).length, 1);
+    assert.ok(staged.result.notices.some(notice => /connector limit/.test(notice)));
+    assert.equal(staged.result.text, "answer");
+    assert.equal(f.uploads.length, 0);
+  } finally { await f.close(); }
+});
+
+
+test("staging caller cancellation propagates before work and after directory listing", async () => {
+  for (const duringListing of [false, true]) {
+    const f = await fixture();
+    try {
+      const controller = new AbortController();
+      const reason = new Error("test cancellation");
+      await writeFile(join(f.publication, "result.txt"), "result");
+      if (duringListing) {
+        const filesystem = f.session.filesystem.bind(f.session);
+        f.session.filesystem = async (method, params) => {
+          const result = await filesystem(method, params);
+          if (method === "fs/readDirectory") controller.abort(reason);
+          return result;
+        };
+      } else controller.abort(reason);
+      await assert.rejects(f.files.stage(f.route, f.work, {
+        turnId: "turn", status: "completed", finalText: "answer", imageGenerations: [],
+      }, f.session, controller.signal), error => error === reason);
+      assert.equal((await readdir(join(f.spool, "outbox"))).length, 0);
+      assert.equal(f.uploads.length, 0);
+    } finally { await f.close(); }
+  }
 });

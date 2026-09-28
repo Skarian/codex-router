@@ -67,6 +67,21 @@ async function sessionFixture(run: (session: DesktopSession, control: { accepted
   const session = new Constructor({ id: "a", label: "a", threadId: "thread", model: "model", cwd: home }, ipc as unknown as DesktopIpc, "owner", home);
   try { await run(session, control); } finally { await session.close(); await rm(home, { recursive: true, force: true }); }
 }
+test("Desktop history readiness can recover before admission without dispatch", async () => sessionFixture(async (session, control) => {
+  control.onHistory = () => { if (control.reads <= 2) throw new DesktopResponseError({ error: "Conversation must be resumed before loading history" }); };
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(session.resume(), (error: any) => error.code === "thread_busy" && !error.ambiguous);
+    assert.equal(control.starts, 0);
+  }
+  await session.resume();
+  await session.admit([], { clientUserMessageId: "ours" });
+  assert.equal(control.starts, 1);
+}));
+test("Desktop unrelated history errors remain protocol failures", async () => sessionFixture(async (session, control) => {
+  control.onHistory = () => { throw new DesktopResponseError({ error: "Unsupported history version" }); };
+  await assert.rejects(session.resume(), { code: "app_server_protocol_failed" });
+  assert.equal(control.starts, 0);
+}));
 test("Desktop acknowledgement before authoritative history waits without resending", async () => sessionFixture(async (session, control) => {
   await session.resume();
   assert.equal(await session.admit([{ type: "text", text: "test", text_elements: [] }], { clientUserMessageId: "ours" }), "accepted");

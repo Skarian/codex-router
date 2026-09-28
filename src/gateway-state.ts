@@ -4,7 +4,7 @@ import { open, readFile, rename, rm } from "node:fs/promises";
 import { acquireGatewayLock } from "./gateway-lock.js";
 import { join } from "node:path";
 import * as v from "valibot";
-import { routeSources, type GatewayConfig, type GatewayRoute } from "./config.js";
+
 import { RouterError } from "./errors.js";
 
 const str = v.pipe(v.string(), v.minLength(1));
@@ -15,34 +15,43 @@ const attachmentSchema = v.variant("state", [
   v.strictObject({ state: v.literal("omitted"), name: str, reason: v.picklist(["download_failed", "invalid_media", "copy_failed"]) }),
 ]);
 const eventSchema = v.strictObject({ messageHandle: str, providerTimeMs: number, receiptSequence: number, text: v.string(), attachment: v.optional(attachmentSchema) });
-const batchSchema = v.strictObject({ id: str, sourceId: str, openedAtMs: number, quietDeadlineMs: number, maximumDeadlineMs: number, events: v.array(eventSchema) });
+const batchSchema = v.strictObject({ deliveryReserved: v.optional(v.literal(true)), id: str, sourceId: str, openedAtMs: number, quietDeadlineMs: number, maximumDeadlineMs: number, events: v.array(eventSchema) });
 const intentSchema = v.strictObject({ batchId: str, clientUserMessageId: str, publicationId: v.optional(str), expectedTurnId: v.optional(str) });
 const executionBindingSchema = v.strictObject({ backend: v.picklist(["desktop", "proxy", "stdio"]), host: str, codexHome: str, threadId: str });
 const workSchema = v.strictObject({
   kind: v.literal("codex"), ownerBatchId: str, joinedBatchIds: v.array(str), batches: v.array(batchSchema), turnId: v.optional(str),
-  pendingAdmission: v.optional(intentSchema), binding: v.optional(executionBindingSchema), clientUserMessageId: v.optional(str), publicationIds: v.array(str), artifactBaseline: v.array(str), admissionFailed: v.optional(v.literal(true)),
+  pendingAdmission: v.optional(intentSchema), binding: v.optional(executionBindingSchema), clientUserMessageId: v.optional(str), publicationIds: v.array(str), artifactBaseline: v.array(str), admissionFailed: v.optional(v.literal(true)), failedBatchIds: v.optional(v.array(str)),
 });
 const payloadSchema = v.variant("kind", [
   v.strictObject({ kind: v.literal("text"), text: v.string() }),
   v.strictObject({ kind: v.literal("media"), localPath: str, name: str, mediaType: str, mediaUrl: str }),
 ]);
 const partSchema = v.strictObject({ id: str, payload: payloadSchema, status: v.picklist(["ready", "sending", "accepted", "failed", "skipped"]), callbackToken: v.optional(str), providerHandle: v.optional(str) });
-const deliverySchema = v.strictObject({ kind: v.literal("delivery"), id: str, sourceId: str, batchIds: v.array(str), parts: v.array(partSchema) });
-const sourceSchema = v.variant("kind", [
-  v.strictObject({ kind: v.literal("sendblue"), id: str, accountId: str, sender: str, sendblueNumber: str }),
-  v.strictObject({ kind: v.literal("https"), id: str, accountId: str }),
-]);
+const destinationSchema = v.strictObject({ id: str, namespace: str, properties: v.record(str, v.string()) });
+const sourceSchema = v.strictObject({ id: str, namespace: str, destination: v.optional(destinationSchema) });
+const artifactSchema = v.strictObject({ localPath: str, name: str, mediaType: str, size: number });
+const deliverySchema = v.strictObject({ kind: v.literal("delivery"), id: str, sourceId: str, batchIds: v.array(str), parts: v.array(partSchema),
+  destination: destinationSchema, completionId: str, sequence: number, prepared: v.boolean(), reservedBytes: number });
 const resultSchema = v.strictObject({ status: v.picklist(["completed", "failed", "interrupted"]), text: v.string(), notices: v.array(v.string()) });
 const receiptSchema = v.strictObject({ sourceId: str, externalId: str, receivedAtMs: number,
-  payloadHash: v.optional(str), batchId: v.optional(str), result: v.optional(resultSchema),
-  expiresAtMs: v.optional(number), reservedBytes: v.optional(number), turnId: v.optional(str) });
+  namespace: str, completionId: v.optional(str), payloadHash: v.optional(str), batchId: v.optional(str),
+  reservedBytes: v.optional(number) });
 const bindingSchema = v.strictObject({ sources: v.array(sourceSchema), target: v.strictObject({ sshHost: v.nullable(str), threadId: str, cwd: str }) });
+const completionFields = { id: str, artifacts: v.array(artifactSchema), turnId: v.optional(str), expiresAtMs: number };
+const completionSchema = v.strictObject({ ...completionFields, result: resultSchema });
 const routeSchema = v.strictObject({
   binding: bindingSchema, nextSequence: number, receipts: v.array(receiptSchema),
-  openBatch: v.optional(batchSchema), queue: v.array(batchSchema), active: v.optional(v.variant("kind", [workSchema, deliverySchema])),
+  openBatch: v.optional(batchSchema), queue: v.array(batchSchema), active: v.optional(workSchema),
+  completions: v.record(str, completionSchema), outbox: v.array(deliverySchema),
 });
 const pollingSchema = v.strictObject({ activationAtMs: number, completedThroughMs: number, routeActivationAtMs: v.record(str, number) });
-const stateSchema = v.strictObject({ version: v.literal(2), routes: v.record(str, routeSchema), polling: v.optional(v.record(str, pollingSchema)) });
+const stateSchema = v.strictObject({ version: v.literal(3), nextDeliverySequence: number, routes: v.record(str, routeSchema), polling: v.optional(v.record(str, pollingSchema)) });
+export type Destination = v.InferOutput<typeof destinationSchema>;
+export type SourceBinding = v.InferOutput<typeof sourceSchema>;
+export type StagedArtifact = v.InferOutput<typeof artifactSchema>;
+export type Completion = v.InferOutput<typeof completionSchema>;
+export interface StagedCompletion { result: RetainedResult; artifacts: StagedArtifact[] }
+export const OUTBOX_METADATA_BYTES = 2 * 1024 * 1024;
 export type Receipt = v.InferOutput<typeof receiptSchema>;
 export type RetainedResult = v.InferOutput<typeof resultSchema>;
 export type GatewayState = v.InferOutput<typeof stateSchema>;
@@ -58,11 +67,18 @@ export type DeliveryPart = v.InferOutput<typeof partSchema>;
 export const SEEN_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const ADMISSION_FAILURE = "Codex did not confirm the latest input. It was not sent again.";
 
-export function routeBinding(route: GatewayRoute): RouteBinding {
-  return { sources: routeSources(route), target: { sshHost: route.agent.sshHost ?? null, threadId: route.agent.threadId, cwd: route.agent.cwd } };
+/** Delivery pinning retains files and results, never an expired request identity. */
+export function receiptVisible(route: RouteState, receipt: Receipt, now: number): boolean {
+  if (!receipt.completionId) return true;
+  const completion = route.completions[receipt.completionId];
+  if (!completion) throw new RouterError("state_invalid", "Receipt completion is missing.");
+  return completion.expiresAtMs > now;
 }
 
 export function validateState(value: unknown): GatewayState {
+  if (value && typeof value === "object" && "version" in value && value.version !== 3) {
+    throw new RouterError("state_invalid", "Unsupported gateway state version. This build requires version 3.");
+  }
   const parsed = v.safeParse(stateSchema, value);
   if (!parsed.success) throw new RouterError("state_invalid", "The canonical gateway state is invalid.");
   const state = parsed.output;
@@ -72,36 +88,41 @@ export function validateState(value: unknown): GatewayState {
     }
   }
   const partIds = new Set<string>();
+  const jobIds = new Set<string>();
+  const sequences = new Set<number>();
   for (const route of Object.values(state.routes)) {
+    for (const [id, completion] of Object.entries(route.completions)) {
+      if (id !== completion.id || (Buffer.byteLength(completion.result.text) > 256 * 1024 || Buffer.byteLength(JSON.stringify(completion.result.notices)) > 4096)) throw new RouterError("state_invalid", "Canonical completion is invalid.");
+    }
     const work = route.active;
     const sources = route.binding.sources;
-    if (!sources.length || new Set(sources.map(s => s.id)).size !== sources.length) throw new RouterError("state_invalid", "Gateway source bindings are invalid.");
+    if (new Set(sources.map(s => s.id)).size !== sources.length) throw new RouterError("state_invalid", "Gateway source bindings are invalid.");
     const batches = [...(route.openBatch ? [route.openBatch] : []), ...route.queue, ...(work?.kind === "codex" ? work.batches : [])];
     for (const batch of batches) if (!sources.some(s => s.id === batch.sourceId)) throw new RouterError("state_invalid", "A batch has no configured source.");
-    if (work?.kind === "delivery" && !sources.some(s => s.id === work.sourceId)) throw new RouterError("state_invalid", "Delivery has no source.");
     const ids = new Set<string>();
     for (const receipt of route.receipts) {
       const key = JSON.stringify([receipt.sourceId, receipt.externalId]);
       if (ids.has(key)) throw new RouterError("state_invalid", "Duplicate submission receipt.");
       ids.add(key);
-      const retained = sources.find(s => s.id === receipt.sourceId)?.kind === "https" || receipt.payloadHash !== undefined || receipt.result !== undefined || receipt.reservedBytes !== undefined || receipt.expiresAtMs !== undefined;
+      if (receipt.namespace === "http" && !receipt.payloadHash) throw new RouterError("state_invalid", "HTTP receipt lost its exact payload identity.");
+      if (receipt.completionId && !route.completions[receipt.completionId]) throw new RouterError("state_invalid", "Receipt completion is missing.");
+      const retained = receipt.payloadHash !== undefined || receipt.completionId !== undefined || receipt.reservedBytes !== undefined;
       if (retained) {
         const batch = batches.find(b => b.id === receipt.batchId);
-        if (!receipt.payloadHash || !receipt.batchId || receipt.reservedBytes === undefined
-          || (receipt.result ? !receipt.expiresAtMs || !!batch : !!receipt.expiresAtMs || !batch || batch.sourceId !== receipt.sourceId
-            || batch.events.length !== 1 || batch.events[0]!.messageHandle !== receipt.externalId)) throw new RouterError("state_invalid", "Retained receipt has invalid execution references.");
-        if (receipt.result) {
-          if (Buffer.byteLength(receipt.result.text) > 256 * 1024 || Buffer.byteLength(JSON.stringify(receipt.result.notices)) > 4096
-            || Buffer.byteLength(JSON.stringify(receipt)) > receipt.reservedBytes) throw new RouterError("state_invalid", "Retained result exceeds its reserved capacity.");
+        if (!receipt.batchId || receipt.reservedBytes === undefined
+          || (receipt.completionId ? !!batch : !batch || batch.sourceId !== receipt.sourceId
+            || !batch.events.some(e => e.messageHandle === receipt.externalId))) throw new RouterError("state_invalid", "Retained receipt has invalid execution references.");
+        if (receipt.completionId) {
+          if (Buffer.byteLength(JSON.stringify(receipt)) > receipt.reservedBytes) throw new RouterError("state_invalid", "Retained receipt exceeds its reserved capacity.");
         } else {
+          if (receipt.namespace === "http" && batch!.events.length !== 1) throw new RouterError("state_invalid", "HTTP batch has multiple inputs.");
           const text = batch!.events[0]!.text;
           const hash = createHash("sha256").update(JSON.stringify([1, text])).digest("hex");
           const minimum = Buffer.byteLength(JSON.stringify({ text })) + 6 * 256 * 1024 + 16 * 1024;
-          if (receipt.payloadHash !== hash || receipt.reservedBytes < minimum) throw new RouterError("state_invalid", "Retained request identity or reservation is invalid.");
+          if (receipt.payloadHash !== undefined && (receipt.payloadHash !== hash || receipt.reservedBytes < minimum)) throw new RouterError("state_invalid", "Retained request identity or reservation is invalid.");
         }
       }
     }
-    for (const batch of batches) if (sources.find(s => s.id === batch.sourceId)?.kind === "https" && route.receipts.filter(r => r.batchId === batch.id && r.sourceId === batch.sourceId && !r.result).length !== 1) throw new RouterError("state_invalid", "Retained batch has no receipt.");
     const batchIds = new Set<string>();
     for (const batch of [...(route.openBatch ? [route.openBatch] : []), ...route.queue, ...(work?.kind === "codex" ? work.batches : [])]) {
       if (batchIds.has(batch.id) || !batch.events.length || batch.quietDeadlineMs < batch.openedAtMs || batch.maximumDeadlineMs < batch.openedAtMs) {
@@ -110,6 +131,7 @@ export function validateState(value: unknown): GatewayState {
       batchIds.add(batch.id);
     }
     if (work?.kind === "codex") {
+      if (work.failedBatchIds && (new Set(work.failedBatchIds).size !== work.failedBatchIds.length || work.failedBatchIds.some(id => !work.batches.some(batch => batch.id === id) || work.joinedBatchIds.includes(id)))) throw new RouterError("state_invalid", "Failed admission references are invalid.");
       if (work.binding && (work.binding.host !== (route.binding.target.sshHost ?? "local")
         || work.binding.threadId !== route.binding.target.threadId
         || (work.binding.backend === "desktop" && (!work.clientUserMessageId || work.binding.host !== "local")))) {
@@ -124,7 +146,10 @@ export function validateState(value: unknown): GatewayState {
         throw new RouterError("state_invalid", "The gateway admission references are invalid.");
       }
     }
-    if (work?.kind === "delivery") {
+    for (const work of route.outbox) {
+      if (jobIds.has(work.id) || sequences.has(work.sequence) || work.sequence >= state.nextDeliverySequence || (!work.prepared && work.parts.length)) throw new RouterError("state_invalid", "Outbox identity or preparation is invalid.");
+      jobIds.add(work.id); sequences.add(work.sequence);
+      if (!route.completions[work.completionId]) throw new RouterError("state_invalid", "Outbox completion is missing.");
       const ids = new Set<string>();
       let unfinished = false;
       let blocked = false;
@@ -142,22 +167,22 @@ export function validateState(value: unknown): GatewayState {
   return state;
 }
 
-export function bindRoutes(state: GatewayState, config: GatewayConfig): void {
+export function bindTargets(state: GatewayState, targets: readonly { id: string; binding: RouteBinding }[]): void {
   for (const [id, stored] of Object.entries(state.routes)) {
-    const current = config.routes.find(route => route.id === id);
+    const current = targets.find(route => route.id === id);
     const pending = [...(stored.openBatch ? [stored.openBatch] : []), ...stored.queue, ...(stored.active?.kind === "codex" ? stored.active.batches : [])];
     const pendingSources = new Set(pending.map(b => b.sourceId));
-    if (stored.active?.kind === "delivery") pendingSources.add(stored.active.sourceId);
-    if (pendingSources.size && (!current || JSON.stringify(stored.binding.target) !== JSON.stringify(routeBinding(current).target)
-      || [...pendingSources].some(sourceId => JSON.stringify(stored.binding.sources.find(s => s.id === sourceId)) !== JSON.stringify(routeSources(current).find(s => s.id === sourceId))))) {
+    if (stored.outbox.length && (!current || JSON.stringify(stored.binding.target) !== JSON.stringify(current.binding.target))) throw new RouterError("config_invalid", "A target with pending delivery changed.");
+    if (pendingSources.size && (!current || JSON.stringify(stored.binding.target) !== JSON.stringify(current.binding.target)
+      || [...pendingSources].some(sourceId => JSON.stringify(stored.binding.sources.find(s => s.id === sourceId)) !== JSON.stringify(current.binding.sources.find(s => s.id === sourceId))))) {
       throw new RouterError("config_invalid", "A route with pending work changed its recipient or Codex target.");
     }
   }
-  for (const route of config.routes) {
+  for (const route of targets) {
     const previous = Object.hasOwn(state.routes, route.id) ? state.routes[route.id] : undefined;
     state.routes[route.id] = previous
-      ? { ...previous, binding: routeBinding(route) }
-      : { binding: routeBinding(route), nextSequence: 0, receipts: [], queue: [] };
+      ? { ...previous, binding: route.binding }
+      : { binding: route.binding, nextSequence: 0, receipts: [], queue: [], outbox: [], completions: {} };
   }
 }
 
@@ -180,12 +205,13 @@ export class GatewayStore {
     await preparePrivateDirectory(directory);
     const unlock = await acquireGatewayLock(directory);
     try {
-      let state: GatewayState = { version: 2, routes: {} };
+      let state: GatewayState = { version: 3, nextDeliverySequence: 0, routes: {} };
       try {
         await validateExistingPrivatePaths([join(directory, "state.json")]);
         await ownerOnly(join(directory, "state.json"), false);
         state = validateState(JSON.parse(await readFile(join(directory, "state.json"), "utf8")));
       } catch (error) {
+        if (error instanceof RouterError && error.code === "state_invalid") throw error;
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new RouterError("state_invalid", "The canonical gateway state cannot be loaded.", { cause: error });
       }
       return new GatewayStore(directory, state, unlock, beforeWrite);
@@ -206,7 +232,11 @@ export class GatewayStore {
       if (result instanceof Promise) throw new RouterError("state_invalid", "A gateway state transaction must be synchronous.");
       const cutoff = Date.now() - SEEN_RETENTION_MS;
       for (const route of Object.values(draft.routes)) {
-        route.receipts = route.receipts.filter(r => r.reservedBytes !== undefined ? !r.expiresAtMs || r.expiresAtMs > Date.now() : r.receivedAtMs >= cutoff);
+        route.receipts = route.receipts.filter(r => r.reservedBytes !== undefined ? receiptVisible(route, r, Date.now()) : r.receivedAtMs >= cutoff);
+      }
+      for (const route of Object.values(draft.routes)) {
+        const pinned = new Set(route.outbox.map(job => job.completionId));
+        for (const [id, completion] of Object.entries(route.completions)) if (!pinned.has(id) && completion.expiresAtMs <= Date.now()) delete route.completions[id];
       }
       validateState(draft);
       await this.beforeWrite?.();
@@ -234,12 +264,10 @@ export class GatewayStore {
 }
 
 export function unresolved(state: GatewayState): { unresolved: Array<{ routeId: string; effectId: string; kind: "codex_admission" | "send" }> } {
-  return { unresolved: Object.entries(state.routes).flatMap<{ routeId: string; effectId: string; kind: "codex_admission" | "send" }>(([routeId, route]) => {
-    if (route.active?.kind === "codex" && route.active.pendingAdmission) return [{ routeId, effectId: route.active.pendingAdmission.clientUserMessageId, kind: "codex_admission" as const }];
-    if (route.active?.kind === "delivery") return route.active.parts.filter((part) => part.status === "sending")
-      .map((part) => ({ routeId, effectId: part.id, kind: "send" as const }));
-    return [];
-  }) };
+  return { unresolved: Object.entries(state.routes).flatMap(([routeId, route]) => [
+    ...(route.active?.pendingAdmission ? [{ routeId, effectId: route.active.pendingAdmission.clientUserMessageId, kind: "codex_admission" as const }] : []),
+    ...route.outbox.flatMap(job => job.parts.filter(part => part.status === "sending").map(part => ({ routeId, effectId: part.id, kind: "send" as const }))),
+  ]) };
 }
 
 export function settlePart(part: DeliveryPart, delivery: Delivery, outcome: { status: "accepted"; providerHandle: string } | { status: "failed" }): void {
@@ -252,26 +280,14 @@ export function settlePart(part: DeliveryPart, delivery: Delivery, outcome: { st
 export function resolveEffect(state: GatewayState, routeId: string, effectId: string, resolution: "failed" | "accepted", providerHandle?: string) {
   const active = state.routes[routeId]?.active;
   if (active?.kind === "codex" && active.pendingAdmission?.clientUserMessageId === effectId && resolution === "failed") {
+    active.failedBatchIds = [...(active.failedBatchIds ?? []), active.pendingAdmission.batchId];
+    if (active.pendingAdmission.publicationId) active.publicationIds = active.publicationIds.filter(id => id !== active.pendingAdmission!.publicationId);
     delete active.pendingAdmission; active.admissionFailed = true;
-  } else if (active?.kind === "delivery") {
-    const part = active.parts.find((part) => part.id === effectId && part.status === "sending");
+  } else {
+    const delivery = state.routes[routeId]?.outbox.find(job => job.parts.some(part => part.id === effectId));
+    const part = delivery?.parts.find((part) => part.id === effectId && part.status === "sending");
     if (!part || (resolution === "accepted" && !providerHandle)) throw new RouterError("effect_not_found", "The unresolved effect was not found.");
-    settlePart(part, active, resolution === "accepted" ? { status: "accepted", providerHandle: providerHandle! } : { status: "failed" });
-  } else throw new RouterError("effect_not_found", "The unresolved effect was not found.");
-  return { type: "resolved", routeId, effectId, resolution, ...(resolution === "accepted" ? { providerHandle } : {}) };
-}
-
-/** Persist activation before network intake; existing checkpoints never reset at startup. */
-export function initializePolling(state: GatewayState, config: GatewayConfig, now: number): void {
-  const polling = state.polling ??= {};
-  for (const account of config.sendblue) {
-    if (account.mode === "webhook") continue;
-    const initial = account.pollStart === undefined ? now : Date.parse(account.pollStart);
-    if (!Number.isSafeInteger(initial) || initial < 0 || initial > now) throw new RouterError("config_invalid", "Polling start must not be in the future.");
-    const existing = polling[account.id];
-    const poll = polling[account.id] ??= { activationAtMs: initial, completedThroughMs: initial, routeActivationAtMs: {} };
-    for (const route of config.routes.filter(route => route.sendblueId === account.id)) {
-      poll.routeActivationAtMs[route.id] ??= existing ? now : initial;
-    }
+    settlePart(part, delivery!, resolution === "accepted" ? { status: "accepted", providerHandle: providerHandle! } : { status: "failed" });
   }
+  return { type: "resolved", routeId, effectId, resolution, ...(resolution === "accepted" ? { providerHandle } : {}) };
 }

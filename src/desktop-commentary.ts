@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { toNamespacedPath } from "node:path";
 
 const MAX_SCAN = 8 * 1024 * 1024;
 const MAX_LINE = 2 * 1024 * 1024;
@@ -18,7 +19,7 @@ export class DesktopCommentary {
   async poll(path: string, turnId: string, eligible: readonly Record<string, any>[]): Promise<Array<{ itemId: string; text: string }>> {
     try {
       const canonical = await realpath(path);
-      if (canonical !== path) throw new Error("rollout_path_changed");
+      if (toNamespacedPath(canonical) !== toNamespacedPath(path)) throw new Error("rollout_path_changed");
       const before = await lstat(path);
       if (!before.isFile() || before.isSymbolicLink()) throw new Error("unsafe_rollout");
       const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));

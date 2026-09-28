@@ -1,129 +1,212 @@
-# HTTPS connector
+# HTTP API and LAN HTTPS
 
-The gateway accepts text requests through HTTPS and returns completed commentary through SSE. Each request has a durable final result.
-
-SendBlue and HTTPS can share a configured Codex chat. Each source receives its own replies. The agent shares conversation context; clients do not receive a synchronized transcript or messages submitted elsewhere.
+The optional HTTP connector exposes configured agents through a local API. It supports discovery, durable requests, semantic progress, results, and cancellation.
+The router listens only on `127.0.0.1`. An optional external proxy supplies HTTPS and authentication for LAN clients.
+CLI operation and SendBlue polling require neither the listener nor the proxy.
 
 ## Configuration
 
-Add an HTTPS account and bind it to a route in `~/.codex-router/config.toml`:
+Add this table to `~/.codex-router/config.toml`:
 
 ```toml
-[gateway]
-listen_port = 8787
-listen_host = "192.168.1.50"
-state_dir = "/absolute/path/to/gateway-state"
-
-[gateway.tls]
-cert = "/absolute/path/to/server.crt"
-key = "/absolute/path/to/server.key"
-
-[[gateway.https]]
-id = "device"
-bearer_token_env = "CODEX_ROUTER_HTTPS_TOKEN"
-
-[[gateway.routes]]
-id = "assistant"
-agent = "assistant"
-https = "device"
+[gateway.http]
+port = 8788
 ```
 
-The agent must already exist in the configuration. Use either `bearer_token` or `bearer_token_env`, never both. Protect direct tokens with owner-only file permissions. Each account needs a distinct token.
+The port defaults to 8787. Every configured agent becomes available through the API without another route or account table.
+Local programs can access the API without credentials. Proxy-authenticated clients share access to all agents, requests, results, and cancellation.
+The API does not provide per-client access controls or a synchronized chat transcript.
 
-To share a SendBlue route, add `https = "device"` to that route. Keep its existing SendBlue fields. HTTPS-only configurations need neither SendBlue credentials nor `public_url`.
-
-Replace `192.168.1.50` with the gateway computer's private IPv4 address. Reserve that address in your DHCP configuration so clients retain a stable destination.
-
-The gateway serves HTTPS directly when `gateway.tls` contains certificate and key paths. Both paths must be absolute. The certificate must cover the URL's hostname or IP address in its Subject Alternative Name. Keep the private key on the gateway computer with owner-only permissions.
-
-Clients must trust the certificate issuer. For a private CA, copy its **certificate** to each client through a trusted channel. Keep the CA private key off clients. The ESP32 example can embed the CA certificate, as described below.
-
-Without `listen_host`, the listener binds to `127.0.0.1`. Loopback permits HTTP for local tools. A nonloopback listener requires TLS and a specific private IPv4 address. Wildcard and public addresses are rejected. A tunnel or proxy is not required for LAN access.
-
-Binding selects a network interface; it does not replace a firewall. Permit access only from your intended LAN clients. Do not forward the port from your internet router. SendBlue polling uses outbound connections and does not need this listener to be publicly reachable.
-
-Verify the certificate and endpoint from a LAN client:
+Start the gateway and inspect its catalog:
 
 ```sh
-curl --cacert /path/to/ca.crt https://192.168.1.50:8787/readyz
+codex-router gateway
 ```
 
-Do not use `--insecure` or disable certificate verification. Requests and SSE use the same trusted HTTPS connection.
+In another terminal:
+
+```sh
+curl http://127.0.0.1:8788/v1/agents
+```
+
+The response contains agent IDs and labels. It excludes credentials and filesystem paths.
+The backend requires `Host: 127.0.0.1:<port>`. It ignores forwarded headers for authorization and grants no CORS access.
+Use the literal loopback address, not `localhost` or a LAN address.
+
+## LAN HTTPS with Caddy
+
+[Caddy](https://caddyserver.com/docs/install) is an optional external program. It manages certificates and authentication without adding them to the router configuration.
+Clients still need its public CA certificate. Certificate generation alone cannot establish trust on another device.
+
+The example preserves LAN port 8787 and sends backend traffic to loopback port 8788.
+Replace `192.168.1.212` with your Windows PC's reserved LAN address.
+
+Generate a password hash interactively:
+
+```sh
+caddy hash-password
+```
+
+Save this Caddyfile, with the generated hash in place of `REPLACE_WITH_PASSWORD_HASH`:
+
+```caddyfile
+{
+    auto_https disable_redirects
+    servers {
+        protocols h1 h2
+    }
+}
+
+https://192.168.1.212:8787 {
+    bind 192.168.1.212
+    tls internal
+    basic_auth {
+        router REPLACE_WITH_PASSWORD_HASH
+    }
+    reverse_proxy 127.0.0.1:8788 {
+        header_up Host {upstream_hostport}
+    }
+}
+```
+
+Validate and start Caddy:
+
+```sh
+caddy validate --config Caddyfile --adapter caddyfile
+caddy run --config Caddyfile --adapter caddyfile
+```
+
+This recipe opens no HTTP redirect port or HTTP/3 listener. Caddy handles SSE without extra buffering configuration.
+The recipe adds no proxy retries. Clients retry uncertain requests with their original UUID and exact payload.
+See [Caddy proxy behavior](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy) and [Basic authentication](https://caddyserver.com/docs/caddyfile/directives/basic_auth).
+
+Caddy stores its private CA under its service user's data directory. Keep that user and directory stable across restarts and updates.
+For a normal Windows user, the default data directory is `%APPDATA%\Caddy`.
+The public root is `pki\authorities\local\root.crt` under that directory.
+An `XDG_DATA_HOME` override or different startup identity changes the location. Inspect `caddy environ` when necessary. See [Caddy data directories](https://caddyserver.com/docs/conventions#data-directory).
+
+Copy only `root.crt` to the client through a trusted channel. Keep all private keys on the server.
+A client can trust this root for later server certificate renewals under the same CA.
+Replacing the CA requires client trust updates. See [Caddy local HTTPS](https://caddyserver.com/docs/automatic-https#local-https).
+
+Verify the proxy from another computer:
+
+```sh
+curl --cacert /path/to/root.crt --user router \
+  https://192.168.1.212:8787/v1/agents
+```
+
+Curl prompts for the password. On Windows, use `curl.exe` to avoid shell aliases.
+Do not disable certificate verification or follow redirects with credentials.
+Keep the PC awake and reserve its LAN IP. Restrict firewall access to the intended LAN clients.
+
+For automatic startup, run both Caddy and the router under the same Windows user.
+An existing Task Scheduler task can start a script that launches both processes and handles their exit status.
+A task triggered at sign-in does not provide availability before sign-in.
+Test each process restart and both startup orders before relying on unattended operation.
+The router does not install or manage a Windows service.
 
 ## Submit and retrieve
 
-Create a UUID before sending a request. Save it with the exact prompt before the first attempt.
+Create a UUID and save it with the exact prompt before the first attempt.
+Use an agent ID from `GET /v1/agents`:
 
 ```http
-POST /v1/routes/assistant/requests
-Authorization: Bearer <token>
+POST /v1/agents/home/requests
 Content-Type: application/json
 
 {"request_id":"60fb8888-728b-4e71-953a-b89c3a8f620b","text":"Explain the current project status."}
 ```
 
-A `202` response confirms durable admission to the queue. It does not confirm that Codex has started work. The response includes a relative `result_url`.
+The LAN client also supplies its proxy credentials. The router itself requires no bearer token.
+A `202` response confirms durable intake, not completed execution. It includes a relative `result_url`.
 
 ```http
-GET /v1/routes/assistant/requests/60fb8888-728b-4e71-953a-b89c3a8f620b
-Authorization: Bearer <token>
+GET /v1/agents/home/requests/60fb8888-728b-4e71-953a-b89c3a8f620b
 ```
 
-Retry a lost POST response with the same UUID and exact text. Matching retries return the existing request. Changed text with the same UUID returns `409`.
+Retry a lost POST response with the same UUID and exact text. Matching retries return the existing request.
+Changed text with the same UUID returns `409`. Never generate a new UUID merely because an acknowledgement was lost.
 
-Possible states are `queued`, `running`, `unresolved`, `completed`, `failed`, and `interrupted`. A `processing` field reports blocked or retrying work. A `blocked_by: "delivery"` field identifies an earlier outbound delivery that holds the shared queue.
+Requests report queued, running, unresolved, or terminal state. Diagnostic fields distinguish execution errors from pending delivery.
+Terminal output contains status, text, and notices. Empty text stays empty.
+HTTP accepts text only. It accepts no attachments, arbitrary URLs, callback addresses, or caller-selected execution configuration.
+Unsupported output attachments produce notices.
 
-Terminal results contain `status`, `text`, and `notices`. Empty text stays empty. Attachment output is not uploaded by HTTPS; supported omission notices identify excluded native images. HTTPS accepts no input attachments, arbitrary URLs, callback addresses, or caller-selected execution settings.
-
-All reads require the account token. Unknown or inaccessible routes and requests return `404`. Token rotation preserves ownership because ownership uses the configured account ID.
+A follow-up steers the agent's active turn, including a turn started through another connector.
+Participating requests receive the shared final response. This API does not synchronize messages submitted through other clients.
 
 ## Receive events
 
 ```http
-GET /v1/routes/assistant/requests/60fb8888-728b-4e71-953a-b89c3a8f620b/events
-Authorization: Bearer <token>
+GET /v1/agents/home/requests/60fb8888-728b-4e71-953a-b89c3a8f620b/events
 Accept: text/event-stream
 Last-Event-ID: <last-consumed-frame-id>
 ```
 
-Events are `status`, `commentary`, `terminal`, and `reset`. Commentary represents a completed message, not tokens or draft text. Terminal output is published only after its result is durable.
+Events are `status`, `reasoning`, `commentary`, `terminal`, and `reset`.
+Reasoning events contain backend-published summaries. Commentary contains completed messages, not draft text or individual tokens.
+Backend capability limits still apply. A missing progress capability does not invalidate a final response.
 
-Each encoded SSE frame is at most 4096 bytes. Large completed messages use multiple transport parts:
+Each encoded SSE frame is at most 4096 bytes. Large semantic messages use multiple transport parts:
 
 ```json
-{"message_id":"opaque","part":0,"end":false,"field":"text","text":"A piece of a completed message"}
+{"message_id":"opaque","part":0,"end":false,"field":"text","text":"Part of a completed message"}
 ```
 
-`field` is `text` or `metadata`. Metadata parts contain serialized JSON. Assemble each field in part order. The final part has `end: true`. These parts belong to one logical message; they are not separate agent messages.
+`field` is `text` or `metadata`. Metadata parts contain serialized JSON.
+Assemble each field in part order. The final part has `end: true`.
+Save the cursor only after consuming its frame. On reconnect, send that cursor as `Last-Event-ID`.
 
-Save the SSE cursor only after consuming its frame. On reconnect, send it as `Last-Event-ID`. A `reset` means replay continuity is unavailable. Discard incomplete message content in both the parser and its display or storage sink.
+A `reset` means replay continuity is unavailable. Discard incomplete content in both the parser and its display or storage sink.
+Progress history is temporary. Restart or eviction can remove earlier summaries and commentary.
+Final results remain available through GET and terminal replay. Replay never starts another turn.
 
-Progress history is temporary and bounded. Restart or eviction can lose earlier commentary. Final results remain available through GET and terminal replay. Neither reconnect nor replay starts another Codex turn.
+A terminal message ends the stream after its last part. Stop reconnecting after that point.
+Heartbeat comments arrive every 15 seconds. Slow clients can lose their stream without stopping execution.
 
-A terminal message ends the stream after its last part. Stop reconnecting at that point. Heartbeat comments arrive every 15 seconds. Slow clients can lose their stream; execution continues independently.
+## Cancel a turn
 
-## Limits and recovery
+Use the current request's `turn_id` as `expected_turn_id`:
 
-Prompts are limited to 64 KiB of decoded UTF-8 text. HTTP bodies are limited to 512 KiB. Semantic output messages are limited to 256 KiB.
+```http
+POST /v1/agents/home/cancel
+Content-Type: application/json
 
-Terminal results and request identities remain available for 30 days. The response includes `expires_at` in Unix milliseconds. Do not retry an old request as new work after this guarantee expires.
+{"expected_turn_id":"THE_OBSERVED_TURN_ID"}
+```
 
-Defaults are 1024 retained requests and a 8 MiB retained-record budget. Configure these with `max_requests` and `retained_bytes`. Pending requests reserve room for their largest permitted result, so the byte limit can reject admission before the count limit.
+Cancellation affects the shared turn and its participants. It does not remove queued input or resolve provider deliveries.
 
-Capacity rejection returns `429`. Existing duplicate lookups remain available at capacity. Pending and unresolved work never expires automatically. These limits do not bound SendBlue records or the entire process heap.
+| Response | Meaning |
+| --- | --- |
+| `202 interrupt_requested` | Codex acknowledged the request; observe the eventual result |
+| `200 already_finished` | The expected turn is finished and no successor is active |
+| `409` | Stale turn identity, unresolved admission, or unsupported interruption |
+| `503 interrupt_uncertain` | The acknowledgement is unknown; inspect status before another action |
 
-SSE permits 32 streams globally and four per account. The replay budget is 2 MiB or 128 messages per request, with a 16 MiB global limit.
+The router never substitutes a newer turn for the supplied ID. A disconnected SSE client does not cancel execution.
 
-A route processes one active turn. HTTPS follow-ups steer that turn without waiting for its response. This also applies when SendBlue or another client started the turn. Each participating HTTPS request retains the shared final response. Commentary after admission streams to each participating HTTPS request. Other Desktop or CLI users can also steer the shared conversation.
+## Limits and upgrades
 
-## Desktop commentary
+Prompts permit 64 KiB of decoded UTF-8 text. Request bodies permit 512 KiB. Semantic messages permit 256 KiB.
+Terminal results remain available for 30 days. `expires_at` gives the deadline in Unix milliseconds.
+Do not retry expired requests as new work.
 
-Desktop commentary requires both an ordered snapshot after the admitted input and a matching persisted completion record. The reader supports paginated rollout history. It has bounded scans and fails closed for commentary if the record is unavailable or invalid.
+Defaults are 1024 retained requests and an 8 MiB result budget. Reservations can reject intake before the request count reaches its limit.
+Capacity rejection returns `429`. Matching duplicate lookups remain available at capacity.
+Pending and unresolved requests do not expire automatically.
 
-A running request can report `commentary.state` and its limitation reason. Commentary observation failure does not fail an otherwise valid final response. Direct and SSH sessions use native completed-item notifications.
+The semantic replay budget is 2 MiB or 128 messages per request, with 16 MiB globally.
+HTTP frame indexes have a separate 2 MiB budget. Stream quotas and write backpressure bound live connections.
 
-See [release qualification](release-qualification.md) for the macOS, Windows, and Linux results. Those results apply to the tested Desktop versions and history modes.
+For old test configuration or state, use [test installation replacement](gateway.md#replace-a-test-installation).
+For the ESP32 client, resolve pending old-format requests before changing the server endpoint or firmware.
+See [the ESP-IDF example](../examples/esp32-https/README.md) for trust, credentials, persistent identities, and reconnect behavior.
 
-## ESP32 example
+## Optional provider webhooks
 
-See [the ESP-IDF example](../examples/esp32-https/README.md) for bounded parsing, TLS, durable UUID storage, and reconnect behavior. Host parser tests do not replace firmware compilation or device testing.
+SendBlue polling needs no inbound listener. Webhook deployments use a separate explicitly configured public HTTPS proxy.
+The agent API requires edge authentication. SendBlue webhook and callback paths retain their application signing-secret checks.
+Do not apply Basic authentication to provider paths that cannot supply it.
+See [SendBlue webhook mode](sendblue.md#optional-webhook-mode).

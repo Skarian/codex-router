@@ -46,27 +46,26 @@ async function fixture() {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "gateway-owner-routing-")));
   const config = parseConfig(`
 [[agents]]
-id="agent"
+id="route"
 label="Agent"
 cwd="/tmp"
 thread_id="thread"
 model="test"
 [gateway]
-listen_port=8787
-public_url="https://example.com"
 state_dir=${JSON.stringify(directory)}
+[gateway.http]
+api=false
 [[gateway.sendblue]]
+public_url="https://example.com"
 mode="webhook"
 id="account"
 api_key_id_env="KEY"
 api_secret_key_env="SECRET"
 webhook_secret_env="SIGNING"
-[[gateway.routes]]
-id="route"
-sendblue="account"
+[[gateway.sendblue.conversations]]
 sender="+15125550100"
 sendblue_number="+15125550200"
-agent="agent"
+agent="route"
 `).gateway!;
   let store = await GatewayStore.open(directory);
   let next = new OwnerSession();
@@ -93,12 +92,12 @@ agent="agent"
     async cleanup() {}, async reconcile() {},
     async prepareBatch(_route, batch) { return batch; },
     async publication() { return "/tmp/owner-publication"; },
-    async delivery(_route, _work, outcome) {
+    async stage(_route, _work, outcome) {
       deliveries.push(outcome);
-      return [{ id: `part-${deliveries.length}`, status: "ready", payload: { kind: "text", text: outcome.finalText ?? "empty" } }];
+      return { result: { status: outcome.status, text: outcome.finalText ?? "empty", notices: [] }, artifacts: [] };
     },
     async release(_route, work, session) {
-      if (work.kind === "codex") {
+      if ("kind" in work) {
         assert.equal((session as OwnerSession).closed, false, "host cleanup needs the execution session");
         releaseFinished = true;
       }
@@ -123,8 +122,8 @@ agent="agent"
     set unresolvedSend(value: boolean) { unresolvedSend = value; },
     get releaseFinished() { return releaseFinished; },
     set retryDelayMs(value: number) { retryDelayMs = value; },
-    async receive(handle: string, target = gateway) {
-      await target.receive("account", { messageHandle: handle, sender: "+15125550100", sendblueNumber: "+15125550200", providerTimeMs: now, text: handle });
+    async receive(handle: string, target = gateway, attachment = false) {
+      await target.receive("account", { messageHandle: handle, sender: "+15125550100", sendblueNumber: "+15125550200", providerTimeMs: now, text: handle, ...(attachment ? { attachment: { sourceUrl: "https://fixture.test/file", name: "file" } } : {}) });
       now += 5001; target.wake("route"); await target.idle();
     },
     async close() { for (const item of gateways) await item.close(); await store.close(); await rm(directory, { recursive: true, force: true }); },
@@ -241,9 +240,9 @@ test("prepared response releases execution ownership while provider acceptance s
     await f.gateway.start(); await f.receive("first"); f.session.complete();
     await until(() => f.sends.length === 1, "response should be submitted"); await f.gateway.idle();
     assert.ok(f.releaseFinished); assert.ok(f.session.closed);
-    const active = f.store.snapshot().routes.route!.active;
-    assert.equal(active?.kind, "delivery");
-    if (active?.kind === "delivery") assert.equal(active.parts[0]!.status, "sending");
+    assert.equal(f.store.snapshot().routes.route!.active, undefined);
+    const delivery = f.store.snapshot().routes.route!.outbox[0]!;
+    assert.equal(delivery.parts[0]!.status, "sending");
   } finally { await f.close(); }
 });
 
@@ -275,7 +274,7 @@ test("processing status requires authentication and separates retrying execution
     assert.equal((await fetch(`${url}/statusz`, { headers: { "sb-signing-secret": "wrong" } })).status, 401);
     const response = await fetch(`${url}/statusz`, { headers: { "sb-signing-secret": "fixture" } });
     assert.equal(response.status, 200); assert.equal(response.headers.get("cache-control"), "no-store");
-    assert.deepEqual(await response.json(), { ready: true, routes: [{ routeId: "route", state: "retrying", code: "app_server_connect_failed" }] });
+    assert.deepEqual(await response.json(), { ready: true, agents: [{ agentId: "route", state: "retrying", code: "app_server_connect_failed" }], deliveries: [] });
     assert.deepEqual(await (await fetch(`${url}/readyz`)).json(), { ready: true });
   } finally { await closeGatewayServer(server); await f.close(); }
 });
@@ -294,7 +293,8 @@ test("Desktop preflight failure after attachment preparation leaves input queued
       assert.equal(saved.routes.route.active, undefined);
       throw new RouterError("app_server_disconnected", "preflight disconnected before input submission");
     };
-    await f.gateway.start(); await f.receive("first");
+    await f.gateway.start(); await f.receive("first", f.gateway, true);
+    await until(() => f.gateway.processingStatus()[0]!.state !== "running", "attachment preparation must reach preflight");
     assert.equal(published, false); assert.equal(f.session.admissions.length, 0);
     assert.equal(f.store.snapshot().routes.route!.active, undefined);
     assert.equal(f.store.snapshot().routes.route!.queue.length, 1);
@@ -349,24 +349,27 @@ test("authenticated processing status distinguishes an active send from unresolv
     const address = server.address() as { port: number };
     const response = await fetch(`http://127.0.0.1:${address.port}/statusz`, { headers: { "sb-signing-secret": "fixture" } });
     assert.equal(response.status, 200);
-    return (await response.json() as { routes: Array<{ state: string }> }).routes[0]!.state;
+    const result = await response.json() as { agents: Array<{ state: string }>; deliveries: Array<{ state: string }> };
+    return result.deliveries[0]?.state ?? result.agents[0]!.state;
   }
   try {
     await gateway.start(); await listenGateway(server, 0); await f.receive("first"); f.session.complete();
     await until(() => physicalSends === 1, "the provider request should start");
-    assert.equal(await status(), "running");
+    assert.ok(["pending", "running"].includes(await status()));
     finishSend(); await gateway.idle();
     assert.equal(await status(), "unresolved");
     await closeGatewayServer(server); await gateway.close(); await f.reopenStore();
     gateway = f.create(); server = createGatewayServer(gateway);
     await gateway.start(); await gateway.idle(); await listenGateway(server, 0);
     assert.equal(await status(), "unresolved"); assert.equal(physicalSends, 1);
-    const delivery = f.store.snapshot().routes.route!.active;
+    const delivery = f.store.snapshot().routes.route!.outbox[0];
     assert.equal(delivery?.kind, "delivery");
     if (delivery?.kind !== "delivery") assert.fail("expected unresolved delivery");
     const part = delivery.parts[0]!;
     await gateway.callback("account", part.id, part.callbackToken!, { status: "DELIVERED", providerHandle: "accepted" });
-    await gateway.idle(); assert.equal(await status(), "idle"); assert.equal(physicalSends, 1);
+    await gateway.idle();
+    await until(() => !f.store.snapshot().routes.route!.outbox.length, "settled delivery should leave outbox");
+    assert.equal(await status(), "idle"); assert.equal(physicalSends, 1);
   } finally {
     finishSend?.();
     if (server.listening) await closeGatewayServer(server);

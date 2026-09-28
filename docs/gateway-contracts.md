@@ -1,109 +1,127 @@
 # Gateway technical contracts
 
-This reference describes the implemented boundaries. Start with [gateway operation](gateway.md) for setup and recovery procedures.
-The [state schemas](https://github.com/Skarian/codex-router/blob/main/src/gateway-state.ts) define persisted records and validation.
+This reference describes the request runtime and connector boundaries. Start with [gateway operation](gateway.md) for procedures.
+The current implementation uses one state store and writer. It does not require a database or message broker.
 
-## Sources and routes
+## Ownership and identities
 
-Each route binds source identities to one execution target: host, chat ID, and working directory.
-SendBlue identities include the account, sender, and receiving line. HTTPS identities include the account and route.
-Credentials do not enter these bindings.
+The catalog resolves agent IDs and exposes public labels. Execution sessions discover owners, admit or steer supplied intents, observe output, and interrupt expected turns.
+The optional request runtime owns durable intake, execution intents, recovery, results, semantic progress, and delivery jobs.
+The gateway hosts that runtime and the connectors. Connectors do not independently submit model turns.
 
-A route can accept both connectors. One execution target cannot appear in competing routes.
-Pending work prevents changes to its source identity or target.
-Credential rotation does not change identity when the account ID stays the same.
+CLI commands use execution sessions directly. They do not open the gateway store or promise crash-resumable request receipts.
+The router rejects duplicate execution targets. Backend ownership still governs concurrent independent CLI and Desktop processes.
 
-SendBlue deduplicates by account and complete provider message handle across route records.
-HTTPS deduplicates by account, route, request ID, and payload identity.
-A reused HTTPS request ID with different text returns `409`.
+HTTP uses a shared origin namespace. Its request identity is the agent ID and request UUID.
+SendBlue deduplicates by account and complete provider message handle, including after a conversation mapping changes.
+A SendBlue conversation identity includes account, sender, and receiving line.
+Origins identify work and destinations. They are not authentication accounts.
+
+Intake freezes the selected target and reply destination. Pending work prevents incompatible rebinding or removal.
+External authentication grants shared access to all HTTP agents and retained API requests.
 
 ## Durable intake and admission
 
-Input becomes durable before intake reports success. The snapshot stores batches, receipts, source identities, and polling checkpoints.
-The current state format is version 2. Version-1 migration is not supported.
+The state format is version 3. Intake commits its receipt and reservations before reporting success.
+Matching retries reuse existing receipts. A changed HTTP payload with the same request UUID returns a conflict.
 
-Idle SendBlue input uses a quiet batching interval with a maximum deadline.
-HTTPS input uses immediate batching. During an active turn, follow-ups bypass the quiet interval.
-Admissions remain serialized within the execution session.
+Idle SendBlue input uses a quiet interval and maximum batching deadline. HTTP input has no quiet interval.
+Active-turn input steers without waiting for ordinary completion.
+Preparation remains ordered within an origin. Ready input from another origin can proceed during slow attachment preparation.
 
-Before a start or steer, the gateway stores the client message UUID, expected turn, execution binding, and publication references.
-After confirmed admission, it stores the turn ID and clears the pending intent.
-An existing turn ID does not prove acceptance of a later steering message.
+Before admission, the runtime stores the exact message UUID, expected turn, execution binding, and publication references.
+Only then does it call the execution session. Confirmed admission stores the turn ID and clears its pending intent.
+An earlier turn ID does not prove acceptance of a later steering message.
 
-An uncertain acknowledgement triggers UUID correlation, not another submission.
-Unresolved admission blocks completion until correlation or operator resolution establishes its outcome.
-A definite stale-turn rejection returns its batch for admission against fresh thread state.
-Transport failure is not a definite rejection.
+An uncertain acknowledgement triggers correlation of the stored UUID, not another submission.
+Unresolved admission prevents final attribution until recovery or operator resolution establishes its outcome.
+A definite stale-turn rejection permits admission against fresh thread state. Transport failure is not a definite rejection.
 
-Desktop acceptance and output attribution are separate boundaries.
-An exact accepted steering record proves admission. Output still requires its matching consumption marker.
-Recovery of Desktop-admitted work waits for Desktop ownership.
+Desktop acceptance and output attribution use separate evidence. Recovery preserves the original execution binding and waits for a compatible owner.
 
-## Completion and progress
+## Progress and cancellation
 
-Each participating source prepares its completion plan after the shared turn ends and pending admissions resolve.
-HTTPS retains the terminal result. SendBlue prepares one ordered delivery for its participating messages.
+The runtime publishes bounded semantic status, reasoning summaries, commentary, terminal results, and replay resets.
+Only backend-published summaries are available. Progress does not expose raw model internals or synchronize full chat history.
+A connector can consume these events without an HTTP listener.
 
-The gateway stores the result before publishing a terminal SSE event.
-Commentary represents completed semantic messages, not individual tokens.
-Temporary commentary history is bounded and can disappear after restart or eviction.
-Durable HTTPS results remain retrievable for their retention period.
+HTTP formats SSE frames and handles cursors, heartbeats, quotas, and slow connections.
+The semantic buffer permits 16 MiB globally and 128 subscriptions. Each request permits 2 MiB or 128 messages.
+HTTP frame indexes have a separate 2 MiB budget. They retain slice boundaries rather than escaped message copies.
 
-See [HTTPS contracts](https.md) for authentication, reservations, SSE frames, cursors, and capacity limits.
-Connector results are not a synchronized transcript of all activity in the Codex chat.
+Terminal publication follows durable result storage. Temporary progress can disappear after restart or eviction.
+Observer errors do not invalidate execution. Stream disconnection does not cancel a turn.
 
-## SendBlue output
+Cancellation identifies an expected turn. It requests interruption without waiting for completion or provider delivery.
+A stale identity cannot cancel a successor. An uncertain acknowledgement does not trigger automatic retry.
+Cancellation does not erase queued input or settle uncertain sends.
 
-The gateway collects stable artifacts, removes duplicates by content hash, and uploads eligible files before recipient delivery.
-It adds omission notices and splits text into parts below the provider text limit.
-Then it stores the complete delivery, including uploaded media URLs.
+## Completion and outbox
 
-No recipient request starts before that snapshot succeeds.
-A restart before this point can repeat preparation or uploads. A restart afterward uses the frozen text, order, and URLs.
-Text parts precede media parts. Each accepted part stores its provider handle before the next part starts.
+After all admissions resolve, the runtime stages eligible output files without provider uploads.
+Files become immutable local references. The runtime syncs them before the completion transaction.
+
+One transaction commits the canonical result and destination delivery jobs, then releases the execution slot.
+Only after that transaction does terminal progress appear.
+The next execution can start while a provider upload or delivery remains pending.
+
+A crash before commit leaves recoverable execution and possible unreferenced staging files.
+A crash after commit leaves durable results and pinned artifact references.
+Cleanup removes only unreferenced files. Pending delivery pins its result and artifacts beyond ordinary result expiry.
+
+Delivery order is per conversation, including after a conversation selects another agent.
+An uncertain send blocks later deliveries to that destination. It does not block HTTP results or unrelated execution.
+
+## Provider effects
+
+Delivery workers upload staged files and freeze formatted text, order, and media URLs before sending messages.
+Text precedes media. Each part stores `sending` before the physical request.
 
 ```text
 ready -> sending -> accepted | failed
 ready -> skipped
 ```
 
-A `sending` part contains a callback token. An `accepted` part contains a provider handle.
-Other part states contain neither field.
+Accepted parts retain provider handles. Sending parts retain callback tokens.
+Automatic retries require definite retryable rejection. There are at most two retries after the first attempt.
+Lost responses and unusable acknowledgements remain uncertain. Restart never automatically resends stored `sending` parts.
+A failed part skips later ready parts.
 
-Automatic retries require a definite retryable rejection. There are at most two retries after the first request.
-Lost responses, server errors, and unusable success responses remain uncertain.
-A stored `sending` part is never automatically resent after restart.
-A failed part skips later ready parts. An uncertain part blocks its route.
+Positive authenticated callbacks can settle webhook deliveries. Negative callbacks cannot prove rejection after multiple physical attempts.
+Polling accounts expose no webhook or callback handler.
+Provider SDK retries remain disabled. Shared per-line scheduling limits recipient effects.
+Typing and read-receipt errors remain nonfatal.
 
-Webhook mode can settle accepted delivery through a positive authenticated callback.
-A negative callback cannot prove rejection after multiple physical attempts.
-Polling mode sends no callback URL and exposes no callback handler.
-SDK implicit retries are disabled. The router owns retry and per-line request scheduling.
-Typing and read-receipt failures remain nonfatal.
+## Capacity and files
 
-## Files
+Intake reserves request and delivery metadata before acceptance. Duplicate lookups do not consume another reservation.
+Each accepted provider-bound batch reserves capacity. Shared completions release surplus reservations.
+Receipts reference one canonical completion, which stores the response, turn ID, and expiry.
+Pending delivery retains an expired completion without extending request visibility.
+The outbox permits 128 jobs or reservations globally and 32 per destination.
 
-Inbound preparation changes an attachment from `pending` to `ready` or `omitted`.
-Ready files retain local and execution-host paths. Prepared records no longer need the provider source URL.
-Download or content failures can produce omissions. Local storage failures block progress instead of admitting incomplete state.
+Artifacts are best effort. A completion permits 16 files and 100,000,000 bytes in total.
+The shared spool permits 512 MiB, including temporary and pinned files. Staging has a 60-second deadline.
+Size, count, deadline, or capacity exclusions produce explicit omission notices.
+Storage or sync failures leave work recoverable instead of pretending successful delivery.
 
-The gateway rejects symlinks, directories, and files that change during copying.
-Native images must belong to the exact turn. Native source files outside gateway directories remain unchanged.
-Cleanup preserves references from active work and pending admissions across routes on the same host.
-Frozen delivery retains its local artifacts until delivery releases them.
+Safe copying rejects symlinks, directories, and files that change during copying.
+Cleanup preserves pending admission, active execution, and outbox references.
+Native images must belong to the observed turn. Native files outside managed directories remain unchanged.
+
+Polling checkpoints advance only after accepted input. Capacity rejection can pause other conversations within the same SendBlue account.
+HTTP intake remains independent. No checkpoint skips an unaccepted provider message.
 
 ## Storage and recovery
 
 One process holds the [operating-system lock](gateway-lock.md). One serialized writer replaces the canonical snapshot atomically.
-State transitions precede external effects whenever recovery needs their identity.
-A failure after snapshot replacement poisons the writer instead of permitting further uncertain writes.
+A failure after replacement poisons the writer rather than permitting further uncertain writes.
+Diagnostics use a separate disposable snapshot and do not change canonical state.
 
-Diagnostics use a separate disposable snapshot. CLI status does not acquire the writer lock.
-Manual resolution and polling reset require a stopped gateway and acquire that lock.
+Manual resolution and polling reset require a stopped gateway and its state lock.
+The gateway rejects unsupported state formats without rewriting them.
 
-Shutdown stops intake and local work without explicitly cancelling the Codex turn.
-Loss of an owned stdio server can interrupt its turn. Recovery does not resend the input.
+Shutdown stops intake and local work without explicit turn cancellation.
+Loss of an owned stdio server can interrupt its turn. Recovery does not resend uncertain input.
 
-See [SendBlue polling recovery](sendblue.md#polling-recovery) for checkpoint bounds.
-See [manual resolution](gateway.md#recover-an-uncertain-operation) for unresolved admissions and deliveries.
-See [release qualification](release-qualification.md) for the tested platforms and remaining limits.
+See [test installation replacement](gateway.md#replace-a-test-installation), [SendBlue recovery](sendblue.md#polling-recovery), and [HTTP contracts](https.md).

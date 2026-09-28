@@ -1,5 +1,45 @@
 # Release qualification
 
+## Version 0.2.0
+
+Date: 2026-09-27 (America/Chicago). These checks cover the shared runtime, HTTP connector, and final fixes.
+
+The manual matrix covered macOS, Windows, and Linux with actual model execution through CLI and HTTP.
+All six directed client/server pairs passed discovery, responses, duplicate submission, and conflicting-payload rejection.
+Caddy passed verified TLS, authentication, SSE, startup order, and restart probes on all three platforms.
+
+Each platform passed steering, guarded cancellation, retained results, SSE reconnection, capacity limits, and recovery after forced gateway termination.
+Thirty repeated model turns and 2,178 concurrent discovery polls completed without polling failures.
+Windows passed Desktop open, closed, reopened, and termination during an active turn.
+Mac Desktop remained open throughout testing.
+
+The matrix found three defects that this release fixes:
+
+- A temporary Desktop history error permanently blocked execution. The gateway now retries that specific readiness error.
+- Windows path spelling differences suppressed Desktop commentary. Equivalent path forms now pass the existing file checks.
+- Cold remote diagnostics required an obsolete installation path. Diagnostics now test daemon command support without starting it.
+
+After these fixes, the full Mac suite passed 351 tests and skipped one Windows-only test.
+All 37 focused tests passed on Windows, including extended paths and rejection of redirected directories.
+A live Mac readiness race recovered after two retries with one native user message and one turn.
+Windows Desktop-owned CLI and HTTP/SSE delivered commentary and final responses.
+A fresh Linux VM passed read-only capability diagnostics and explicit daemon startup under the current installation layout.
+The focused Linux recheck did not execute a model turn. The earlier full matrix did.
+
+### Known limits
+
+Unowned chats on this Mac incurred about ten seconds of Desktop discovery delay. That performance issue remains open.
+Windows discovery measured 12 ms and 5 ms, so the delay did not reproduce there.
+
+An ordinary standalone CLI privately owns its chat. Gateway input waits until that CLI closes.
+A CLI attached to the shared daemon passed same-turn steering. Independent `codex exec` remains outside the supported ownership scope.
+
+This matrix did not retest live SendBlue delivery or physical ESP32 firmware.
+Desktop uses a private protocol. These results do not establish compatibility with every future Desktop version or power-loss durability.
+
+## Earlier implementation record
+
+
 Date: 2026-09-27. This record covers the gateway implementation and its final cleanup.
 
 ## Intended use

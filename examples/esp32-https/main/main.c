@@ -26,7 +26,7 @@ extern const char router_ca_pem_start[] asm("_binary_router_ca_pem_start");
 
 #define PROMPT_MAX 1024
 static const char *TAG = "router";
-typedef struct { unsigned version; bool done; int64_t created; char id[37], prompt[PROMPT_MAX + 1], origin[256], route[64]; } pending_record;
+typedef struct { unsigned version; bool done; int64_t created; char id[37], prompt[PROMPT_MAX + 1], origin[256], agent[64]; } pending_record;
 static pending_record pending;
 static receiver messages;
 static sse_parser parser;
@@ -61,19 +61,23 @@ static void load(void) {
         unsigned char id[16]; esp_fill_random(id, sizeof(id)); id[6] = (id[6] & 15) | 64; id[8] = (id[8] & 63) | 128;
         snprintf(pending.id, sizeof(pending.id), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
             id[0],id[1],id[2],id[3],id[4],id[5],id[6],id[7],id[8],id[9],id[10],id[11],id[12],id[13],id[14],id[15]);
-        if (strlen(CONFIG_ROUTER_PROMPT) > PROMPT_MAX || strlen(CONFIG_ROUTER_ORIGIN) >= sizeof(pending.origin) || strlen(CONFIG_ROUTER_ROUTE) >= sizeof(pending.route)) abort();
-        strcpy(pending.prompt, CONFIG_ROUTER_PROMPT); strcpy(pending.origin, CONFIG_ROUTER_ORIGIN); strcpy(pending.route, CONFIG_ROUTER_ROUTE);
-        pending.version = 1; pending.created = (int64_t)time(NULL); save(); // UUID and exact text/target are durable before any POST.
+        if (strlen(CONFIG_ROUTER_PROMPT) > PROMPT_MAX || strlen(CONFIG_ROUTER_ORIGIN) >= sizeof(pending.origin) || strlen(CONFIG_ROUTER_AGENT) >= sizeof(pending.agent)) abort();
+        strcpy(pending.prompt, CONFIG_ROUTER_PROMPT); strcpy(pending.origin, CONFIG_ROUTER_ORIGIN); strcpy(pending.agent, CONFIG_ROUTER_AGENT);
+        pending.version = 2; pending.created = (int64_t)time(NULL); save(); // UUID and exact text/target are durable before any POST.
     } else {
         ESP_ERROR_CHECK(result);
-        if (size != sizeof(pending) || pending.version != 1 || pending.id[36] || pending.prompt[PROMPT_MAX] || pending.origin[255] || pending.route[63]) abort();
-        if (strcmp(pending.origin, CONFIG_ROUTER_ORIGIN) || strcmp(pending.route, CONFIG_ROUTER_ROUTE)) {
+        if (size != sizeof(pending) || pending.version != 2) {
+            ESP_LOGE(TAG, "Unsupported saved request format; reconcile the old request before upgrading. NVS is unchanged"); abort();
+        }
+        if (pending.id[36] || pending.prompt[PROMPT_MAX] || pending.origin[255] || pending.agent[63]) abort();
+        if (strcmp(pending.origin, CONFIG_ROUTER_ORIGIN) || strcmp(pending.agent, CONFIG_ROUTER_AGENT)) {
             ESP_LOGE(TAG, "Saved request belongs to another target; refusing to rebind it"); abort();
         }
     }
 }
 static esp_http_client_handle_t client(const char *url) {
     esp_http_client_config_t config = { .url = url,
+        .username = CONFIG_ROUTER_USERNAME, .password = CONFIG_ROUTER_PASSWORD, .auth_type = HTTP_AUTH_TYPE_BASIC,
 #ifdef CONFIG_ROUTER_PRIVATE_CA
         .cert_pem = router_ca_pem_start,
 #else
@@ -83,9 +87,7 @@ static esp_http_client_handle_t client(const char *url) {
         .timeout_ms = 25000, .disable_auto_redirect = true, .buffer_size = 1024 };
     esp_http_client_handle_t http = esp_http_client_init(&config);
     if (!http) abort();
-    char authorization[512];
-    if (snprintf(authorization, sizeof(authorization), "Bearer %s", CONFIG_ROUTER_TOKEN) >= (int)sizeof(authorization)) abort();
-    ESP_ERROR_CHECK(esp_http_client_set_header(http, "Authorization", authorization)); return http;
+    return http;
 }
 static int submit(const char *url) {
     cJSON *body = cJSON_CreateObject(); cJSON_AddStringToObject(body, "request_id", pending.id); cJSON_AddStringToObject(body, "text", pending.prompt);
@@ -129,7 +131,7 @@ void app_main(void) {
     if (pending.done) { ESP_LOGI(TAG, "Saved request already completed; no resubmission"); return; }
     if (strncmp(pending.origin, "https://", 8)) abort();
     char submit_url[512], events_url[576];
-    snprintf(submit_url, sizeof(submit_url), "%s/v1/routes/%s/requests", pending.origin, pending.route);
+    snprintf(submit_url, sizeof(submit_url), "%s/v1/agents/%s/requests", pending.origin, pending.agent);
     snprintf(events_url, sizeof(events_url), "%s/%s/events", submit_url, pending.id);
     receiver_init(&messages, sink, NULL);
     // Recovery first: an existing durable request may have completed while the device was off.

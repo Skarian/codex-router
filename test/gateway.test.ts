@@ -5,36 +5,36 @@ import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
 import { parseConfig, type GatewayConfig } from "../src/config.js";
 import { Gateway, type SendblueProvider, type GatewayFiles, type GatewaySession, type SendOutcome } from "../src/gateway.js";
-import { GatewayStore, bindRoutes, resolveEffect, unresolved, type Delivery, type GatewayState } from "../src/gateway-state.js";
+import { GatewayStore, bindTargets, resolveEffect, unresolved, type Delivery, type GatewayState } from "../src/gateway-state.js";
 import { createGatewayServer, listenGateway, closeGatewayServer } from "../src/gateway-server.js";
 import type { TurnOutcome } from "../src/turn-state.js";
 import { sendblueCredentials, sendblueConnectors } from "../src/sendblue.js";
+import { runtimeBindings } from "../src/gateway-adapters.js";
 import { RouterError } from "../src/errors.js";
 
 function configSource(directory: string): string {
   return `
 [[agents]]
-id="one"
+id="route"
 label="One"
 cwd="/tmp"
 thread_id="thread-one"
 model="test"
 [gateway]
-listen_port=8787
-public_url="https://example.exe.xyz"
 state_dir=${JSON.stringify(directory)}
+[gateway.http]
+port=8787
 [[gateway.sendblue]]
 id="account"
 mode="webhook"
+public_url="https://example.exe.xyz"
 api_key_id_env="KEY"
 api_secret_key_env="SECRET"
 webhook_secret_env="SIGNING"
-[[gateway.routes]]
-id="route"
-sendblue="account"
+[[gateway.sendblue.conversations]]
 sender="+15125550100"
 sendblue_number="+15125550200"
-agent="one"
+agent="route"
 `;
 }
 function configuration(directory: string): GatewayConfig { return parseConfig(configSource(directory)).gateway!; }
@@ -77,7 +77,7 @@ async function fixture(beforeWrite?: () => Promise<void>) {
   const files: GatewayFiles = {
     async cleanup() {}, async reconcile() {}, async prepareBatch(_route, batch) { return batch; },
     async publication() { return "/tmp/publication"; },
-    async delivery(_route, _work, outcome) { return [{ id: "part", status: "ready", payload: { kind: "text", text: outcome.finalText ?? "empty" } }]; },
+    async stage(_target, _work, outcome) { return {result:{status:outcome.status,text:outcome.finalText ?? "empty",notices:[]},artifacts:[]}; },
   };
   let now = Date.now();
   const gateway = new Gateway(config, store, { connector: () => connector, files, openSession: async () => session, now: () => now });
@@ -88,8 +88,12 @@ async function fixture(beforeWrite?: () => Promise<void>) {
   };
 }
 
+const sourceId = JSON.stringify(["account", "+15125550200", "+15125550100"]);
+const destination = {id:sourceId, namespace:JSON.stringify(["sendblue","account"]),properties:{accountId:"account",sender:"+15125550100",sendblueNumber:"+15125550200"}};
+function bindRoutes(state: GatewayState, config: GatewayConfig) { bindTargets(state, runtimeBindings(config)); }
+function installDelivery(state:GatewayState, job:Delivery, target="route") { state.routes[target]!.outbox.push(job); state.routes[target]!.completions[job.completionId]={id:job.completionId,result:{status:"completed",text:"reply",notices:[]},artifacts:[],expiresAtMs:0}; state.nextDeliverySequence=Math.max(state.nextDeliverySequence,job.sequence+1); }
 function delivery(): Delivery {
-  return { kind: "delivery", id: "delivery", sourceId: "sendblue:account", batchIds: ["batch"], parts: [
+  return { kind: "delivery", id: "delivery", sourceId: sourceId, batchIds: ["batch"], destination,completionId:"completion",sequence:0,prepared:true,reservedBytes:2097152, parts: [
     { id: "part-one", status: "ready", payload: { kind: "text", text: "first" } },
     { id: "part-two", status: "ready", payload: { kind: "text", text: "second" } },
   ] };
@@ -101,6 +105,7 @@ async function until(predicate: () => boolean): Promise<void> {
 
 test("gateway batches quiet input, deduplicates, and shares one response across steers", async () => {
   const f = await fixture();
+  f.gateway.settings.retainedBytes = 16 * 1024 * 1024;
   try {
     await f.gateway.start(); await f.receive("first"); await f.receive("first");
     f.advance(4000); await f.receive("second"); await f.gateway.idle();
@@ -112,7 +117,7 @@ test("gateway batches quiet input, deduplicates, and shares one response across 
     assert.equal(f.session.admissions.length, 2);
     const work = f.store.snapshot().routes.route!.active!;
     assert.equal(work.kind, "codex");
-    if (work.kind === "codex") { assert.equal(work.batches.length, 2); assert.equal(work.joinedBatchIds.length, 1); }
+    if ("kind" in work) { assert.equal(work.batches.length, 2); assert.equal(work.joinedBatchIds.length, 1); }
     assert.equal(f.sends.length, 0);
     f.session.finish({ turnId: "owned", status: "completed", finalText: "one answer", imageGenerations: [] });
     await until(() => f.sends.length === 1); await f.gateway.idle();
@@ -123,6 +128,7 @@ test("gateway batches quiet input, deduplicates, and shares one response across 
 
 test("maximum batch age closes continuous input after thirty seconds", async () => {
   const f = await fixture();
+  f.gateway.settings.retainedBytes = 64 * 1024 * 1024;
   try {
     await f.gateway.start();
     for (let i = 0; i < 8; i++) { await f.receive(String(i)); f.advance(4000); await f.gateway.idle(); }
@@ -152,19 +158,19 @@ test("pending route bindings reject every target or recipient change before clea
   try {
     await f.gateway.start(); await f.receive("pending");
     const changes = [
-      (c: GatewayConfig) => { c.routes[0]!.sender = "+15125550300"; },
-      (c: GatewayConfig) => { c.routes[0]!.sendblueNumber = "+15125550400"; },
-      (c: GatewayConfig) => { c.routes[0]!.sendblueId = "other"; },
-      (c: GatewayConfig) => { c.routes[0]!.agent.threadId = "other"; },
-      (c: GatewayConfig) => { c.routes[0]!.agent.cwd = "/other"; },
-      (c: GatewayConfig) => { c.routes[0]!.agent.sshHost = "other"; },
-      (c: GatewayConfig) => { c.routes = []; },
+      (c: GatewayConfig) => { c.sendblue[0]!.conversations[0]!.sender = "+15125550300"; },
+      (c: GatewayConfig) => { c.sendblue[0]!.conversations[0]!.sendblueNumber = "+15125550400"; },
+      (c: GatewayConfig) => { c.sendblue[0]!.id = "other"; },
+      (c: GatewayConfig) => { c.agents[0]!.threadId = "other"; },
+      (c: GatewayConfig) => { c.agents[0]!.cwd = "/other"; },
+      (c: GatewayConfig) => { c.agents[0]!.sshHost = "other"; },
+      (c: GatewayConfig) => { c.agents = []; },
     ];
     for (const change of changes) {
       const config = structuredClone(f.config); change(config);
       assert.throws(() => bindRoutes(f.store.snapshot(), config), (error: unknown) => error instanceof RouterError && error.code === "config_invalid");
     }
-    const config = structuredClone(f.config); config.routes[0]!.agent.model = "another";
+    const config = structuredClone(f.config); config.agents[0]!.model = "another";
     assert.doesNotThrow(() => bindRoutes(f.store.snapshot(), config));
   } finally { await f.close(); }
 });
@@ -173,8 +179,11 @@ test("an idle route rename preserves connector-wide deduplication", async () => 
   const f = await fixture();
   try {
     await f.gateway.start(); await f.receive("seen");
-    await f.store.transaction((state) => { delete state.routes.route!.openBatch; });
-    const config = structuredClone(f.config); config.routes[0]!.id = "renamed";
+    f.advance(5001); await f.gateway.idle();
+    f.session.finish({ turnId: "owned", status: "completed", finalText: "done", imageGenerations: [] });
+    await until(() => f.store.snapshot().routes.route!.outbox.length === 0 && !!f.store.snapshot().routes.route!.receipts[0]?.completionId);
+    await f.gateway.close();
+    const config = structuredClone(f.config); config.agents[0]!.id = "renamed"; config.sendblue[0]!.conversations[0]!.agent.id="renamed";
     await f.store.transaction((state) => bindRoutes(state, config));
     const gateway = new Gateway(config, f.store, f.gateway.operations);
     await gateway.start();
@@ -210,14 +219,14 @@ test("persisted sends never replay and negative restart callbacks cannot settle 
     await f.store.transaction((state) => {
       bindRoutes(state, f.config); const active = delivery();
       active.parts[0]!.status = "sending"; active.parts[0]!.callbackToken = "token";
-      state.routes.route!.active = active;
+      installDelivery(state, active);
     });
     await f.gateway.start(); await f.gateway.idle(); assert.equal(f.sends.length, 0);
     assert.equal(await f.gateway.callback("account", "part-one", "wrong", { status: "SENT", providerHandle: "handle" }), false);
     await f.gateway.callback("account", "part-one", "token", { status: "ERROR" });
     assert.equal(unresolved(f.store.snapshot()).unresolved.length, 1);
     await f.gateway.callback("account", "part-one", "token", { status: "DELIVERED", providerHandle: "observed" });
-    await f.gateway.idle();
+    await until(() => f.sends.length === 1);
     assert.equal(f.sends.length, 1);
   } finally { await f.close(); }
 });
@@ -231,16 +240,16 @@ test("callback settlement waits for a live retry to drain before the next part",
     return { status: "accepted", providerHandle: "next" };
   };
   try {
-    await f.store.transaction((state) => { bindRoutes(state, f.config); state.routes.route!.active = delivery(); });
+    await f.store.transaction((state) => { bindRoutes(state, f.config); installDelivery(state, delivery()); });
     await f.gateway.start(); await until(() => calls === 2);
-    const active = f.store.snapshot().routes.route!.active as Delivery;
+    const active = f.store.snapshot().routes.route!.outbox[0] as Delivery;
     const token = active.parts[0]!.callbackToken!;
     await f.gateway.callback("account", "part-one", token, { status: "ERROR" });
-    assert.equal((f.store.snapshot().routes.route!.active as Delivery).parts[0]!.status, "sending");
+    assert.equal((f.store.snapshot().routes.route!.outbox[0] as Delivery).parts[0]!.status, "sending");
     await f.gateway.callback("account", "part-one", token, { status: "SENT", providerHandle: "known" });
     assert.equal(retrySignal!.aborted, true); assert.equal(calls, 2);
     finishRetry({ status: "uncertain", retryable: true });
-    await f.gateway.idle(); assert.equal(calls, 3);
+    await until(() => calls === 3); assert.equal(calls, 3);
   } finally { await f.close(); }
 });
 
@@ -249,9 +258,9 @@ test("failed settlement persistence retains the accepted handle for a later call
   const f = await fixture(async () => { if (fail) throw new Error("disk full"); });
   f.connector.send = async () => { calls++; fail = true; return { status: "accepted", providerHandle: "original-handle" }; };
   try {
-    await f.store.transaction((state) => { bindRoutes(state, f.config); const active = delivery(); active.parts.pop(); state.routes.route!.active = active; });
-    await f.gateway.start(); await f.gateway.idle();
-    const active = f.store.snapshot().routes.route!.active as Delivery;
+    await f.store.transaction((state) => { bindRoutes(state, f.config); const active = delivery(); active.parts.pop(); installDelivery(state, active); });
+    await f.gateway.start(); await until(() => calls === 1); await until(() => f.gateway.deliveryStatus()[0]?.state === "unresolved");
+    const active = f.store.snapshot().routes.route!.outbox[0] as Delivery;
     assert.equal(active.parts[0]!.status, "sending");
     fail = false;
     await f.gateway.callback("account", "part-one", active.parts[0]!.callbackToken!, { status: "SENT", providerHandle: "different-handle" });
@@ -264,10 +273,10 @@ test("operator resolution releases failed sends without retry and rejects stale 
   try {
     await f.store.transaction((state) => {
       bindRoutes(state, f.config); const active = delivery(); active.parts[0]!.status = "sending"; active.parts[0]!.callbackToken = "token";
-      state.routes.route!.active = active;
+      installDelivery(state, active);
     });
     await f.store.transaction((state) => resolveEffect(state, "route", "part-one", "failed"));
-    assert.equal((f.store.snapshot().routes.route!.active as Delivery).parts[1]!.status, "skipped");
+    assert.equal((f.store.snapshot().routes.route!.outbox[0] as Delivery).parts[1]!.status, "skipped");
     await assert.rejects(f.store.transaction((state) => resolveEffect(state, "route", "part-one", "failed")));
     await f.gateway.start(); await f.gateway.idle(); assert.equal(f.sends.length, 0);
   } finally { await f.close(); }
@@ -299,14 +308,14 @@ test("HTTP authenticates before parsing and provides exact status and health res
 test("gateway configuration rejects duplicate targets and invalid origins, references, and environment names", () => {
   const source = configSource("/tmp/state");
   for (const invalid of [
-    source.replace('listen_port=8787', 'listen_port=0'),
+    source.replace('port=8787', 'port=0'),
     source.replace('https://example.exe.xyz', 'http://example.exe.xyz'),
     source.replace('https://example.exe.xyz', 'https://example.exe.xyz/path'),
     source.replace('api_key_id_env="KEY"', 'api_key_id_env="a secret"'),
-    source.replace('sendblue="account"', 'sendblue="missing"'),
-    source.replace('agent="one"', 'agent="missing"'),
+
+    source.replace('agent="route"', 'agent="missing"'),
     source.replace('sender="+15125550100"', 'sender="5125550100"'),
-    `${source}\n[[gateway.routes]]\nid="second"\nsendblue="account"\nsender="+15125550300"\nsendblue_number="+15125550200"\nagent="one"\n`,
+    `${source}\n[[gateway.sendblue.conversations]]\nsender="+15125550100"\nsendblue_number="+15125550200"\nagent="route"\n`,
     `${source}\n[[agents]]\nid="two"\nlabel="Two"\ncwd="/tmp"\nthread_id="thread-one"\nmodel="test"\n`,
   ]) assert.throws(() => parseConfig(invalid), (error: unknown) => error instanceof RouterError && error.code === "config_invalid");
   assert.doesNotThrow(() => parseConfig(source));
@@ -321,10 +330,10 @@ test("CLI status and resolution require a stopped gateway and never resolve secr
     await assert.rejects(exec(process.execPath, [...args, "status", "--json"]), (error: unknown) => {
       const result = error as { code: number; stdout: string }; return result.code === 1 && JSON.parse(result.stdout).runtime.state === "unavailable";
     });
-    await f.store.transaction((state) => { bindRoutes(state, f.config); const active = delivery(); active.parts[0]!.status = "sending"; active.parts[0]!.callbackToken = "token"; state.routes.route!.active = active; });
+    await f.store.transaction((state) => { bindRoutes(state, f.config); const active = delivery(); active.parts[0]!.status = "sending"; active.parts[0]!.callbackToken = "token"; installDelivery(state, active); });
     await f.store.close();
     const status = JSON.parse((await exec(process.execPath, [...args, "status", "--json"])).stdout);
-    assert.deepEqual(status, { unresolved: [{ routeId: "route", effectId: "part-one", kind: "send" }], runtime: { state: "stopped" } });
+    assert.deepEqual(status, { unresolved: [{ agentId: "route", effectId: "part-one", kind: "send" }], runtime: { state: "stopped" } });
     const result = JSON.parse((await exec(process.execPath, [...args, "resolve", "route", "part-one", "accepted", "observed", "--json"])).stdout);
     assert.deepEqual(result, { type: "resolved", routeId: "route", effectId: "part-one", resolution: "accepted", providerHandle: "observed" });
     await assert.rejects(exec(process.execPath, [...args, "resolve", "route", "part-one", "retry", "--json"]), (error: unknown) => (error as { code: number }).code === 2);
@@ -363,12 +372,13 @@ test("an unavailable host cannot block readiness, durable intake, or a frozen de
   const f = await fixture(); let gateway: Gateway | undefined;
   try {
     const config = structuredClone(f.config);
-    config.routes.push({ ...config.routes[0]!, id: "healthy", sender: "+15125550300", agent: { ...config.routes[0]!.agent, id: "two", threadId: "thread-two" } });
+    const healthy = {...config.agents[0]!,id:"healthy",threadId:"thread-two"}; config.agents.push(healthy);
+    config.sendblue[0]!.conversations.push({...config.sendblue[0]!.conversations[0]!,id:JSON.stringify(["account","+15125550200","+15125550300"]),sender:"+15125550300",agent:healthy});
     await f.store.transaction((state) => {
       bindRoutes(state, config);
-      state.routes.healthy!.active = delivery();
+      installDelivery(state,delivery(),"healthy");
       const now = Date.now();
-      state.routes.route!.queue.push({ id: "queued", sourceId: "sendblue:account", openedAtMs: now, quietDeadlineMs: now, maximumDeadlineMs: now, events: [{ messageHandle: "one", providerTimeMs: now, receiptSequence: 0, text: "hello" }] });
+      state.routes.route!.queue.push({ id: "queued", sourceId: sourceId, openedAtMs: now, quietDeadlineMs: now, maximumDeadlineMs: now, events: [{ messageHandle: "one", providerTimeMs: now, receiptSequence: 0, text: "hello" }] });
     });
     gateway = new Gateway(config, f.store, { ...f.gateway.operations, openSession: (_route, signal) => new Promise((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
@@ -396,7 +406,7 @@ test("completion cannot erase a later uncertain admission or its prepared file r
   };
   try {
     await f.gateway.start(); await f.receive("one"); f.advance(5000); await f.gateway.idle();
-    await f.receive("two"); f.advance(5000); await f.gateway.idle();
+    await f.gateway.receive("account", {messageHandle:"two",sender:"+15125550100",sendblueNumber:"+15125550200",providerTimeMs:Date.now(),text:"two",attachment:{sourceUrl:"https://example.com/input.txt",name:"input.txt"}}); f.advance(5000); await until(() => !!f.store.snapshot().routes.route!.active?.pendingAdmission && f.store.snapshot().routes.route!.active!.batches.length === 2);
     const active = f.store.snapshot().routes.route!.active;
     assert.equal(active?.kind, "codex");
     if (active?.kind !== "codex") assert.fail("missing work");
@@ -417,9 +427,9 @@ test("a negative callback selects settlement before a delayed snapshot and preve
   let calls = 0;
   f.connector.send = async () => { calls++; return { status: "rejected", retryable: true, retryAfterMs: 50 }; };
   try {
-    await f.store.transaction((state) => { bindRoutes(state, f.config); state.routes.route!.active = delivery(); });
+    await f.store.transaction((state) => { bindRoutes(state, f.config); installDelivery(state, delivery()); });
     await f.gateway.start(); await until(() => calls === 1);
-    const active = f.store.snapshot().routes.route!.active as Delivery;
+    const active = f.store.snapshot().routes.route!.outbox[0] as Delivery;
     block = true;
     const callback = f.gateway.callback("account", "part-one", active.parts[0]!.callbackToken!, { status: "ERROR" });
     await waiting;
@@ -431,7 +441,7 @@ test("a negative callback selects settlement before a delayed snapshot and preve
 test("remote cleanup cannot delay a response after its delivery snapshot is durable", async () => {
   const f = await fixture(); let finishCleanup!: () => void;
   const cleanup = new Promise<void>((resolve) => { finishCleanup = resolve; });
-  f.files.release = async (_route, active) => { if (active.kind === "codex") await cleanup; };
+  f.files.release = async (_route, active) => { if ("kind" in active) await cleanup; };
   try {
     await f.gateway.start(); await f.receive("one"); f.advance(5000); await f.gateway.idle();
     f.session.finish({ turnId: "owned", status: "completed", finalText: "ready", imageGenerations: [] });
@@ -449,7 +459,7 @@ test("foreground gateway serves health, ignores unmatched traffic, and releases 
   await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
   const port = (probe.address() as { port: number }).port;
   await new Promise<void>((resolve) => probe.close(() => resolve()));
-  const config = configuration(directory); config.listenPort = port;
+  const config = configuration(directory); config.http!.port = port;
   const previous = [process.env.KEY, process.env.SECRET, process.env.SIGNING];
   process.env.KEY = "fixture-key"; process.env.SECRET = "fixture-secret"; process.env.SIGNING = "fixture-signing";
   const abort = new AbortController();
@@ -478,14 +488,13 @@ test("foreground gateway serves health, ignores unmatched traffic, and releases 
 });
 
 test("shutdown during the sending snapshot starts no provider request", async () => {
-  let hold = false; let release!: () => void; let entered!: () => void;
+  let hold = false; let writes = 0; let release!: () => void; let entered!: () => void;
   const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
-  const f = await fixture(async () => { if (hold) { hold = false; entered(); await new Promise<void>((resolve) => { release = resolve; }); } });
+  const f = await fixture(async () => { if (hold && ++writes === 2) { hold = false; entered(); await new Promise<void>((resolve) => { release = resolve; }); } });
   try {
-    await f.gateway.start(); await f.gateway.idle();
-    await f.store.transaction((state) => { state.routes.route!.active = delivery(); });
-    hold = true; f.gateway.wake("route"); await enteredPromise;
-    const closing = f.gateway.close(); release(); await closing;
+    await f.store.transaction((state) => { bindRoutes(state,f.config); installDelivery(state, delivery()); });
+    hold = true; const starting=f.gateway.start(); await enteredPromise;
+    const closing = f.gateway.close(); release(); await starting; await closing;
     assert.equal(f.sends.length, 0);
     assert.equal(unresolved(f.store.snapshot()).unresolved.length, 1);
   } finally { await f.close(); }
@@ -504,7 +513,7 @@ test("a stalled request receives 408 before its socket closes", async () => {
       let received = "";
       socket.setEncoding("utf8"); socket.setTimeout(3000, () => socket.destroy(new Error("timeout response missing")));
       socket.on("error", reject); socket.on("data", (chunk) => { received += chunk; }); socket.on("end", () => resolve(received));
-      socket.on("connect", () => socket.write(`POST /webhooks/sendblue/account HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nsb-signing-secret: ${f.connector.signingSecret}\r\nContent-Length: 100\r\n\r\n{`));
+      socket.on("connect", () => socket.write(`POST /webhooks/sendblue/account HTTP/1.1\r\nHost: 127.0.0.1:${(server.address() as {port:number}).port}\r\nContent-Type: application/json\r\nsb-signing-secret: ${f.connector.signingSecret}\r\nContent-Length: 100\r\n\r\n{`));
     });
     assert.match(response, /^HTTP\/1\.1 408 /);
     assert.match(response, /connection: close/i);
@@ -601,11 +610,13 @@ for (const mode of ["poll", "webhook"] as const) test(`ambiguous ${mode} deliver
   f.config.sendblue[0]!.mode = mode;
   f.connector.send = async () => { calls++; return { status: "uncertain", retryable: true, retryAfterMs: 0 }; };
   try {
-    await f.store.transaction(state => { bindRoutes(state, f.config); state.routes.route!.active = delivery(); });
+    await f.store.transaction(state => { bindRoutes(state, f.config); installDelivery(state, delivery()); });
     await f.gateway.start(); await f.gateway.idle();
+    await until(() => calls === 1 && f.gateway.deliveryStatus()[0]?.state === "unresolved");
     assert.equal(calls, 1);
-    assert.equal((f.store.snapshot().routes.route!.active as Delivery).parts[0]!.status, "sending");
-    assert.equal(f.gateway.processingStatus()[0]!.state, "unresolved");
+    assert.equal((f.store.snapshot().routes.route!.outbox[0] as Delivery).parts[0]!.status, "sending");
+    assert.equal(f.gateway.deliveryStatus()[0]!.state, "unresolved");
+    assert.equal(f.gateway.processingStatus()[0]!.state,"idle");
   } finally { await f.close(); }
 });
 
@@ -614,8 +625,9 @@ test("exhausted definite rejections settle failed instead of remaining uncertain
   const f = await fixture(); let calls = 0;
   f.connector.send = async () => { calls++; return { status: "rejected", retryable: true, retryAfterMs: 0 }; };
   try {
-    await f.store.transaction(state => { bindRoutes(state, f.config); state.routes.route!.active = delivery(); });
+    await f.store.transaction(state => { bindRoutes(state, f.config); installDelivery(state, delivery()); });
     await f.gateway.start(); await f.gateway.idle();
+    await until(() => f.store.snapshot().routes.route!.outbox.length === 0);
     assert.equal(calls, 3);
     assert.equal(f.store.snapshot().routes.route!.active, undefined);
     assert.equal(f.gateway.processingStatus()[0]!.state, "idle");
@@ -625,12 +637,12 @@ test("exhausted definite rejections settle failed instead of remaining uncertain
 test("CLI polling recovery requires stopped service and retains admission receipts", async () => {
   const { execFile } = await import("node:child_process"); const { promisify } = await import("node:util");
   const exec = promisify(execFile); const f = await fixture();
-  const path = join(f.directory, "poll.toml"); await writeFile(path, configSource(f.directory).replace('mode="webhook"', 'mode="poll"'));
+  const path = join(f.directory, "poll.toml"); await writeFile(path, configSource(f.directory).replace('public_url="https://example.exe.xyz"', "").replace('mode="webhook"', 'mode="poll"'));
   const since = new Date(Date.now() - 3600000).toISOString();
   const args = ["dist/src/cli.js", "--config", path, "gateway", "polling-reset", "account", since, "--json"];
   try {
     await assert.rejects(exec(process.execPath, args), (error: unknown) => JSON.parse((error as { stdout: string }).stdout).code === "gateway_running");
-    await f.store.transaction(state => { bindRoutes(state, f.config); state.routes.route!.receipts!.push({ sourceId: "sendblue:account", externalId: "already-read", receivedAtMs: Date.now() }); });
+    await f.store.transaction(state => { bindRoutes(state, f.config); state.routes.route!.receipts!.push({ sourceId: sourceId, namespace: destination.namespace, externalId: "already-read", receivedAtMs: Date.now() }); });
     await f.store.close();
     assert.deepEqual(JSON.parse((await exec(process.execPath, args)).stdout), { account: "account", pollingFrom: since });
     const saved = JSON.parse(await readFile(join(f.directory, "state.json"), "utf8"));
@@ -645,7 +657,7 @@ test("Sendblue account latency settings control admission batching", async () =>
   const f = await fixture();
   try {
     f.config.sendblue[0]!.batchQuietMs = 1000;
-    const gateway = new Gateway(f.config, f.store, { connector: () => f.connector, files: { async cleanup() {}, async reconcile() {}, async prepareBatch(_r, b) { return b; }, async publication() { return "/tmp"; }, async delivery() { return []; } }, openSession: async () => f.session });
+    const gateway = new Gateway(f.config, f.store, { connector: () => f.connector, files: { async cleanup() {}, async reconcile() {}, async prepareBatch(_r, b) { return b; }, async publication() { return "/tmp"; }, async stage(_r,_w,outcome) {return {result:{status:outcome.status,text:outcome.finalText ?? "",notices:[]},artifacts:[]};} }, openSession: async () => f.session });
     try {
       await gateway.start();
       await gateway.receive("account", { messageHandle: "fast", sender: "+15125550100", sendblueNumber: "+15125550200", providerTimeMs: Date.now(), text: "fast" });
@@ -656,7 +668,7 @@ test("Sendblue account latency settings control admission batching", async () =>
 });
 
 test("Sendblue latency configuration validates bounds", () => {
-  const base = configSource("/tmp/config-latency-test");
+  const base = configSource("/tmp/config-latency-test").replace('public_url="https://example.exe.xyz"', "");
   const configured = parseConfig(base.replace('mode="webhook"', 'mode="poll"\npoll_interval_ms=1000\nbatch_quiet_ms=1000')).gateway!;
   assert.equal(configured.sendblue[0]!.pollIntervalMs, 1000);
   assert.equal(configured.sendblue[0]!.batchQuietMs, 1000);

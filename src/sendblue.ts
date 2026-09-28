@@ -1,8 +1,9 @@
 import { openAsBlob } from "node:fs";
 import SendblueAPI, { type APIPromise } from "sendblue";
 import type { MessageListParams, MessageListResponse, MessageResponse } from "sendblue/resources/messages";
-import type { GatewayConfig, GatewayRoute, SendblueConfig } from "./config.js";
-import { delay, type SendblueProvider, type IncomingMessage, type SendOutcome, type StatusCallback } from "./gateway.js";
+import type { GatewayConfig, SendblueConfig } from "./config.js";
+import type { SendblueProvider, IncomingMessage, SendOutcome, StatusCallback } from "./gateway.js";
+import { delay } from "./request-runtime.js";
 import type { DeliveryPart } from "./gateway-state.js";
 import { RouterError } from "./errors.js";
 
@@ -147,7 +148,7 @@ To send an image or other file as an attachment, save it in ${JSON.stringify(out
     return this.checked(await this.request((client, signal) => client.messages.getStatus({ handle }, { signal }), signal,
       this.operations.requestTimeoutMs ?? 60000)) as MessageResponse;
   }
-  async send(route: GatewayRoute, part: DeliveryPart, callbackUrl: string | undefined, signal: AbortSignal): Promise<SendOutcome> {
+  async send(route: import("./gateway.js").SendblueRecipient, part: DeliveryPart, callbackUrl: string | undefined, signal: AbortSignal): Promise<SendOutcome> {
     const payload = { number: route.sender!, from_number: route.sendblueNumber!, ...(callbackUrl ? { status_callback: callbackUrl } : {}),
       ...(part.payload.kind === "text" ? { content: part.payload.text } : { media_url: part.payload.mediaUrl }) };
     try {
@@ -181,12 +182,12 @@ To send an image or other file as an attachment, save it in ${JSON.stringify(out
     }
     throw new RouterError("turn_failed", "The Sendblue upload failed.");
   }
-  async readReceipt(route: GatewayRoute, signal: AbortSignal): Promise<void> {
+  async readReceipt(route: import("./gateway.js").SendblueRecipient, signal: AbortSignal): Promise<void> {
     this.checked(await this.request((client, signal) => client.post("/api/mark-read", {
       body: { number: route.sender, from_number: route.sendblueNumber }, signal }),
       signal, this.operations.requestTimeoutMs ?? 60000));
   }
-  async typing(route: GatewayRoute, state: "start" | "stop", signal: AbortSignal): Promise<void> {
+  async typing(route: import("./gateway.js").SendblueRecipient, state: "start" | "stop", signal: AbortSignal): Promise<void> {
     this.checked(await this.request((client, signal) => client.typingIndicators.send({ number: route.sender!, from_number: route.sendblueNumber!, state,
       ...(state === "start" ? { max_duration_ms: 300000 } : {}) }, { signal }), signal, this.operations.requestTimeoutMs ?? 60000));
   }

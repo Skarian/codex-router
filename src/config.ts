@@ -1,5 +1,4 @@
 import { readFile } from "node:fs/promises";
-import { isIPv4 } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { parse } from "smol-toml";
@@ -117,14 +116,10 @@ export async function loadConfig(path: string): Promise<RouterConfig> {
   return parseConfig(source);
 }
 
-export function findAgent(config: RouterConfig, id: string): AgentConfig {
-  const agent = config.agents.find((candidate) => candidate.id === id);
-  if (!agent) throw new RouterError("unknown_agent", `No configured agent has id ${JSON.stringify(id)}.`);
-  return agent;
-}
-
 export interface SendblueConfig {
   id: string;
+  conversations: SendblueConversation[];
+  publicUrl?: string;
   mode?: "poll" | "webhook";
   pollStart?: string;
   pollIntervalMs?: number;
@@ -137,47 +132,24 @@ export interface SendblueConfig {
   webhookSecretEnv?: string | undefined;
 }
 
-export interface HttpsConfig {
+export interface SendblueConversation {
   id: string;
-  bearerToken?: string;
-  bearerTokenEnv?: string;
-}
-
-export type SourceBinding =
-  | { kind: "sendblue"; id: string; accountId: string; sender: string; sendblueNumber: string }
-  | { kind: "https"; id: string; accountId: string };
-
-export interface GatewayRoute {
-  id: string;
-  sendblueId?: string;
-  sender?: string;
-  sendblueNumber?: string;
-  httpsId?: string;
+  sender: string;
+  sendblueNumber: string;
   agent: AgentConfig;
 }
 
-/** Derive source bindings from the configured route. */
-export function routeSources(route: GatewayRoute): SourceBinding[] {
-  const sources: SourceBinding[] = [];
-  if (route.sendblueId && route.sender && route.sendblueNumber) sources.push({
-    kind: "sendblue", id: `sendblue:${route.sendblueId}`, accountId: route.sendblueId,
-    sender: route.sender, sendblueNumber: route.sendblueNumber,
-  });
-  if (route.httpsId) sources.push({ kind: "https", id: `https:${route.httpsId}`, accountId: route.httpsId });
-  return sources;
-}
-
 export interface GatewayConfig {
-  listenPort: number;
-  listenHost?: string;
-  tls?: { certPath: string; keyPath: string };
-  publicUrl?: string;
+  agents: AgentConfig[];
+  http?: { port: number; api: boolean };
   stateDir: string;
   sendblue: SendblueConfig[];
-  https?: HttpsConfig[];
   maxRequests?: number;
   retainedBytes?: number;
-  routes: GatewayRoute[];
+}
+
+export function conversationId(accountId: string, sendblueNumber: string, sender: string): string {
+  return JSON.stringify([accountId, sendblueNumber, sender]);
 }
 
 function parseGateway(value: unknown, agents: AgentConfig[]): GatewayConfig {
@@ -210,29 +182,15 @@ function parseGateway(value: unknown, agents: AgentConfig[]): GatewayConfig {
     return value;
   };
   const record = table(value);
-  fields(record, ["listen_port", "listen_host", "tls", "public_url", "state_dir", "sendblue", "https", "routes", "max_requests", "retained_bytes"]);
-  if (!Number.isInteger(record.listen_port) || Number(record.listen_port) < 1 || Number(record.listen_port) > 65535) invalid();
-  const listenHost = optionalString(record, "listen_host", "Gateway") ?? "127.0.0.1";
-  const octets = listenHost.split(".").map(Number);
-  const loopback = isIPv4(listenHost) && octets[0] === 127;
-  const privateAddress = isIPv4(listenHost) && (octets[0] === 10 || octets[0] === 192 && octets[1] === 168
-    || octets[0] === 172 && octets[1]! >= 16 && octets[1]! <= 31);
-  if (!loopback && !privateAddress) invalid();
-  let tls: GatewayConfig["tls"];
-  if (record.tls !== undefined) {
-    const entry = table(record.tls);
-    fields(entry, ["cert", "key"]);
-    const certPath = requiredString(entry, "cert", "Gateway TLS"), keyPath = requiredString(entry, "key", "Gateway TLS");
-    if (!isAbsolute(certPath) || !isAbsolute(keyPath)) invalid();
-    tls = { certPath, keyPath };
-  }
-  if (!loopback && !tls) invalid();
-  const publicUrl = optionalString(record, "public_url", "Gateway");
-  if (publicUrl !== undefined) {
-    try {
-      const url = new URL(publicUrl);
-      if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) invalid();
-    } catch { invalid(); }
+  fields(record, ["http", "state_dir", "sendblue", "max_requests", "retained_bytes"]);
+  let http: GatewayConfig["http"];
+  if (record.http !== undefined) {
+    const entry = table(record.http);
+    fields(entry, ["port", "api"]);
+    const port = entry.port ?? 8787;
+    if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535
+      || (entry.api !== undefined && typeof entry.api !== "boolean")) invalid();
+    http = { port: port as number, api: entry.api !== false };
   }
   const positiveLimit = (key: string, fallback: number): number => {
     const value = record[key] ?? fallback;
@@ -245,7 +203,7 @@ function parseGateway(value: unknown, agents: AgentConfig[]): GatewayConfig {
   if (!isAbsolute(stateDir)) invalid();
   const accounts = new Set<string>();
   const sendblue = entries(record.sendblue).map((entry): SendblueConfig => {
-    fields(entry, ["id", "mode", "poll_start", "poll_interval_ms", "batch_quiet_ms", "api_key_id", "api_secret_key", "webhook_secret", "api_key_id_env", "api_secret_key_env", "webhook_secret_env"]);
+    fields(entry, ["id", "mode", "poll_start", "poll_interval_ms", "batch_quiet_ms", "api_key_id", "api_secret_key", "webhook_secret", "api_key_id_env", "api_secret_key_env", "webhook_secret_env", "public_url", "conversations"]);
     const duration = (key: string, maximum: number): number | undefined => {
       const value = entry[key];
       if (value === undefined) return undefined;
@@ -267,7 +225,26 @@ function parseGateway(value: unknown, agents: AgentConfig[]): GatewayConfig {
     const accountId = id(entry, "id");
     if (accounts.has(accountId)) invalid();
     accounts.add(accountId);
-    return { id: accountId, mode, ...(pollStart === undefined ? {} : { pollStart }),
+    const publicUrl = optionalString(entry, "public_url", "SendBlue");
+    if (publicUrl !== undefined) {
+      try {
+        const url = new URL(publicUrl);
+        if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) invalid();
+      } catch { invalid(); }
+    }
+    if (mode === "webhook" && (!http || !publicUrl)) invalid();
+    if (mode === "poll" && publicUrl !== undefined) invalid();
+    const seen = new Set<string>();
+    const conversations = entries(entry.conversations, true).map(value => {
+      fields(value, ["sender", "sendblue_number", "agent"]);
+      const sender = phone(value, "sender"), sendblueNumber = phone(value, "sendblue_number");
+      const agent = agents.find(agent => agent.id === value.agent);
+      const identity = conversationId(accountId, sendblueNumber, sender);
+      if (!agent || seen.has(identity)) return invalid();
+      seen.add(identity);
+      return { id: identity, sender, sendblueNumber, agent };
+    });
+    return { id: accountId, mode, conversations, ...(publicUrl === undefined ? {} : { publicUrl: new URL(publicUrl).origin }), ...(pollStart === undefined ? {} : { pollStart }),
       ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }), ...(batchQuietMs === undefined ? {} : { batchQuietMs }),
       apiKeyId: entry.api_key_id as string | undefined,
       apiSecretKey: entry.api_secret_key as string | undefined,
@@ -277,49 +254,5 @@ function parseGateway(value: unknown, agents: AgentConfig[]): GatewayConfig {
       webhookSecretEnv: entry.webhook_secret_env === undefined ? undefined : env(entry, "webhook_secret_env"),
     };
   });
-  if (sendblue.some(account => account.mode === "webhook") && publicUrl === undefined) invalid();
-  const httpsAccounts = new Set<string>();
-  const https = entries(record.https).map((entry): HttpsConfig => {
-    fields(entry, ["id", "bearer_token", "bearer_token_env"]);
-    const accountId = id(entry, "id");
-    if (httpsAccounts.has(accountId) || (entry.bearer_token === undefined) === (entry.bearer_token_env === undefined)) return invalid();
-    httpsAccounts.add(accountId);
-    if (entry.bearer_token !== undefined) {
-      const bearerToken = requiredString(entry, "bearer_token", "Gateway");
-      if (/[^\x21-\x7e]/.test(bearerToken)) return invalid();
-      return { id: accountId, bearerToken };
-    }
-    return { id: accountId, bearerTokenEnv: env(entry, "bearer_token_env") };
-  });
-  const routeIds = new Set<string>();
-  const conversations = new Set<string>();
-  const targets = new Set<string>();
-  const routes = entries(record.routes, true).map((entry): GatewayRoute => {
-    fields(entry, ["id", "sendblue", "sender", "sendblue_number", "https", "agent"]);
-    const routeId = id(entry, "id");
-    const agent = agents.find((agent) => agent.id === entry.agent);
-    if (!agent || routeIds.has(routeId)) return invalid();
-    const target = JSON.stringify([agent.sshHost ?? null, agent.threadId]);
-    if (targets.has(target)) return invalid();
-    const route: GatewayRoute = { id: routeId, agent };
-    if (entry.sendblue !== undefined) {
-      const sendblueId = id(entry, "sendblue");
-      if (!accounts.has(sendblueId)) return invalid();
-      const sender = phone(entry, "sender");
-      const sendblueNumber = phone(entry, "sendblue_number");
-      const conversation = JSON.stringify([sendblueId, sender, sendblueNumber]);
-      if (conversations.has(conversation)) return invalid();
-      conversations.add(conversation);
-      Object.assign(route, { sendblueId, sender, sendblueNumber });
-    } else if (entry.sender !== undefined || entry.sendblue_number !== undefined) return invalid();
-    if (entry.https !== undefined) {
-      route.httpsId = id(entry, "https");
-      if (!httpsAccounts.has(route.httpsId)) return invalid();
-    }
-    if (!routeSources(route).length) return invalid();
-    targets.add(target); routeIds.add(routeId);
-    return route;
-  });
-  return { listenPort: Number(record.listen_port), listenHost, ...(tls ? { tls } : {}), ...(publicUrl === undefined ? {} : { publicUrl: new URL(publicUrl).origin }),
-    stateDir, sendblue, https, maxRequests, retainedBytes, routes };
+  return { agents, ...(http ? { http } : {}), stateDir, sendblue, maxRequests, retainedBytes };
 }

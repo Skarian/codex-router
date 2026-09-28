@@ -36,7 +36,7 @@ export async function inspectRemoteAppServer(agent: AgentConfig, operations: Rem
         name: `agent:${agent.id}:app-server`,
         ok: daemonAvailable,
         text: daemonAvailable
-          ? "Persistent app-server is not running; the first send will start it."
+          ? "Persistent app-server is not running. Daemon startup is supported. The first send will attempt startup."
           : "Persistent app-server is not running, and this Codex installation does not support durable daemon startup.",
       },
       { name: `agent:${agent.id}:thread`, ok: false, text: "Task was not checked." },

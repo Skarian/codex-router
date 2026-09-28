@@ -15,33 +15,39 @@ function encode(value: unknown): Buffer {
   const header = Buffer.alloc(4); header.writeUInt32LE(body.length);
   return Buffer.concat([header, body]);
 }
-for (const brokerError of ["no-client-found", "client-disconnected"]) {
-  test(`Desktop owner ${brokerError} recovers acknowledged work without replay`, async () => {
+for (const { brokerError, loseAck = false, fatal = false } of [
+  { brokerError: "no-client-found" },
+  { brokerError: "client-disconnected" },
+  { brokerError: "Conversation must be resumed before loading history" },
+  { brokerError: "Conversation must be resumed before loading history", loseAck: true },
+  { brokerError: "Unsupported history version", loseAck: true, fatal: true },
+]) {
+  test(`Desktop recovery: ${brokerError}, lost acknowledgement=${loseAck}`, async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "dg-")));
     await mkdir(join(root, "sessions"));
     const rolloutPath = join(root, "sessions", "rollout.jsonl"); await writeFile(rolloutPath, "");
     const config = parseConfig(`
 [[agents]]
-id="agent"
+id="route"
 label="Agent"
 cwd=${JSON.stringify(root)}
 thread_id="thread"
 model="test"
 [gateway]
-listen_port=8787
-public_url="https://example.com"
 state_dir=${JSON.stringify(join(root, "state"))}
+[gateway.http]
+api=false
 [[gateway.sendblue]]
+mode="webhook"
+public_url="https://example.com"
 id="account"
 api_key_id_env="KEY"
 api_secret_key_env="SECRET"
 webhook_secret_env="SIGNING"
-[[gateway.routes]]
-id="route"
-sendblue="account"
+[[gateway.sendblue.conversations]]
 sender="+15125550100"
 sendblue_number="+15125550200"
-agent="agent"
+agent="route"
 `).gateway!;
     const store = await GatewayStore.open(join(root, "state"));
     const socketPath = join(root, "s");
@@ -49,7 +55,8 @@ agent="agent"
     await new Promise<void>((resolve, reject) => { broker.once("error", reject); broker.listen(socketPath, resolve); });
     let now = Date.now(), opens = 0, starts = 0, sends = 0, revision = 0;
     let acceptedUuid: string | undefined;
-    let ownerLost = false;
+    let failures = 0;
+    const failureLimit = brokerError === "Conversation must be resumed before loading history" ? 2 : 1;
     broker.on("connection", peer => {
       let buffer: Buffer = Buffer.alloc(0);
       peer.on("data", chunk => {
@@ -61,10 +68,18 @@ agent="agent"
           const reply = { type: "response", requestId: request.requestId, method: request.method, handledByClientId: "owner", resultType: "success" };
           if (request.method === "thread-follower-start-turn") {
             starts++; acceptedUuid = request.params.turnStart.request.clientUserMessageId;
+            if (loseAck) {
+              peer.write(encode({ type: "response", requestId: request.requestId, resultType: "error", error: "client-disconnected" })); continue;
+            }
             peer.write(encode({ ...reply, result: { result: { turn: { id: "accepted" } } } })); continue;
           }
-          if (acceptedUuid && !ownerLost) {
-            ownerLost = true;
+          if (acceptedUuid && failures < failureLimit) {
+            failures++;
+            if (loseAck) {
+              const active = store.snapshot().routes.route!.active;
+              assert.ok(active?.kind === "codex");
+              assert.equal(active.pendingAdmission?.clientUserMessageId, acceptedUuid);
+            }
             peer.write(encode({ type: "response", requestId: request.requestId, resultType: "error", error: brokerError })); continue;
           }
           revision++;
@@ -85,22 +100,31 @@ agent="agent"
     };
     const files: GatewayFiles = {
       async cleanup() {}, async reconcile() {}, async prepareBatch(_route, batch) { return batch; }, async publication() { return join(root, "out"); },
-      async delivery(_route, _work, outcome) { return [{ id: "reply", status: "ready", payload: { kind: "text", text: outcome.finalText! } }]; },
+      async stage(_route, _work, outcome) { return { result: { status: outcome.status, text: outcome.finalText ?? "", notices: [] }, artifacts: [] }; },
     };
     const Constructor = DesktopSession as unknown as new (agent: AgentConfig, ipc: DesktopIpc, owner: string, home: string) => DesktopSession;
     const gateway = new Gateway(config, store, { connector: () => connector, files, now: () => now, retryDelayMs: () => 10,
-      async openSession() { opens++; const ipc = new DesktopIpc(connect(socketPath)); ipc.clientId = "client"; return new Constructor(config.routes[0]!.agent, ipc, "owner", root); },
+      async openSession() { opens++; const ipc = new DesktopIpc(connect(socketPath)); ipc.clientId = "client"; return new Constructor(config.agents[0]!, ipc, "owner", root); },
     });
     try {
       await gateway.start(); await gateway.idle();
       await gateway.receive("account", { messageHandle: "input", sender: "+15125550100", sendblueNumber: "+15125550200", providerTimeMs: now, text: "hello" });
       now += 5001; gateway.wake("route"); await gateway.idle();
       const deadline = Date.now() + 3000;
-      while (sends === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      while (sends === 0 && !gateway.processingStatus().some(s => s.state === "blocked" || s.state === "unresolved") && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
       await gateway.idle();
-      assert.equal(ownerLost, true); assert.equal(opens, 2); assert.equal(starts, 1); assert.equal(sends, 1);
-      assert.equal(store.snapshot().routes.route!.active, undefined);
-      assert.deepEqual(gateway.processingStatus(), [{ routeId: "route", state: "idle" }]);
+      assert.equal(failures, failureLimit); assert.equal(starts, 1);
+      if (fatal) {
+        assert.equal(sends, 0);
+        const active = store.snapshot().routes.route!.active;
+        assert.ok(active?.kind === "codex");
+        assert.equal(active.pendingAdmission?.clientUserMessageId, acceptedUuid);
+        assert.equal(gateway.processingStatus()[0]?.code, "app_server_protocol_failed");
+      } else {
+        assert.equal(opens, 1 + failureLimit + Number(loseAck)); assert.equal(sends, 1);
+        assert.equal(store.snapshot().routes.route!.active, undefined);
+        assert.deepEqual(gateway.processingStatus(), [{ routeId: "route", state: "idle" }]);
+      }
     } finally {
       await gateway.close(); await store.close(); await new Promise<void>(resolve => broker.close(() => resolve())); await rm(root, { recursive: true, force: true });
     }

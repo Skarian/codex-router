@@ -114,14 +114,14 @@ async function startRemoteDaemon(sshHost: string): Promise<void> {
     }
     throw new RouterError(
       "app_server_start_failed",
-      "The persistent remote Codex app-server could not be started. On the remote host, install or update standalone Codex with `curl -fsSL https://chatgpt.com/codex/install.sh | sh`, then retry.",
+      "The persistent remote Codex app-server could not be started. On the remote host, check `codex app-server daemon start`. Install or update Codex if this command is unavailable.",
       { cause: error },
     );
   }
 }
 
 export async function remoteDaemonAvailable(sshHost: string): Promise<boolean> {
-  const script = 'codex_home=${CODEX_HOME:-"$HOME/.codex"}; if test -x "$codex_home/packages/standalone/current/codex" && codex app-server daemon start --help >/dev/null 2>&1; then printf available; else printf unavailable; fi';
+  const script = 'if codex app-server daemon start --help >/dev/null 2>&1; then printf available; else printf unavailable; fi';
   const spec = sshProcessSpec(sshHost, ["sh", "-c", script]);
   try {
     const { stdout } = await execFileAsync(spec.command, spec.args, {

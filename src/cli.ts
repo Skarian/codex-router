@@ -1,13 +1,15 @@
 #!/usr/bin/env node
+import { getAgent, listAgents } from "./agent-catalog.js";
 import { readGatewayStatus } from "./gateway-diagnostics.js";
 import { resolve } from "node:path";
-import { defaultConfigPath, findAgent, loadConfig } from "./config.js";
+import { defaultConfigPath, loadConfig } from "./config.js";
 import type { RouterConfig } from "./config.js";
 import { runGateway } from "./gateway-server.js";
 import { runDoctor } from "./doctor.js";
 import { failedMessage, asRouterError, RouterError } from "./errors.js";
 import { cancelTurn, sendTurn } from "./execution-commands.js";
-import { GatewayStore, bindRoutes, unresolved, resolveEffect } from "./gateway-state.js";
+import { runtimeBindings } from "./gateway-adapters.js";
+import { GatewayStore, bindTargets, unresolved, resolveEffect } from "./gateway-state.js";
 import type { SemanticMessage } from "./turn-state.js";
 
 interface ParsedArgs {
@@ -40,8 +42,8 @@ function usage(): string {
     "  codex-router [--config PATH] gateway",
     "  codex-router [--config PATH] gateway status [--json]",
     "  codex-router [--config PATH] gateway polling-reset ACCOUNT_ID SINCE_UTC [--json]",
-    "  codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID failed [--json]",
-    "  codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE [--json]",
+    "  codex-router [--config PATH] gateway resolve AGENT_ID EFFECT_ID failed [--json]",
+    "  codex-router [--config PATH] gateway resolve AGENT_ID EFFECT_ID accepted HANDLE [--json]",
   ].join("\n");
 }
 
@@ -80,12 +82,8 @@ function writeStdout(text: string): void {
   }
 }
 
-function listAgents(config: RouterConfig): Array<{ id: string; label: string }> {
-  return config.agents.map(({ id, label }) => ({ id, label }));
-}
-
 function formatAgentTable(config: RouterConfig): string {
-  const rows = [["ID", "LABEL"], ...config.agents.map(({ id, label }) => [id, label])];
+  const rows = [["ID", "LABEL"], ...listAgents(config.agents).map(({ id, label }) => [id, label])];
   const width = Math.max(...rows.map(([id]) => id?.length ?? 0));
   return rows.map(([id, label]) => `${id?.padEnd(width)}  ${label}`).join("\n");
 }
@@ -138,9 +136,9 @@ async function main(): Promise<void> {
       const store = await GatewayStore.open(config.gateway.stateDir);
       try {
         await store.transaction(state => {
-          bindRoutes(state, config.gateway!);
+          bindTargets(state, runtimeBindings(config.gateway!));
           (state.polling ??= {})[accountId!] = { activationAtMs: time, completedThroughMs: time,
-            routeActivationAtMs: Object.fromEntries(config.gateway!.routes.filter(route => route.sendblueId === accountId).map(route => [route.id, time])) };
+            routeActivationAtMs: Object.fromEntries(account.conversations.map(conversation => [conversation.id, time])) };
         });
         if (parsed.json) printJson({ account: accountId, pollingFrom: since });
         else writeStdout(`Polling for ${accountId} will resume from ${since}. Existing message receipts were retained.\n`);
@@ -161,15 +159,16 @@ async function main(): Promise<void> {
         else {
           writeStdout(`Gateway status: ${status.runtime.state}.\n`);
           if (status.runtime.polling) for (const poll of status.runtime.polling) writeStdout(`${poll.accountId}: ${poll.state}${poll.code ? ` (${poll.code})` : ""}\n`);
-          if (status.runtime.routes) for (const route of status.runtime.routes) writeStdout(`${route.routeId}: ${route.state}${route.code ? ` (${route.code})` : ""}\n`);
-          for (const effect of status.unresolved) writeStdout(`${effect.routeId}  ${effect.kind}  ${effect.effectId}\n`);
+          if (status.runtime.agents) for (const route of status.runtime.agents) writeStdout(`${route.agentId}: ${route.state}${route.code ? ` (${route.code})` : ""}\n`);
+          if (status.runtime.deliveries) for (const delivery of status.runtime.deliveries) writeStdout(`${delivery.agentId}: delivery ${delivery.state} (${delivery.destinationId})\n`);
+          for (const effect of status.unresolved) writeStdout(`${effect.agentId}  ${effect.kind}  ${effect.effectId}\n`);
         }
         if (["unavailable", "stale"].includes(status.runtime.state)) process.exitCode = 1;
         return;
       }
       const store = await GatewayStore.open(config.gateway.stateDir);
       try {
-        bindRoutes(store.snapshot(), config.gateway);
+        bindTargets(store.snapshot(), runtimeBindings(config.gateway));
           const result = await store.transaction((state) => resolveEffect(state, routeId!, effectId!, resolution as "accepted" | "failed", handle));
           if (parsed.json) printJson(result);
           else writeStdout(`Resolved ${effectId} as ${resolution}.\n`);
@@ -177,7 +176,7 @@ async function main(): Promise<void> {
       return;
     }
     if (first === "agents" && second === "list" && third === undefined && !parsed.stdin && !parsed.stream) {
-      if (parsed.json) printJson(listAgents(config));
+      if (parsed.json) printJson(listAgents(config.agents));
       else writeStdout(`${formatAgentTable(config)}\n`);
       return;
     }
@@ -190,7 +189,7 @@ async function main(): Promise<void> {
       return;
     }
     if (first === "send" && second && third === undefined && parsed.stdin) {
-      const agent = findAgent(config, second);
+      const agent = getAgent(config.agents, second);
       const text = await readStdin();
       const abortController = new AbortController();
       activeAbortController = abortController;
@@ -215,7 +214,7 @@ async function main(): Promise<void> {
       return;
     }
     if (first === "cancel" && second && third === undefined && !parsed.stdin && !parsed.stream) {
-      const agent = findAgent(config, second);
+      const agent = getAgent(config.agents, second);
       const result = await cancelTurn(agent);
       if (parsed.json) printJson(result);
       else if (result.type === "interrupt_requested") writeStdout(`Interrupt requested for ${agent.label}.\n`);

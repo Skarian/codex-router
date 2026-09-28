@@ -52,7 +52,7 @@ test("canonical startup failure releases the kernel handle; stale metadata does 
   try {
     await writeFile(join(f.root, "state.json"), "invalid", { mode: 0o600 });
     await assert.rejects(GatewayStore.open(f.root), { code: "state_invalid" });
-    await writeFile(join(f.root, "state.json"), JSON.stringify({ version: 2, routes: {} }), { mode: 0o600 });
+    await writeFile(join(f.root, "state.json"), JSON.stringify({ version: 3, nextDeliverySequence: 0, routes: {} }), { mode: 0o600 });
     await writeFile(join(f.root, "owner.json"), "truncated-owner", { mode: 0o600 });
     store = await GatewayStore.open(f.root);
     assert.equal(JSON.parse(await readFile(join(f.root, "owner.json"), "utf8")).pid, process.pid);

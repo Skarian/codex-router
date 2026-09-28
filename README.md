@@ -1,16 +1,20 @@
 # Codex Router
 
-Codex Router connects shells, messaging apps, and HTTPS clients to existing Codex chats.
+Codex Router connects shells, messaging apps, and HTTP clients to existing Codex chats.
 Give each chat a local name, then send messages through the CLI or the gateway.
 
 | Interface | Input and output |
 | --- | --- |
 | CLI | Text input, final replies, or completed messages as JSON Lines |
 | SendBlue | Text, images, and files through a configured messaging line |
-| HTTPS | Text requests, retained results, and completed commentary through SSE |
+| HTTP connector | Agent discovery, durable requests, progress through SSE, results, and guarded cancellation |
 
 Follow-ups steer an active turn. Idle chats start a new turn.
-The gateway saves accepted input and pending responses across restarts.
+The optional gateway saves accepted input and pending responses across restarts.
+The CLI works without a gateway, network listener, or proxy.
+
+Version `0.2.0` introduces the shared request runtime and HTTP API.
+Earlier test installations need a [configuration and state reset](docs/gateway.md#replace-a-test-installation).
 
 ## Install
 
@@ -31,7 +35,7 @@ Local chats can use the Codex Desktop app on macOS or Windows.
 Without a Desktop owner, the router needs an authenticated `codex` executable on `PATH`.
 Linux servers use the CLI and app-server path.
 
-For SSH agents, install standalone Codex on the remote host. Its daemon commands must work through noninteractive SSH.
+For SSH agents, install Codex on the remote host. Its `codex app-server daemon start` command must work through noninteractive SSH.
 See [SSH configuration](docs/cli-reference.md#configuration) for the installation and connection requirements.
 
 ## Update
@@ -43,6 +47,7 @@ npm install --global @skarian/codex-router@latest
 ```
 
 Restart a running gateway after the update. Your configuration stays in `~/.codex-router/config.toml`.
+For an older test installation, follow [test installation replacement](docs/gateway.md#replace-a-test-installation).
 To install a specific release, replace `@latest` with its version, such as `@0.0.1`.
 Only explicit versioned releases reach npm. Commits to `main` do not publish or update installed copies.
 
@@ -95,23 +100,34 @@ See the [CLI reference](docs/cli-reference.md) for commands, configuration, outp
 Choose a connector and add its configuration:
 
 - [SendBlue setup](docs/sendblue.md): API credentials, phone numbers, polling, attachments, and troubleshooting.
-- [HTTPS setup](docs/https.md): LAN TLS, bearer tokens, requests, retained results, and SSE.
+- [HTTP API and LAN HTTPS](docs/https.md): optional agent API, requests, SSE, and an external Caddy proxy.
 - [ESP32 example](examples/esp32-https/README.md): an HTTPS client with bounded parsing and reconnect support.
 
 ```sh
 codex-router gateway
 ```
 
-The gateway runs in the foreground. In another terminal, inspect its state:
+The gateway runs in the foreground. To enable the HTTP API for existing agents, add:
+
+```toml
+[gateway.http]
+port = 8788
+```
+
+Local programs can call `http://127.0.0.1:8788/v1/agents`.
+LAN clients use the optional proxy described in the HTTP guide.
+In another terminal, inspect gateway state:
 
 ```sh
 codex-router gateway status --json
 ```
 
 SendBlue polling needs outbound HTTPS only. It requires no public tunnel or inbound webhook.
-HTTPS can remain on your local network. Both connectors are optional.
+The HTTP connector binds only to loopback. Caddy can provide authenticated HTTPS for LAN clients.
+Each connector is optional. Polling-only gateways open no listener.
 
-A route can accept both connectors for the same chat. They share Codex context, not a synchronized client transcript.
+HTTP clients can address all configured agents without separate route entries.
+SendBlue conversations select an agent. Both connectors share Codex context, not a synchronized client transcript.
 Each source receives responses to its own submissions. Participating requests share the final response when they steer one active turn.
 
 See [gateway operation and recovery](docs/gateway.md) for process ownership, shutdown, and unresolved operations.

@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, appendFile, rm, realpath } from "node:fs/promises";
+import { mkdtemp, writeFile, appendFile, rm, realpath, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname, toNamespacedPath } from "node:path";
 import { DesktopCommentary } from "../src/desktop-commentary.js";
 const meta = JSON.stringify({ type: "session_meta", payload: { id: "thread", history_mode: "paginated" } }) + "\n";
 const item = (id: string, text = "same") => ({ id, type: "agentMessage", phase: "commentary", text });
@@ -41,4 +41,22 @@ test("Desktop reader reports unsupported history and revalidates replaced sessio
   await rm(path); await writeFile(path, JSON.stringify({ type: "session_meta", payload: { id: "wrong", history_mode: "paginated" } }) + "\n");
   assert.deepEqual(await reader.poll(path, "turn", [item("two")]), []);
   assert.equal(reader.status.reason, "rollout_identity_mismatch");
+}));
+test("Windows Desktop commentary accepts ordinary and extended paths", { skip: process.platform !== "win32" }, async () => fixture(async (_reader, path) => {
+  await appendFile(path, completed("one"));
+  for (const spelling of [path, toNamespacedPath(path)]) {
+    const reader = new DesktopCommentary("thread");
+    assert.deepEqual(await reader.poll(spelling, "turn", [item("one")]), [{ itemId: "one", text: "same" }]);
+    assert.equal(reader.status.state, "available");
+  }
+}));
+test("Desktop commentary rejects a redirected parent directory", async () => fixture(async (reader, path) => {
+  await appendFile(path, completed("one"));
+  const parent = await realpath(await mkdtemp(join(tmpdir(), "commentary-alias-")));
+  try {
+    const alias = join(parent, "alias");
+    await symlink(dirname(path), alias, process.platform === "win32" ? "junction" : "dir");
+    assert.deepEqual(await reader.poll(join(alias, "rollout.jsonl"), "turn", [item("one")]), []);
+    assert.equal(reader.status.reason, "rollout_path_changed");
+  } finally { await rm(parent, { recursive: true, force: true }); }
 }));

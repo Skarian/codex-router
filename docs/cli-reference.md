@@ -10,8 +10,8 @@ codex-router [--config PATH] cancel AGENT_ID [--json]
 codex-router [--config PATH] gateway
 codex-router [--config PATH] gateway status [--json]
 codex-router [--config PATH] gateway polling-reset ACCOUNT_ID SINCE_UTC [--json]
-codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID failed [--json]
-codex-router [--config PATH] gateway resolve ROUTE_ID EFFECT_ID accepted HANDLE [--json]
+codex-router [--config PATH] gateway resolve AGENT_ID EFFECT_ID failed [--json]
+codex-router [--config PATH] gateway resolve AGENT_ID EFFECT_ID accepted HANDLE [--json]
 ```
 
 `--config PATH` selects a TOML file. The default is
@@ -50,14 +50,13 @@ then connects through the proxy. All other agent fields remain in this local
 configuration; `cwd` and `thread_id` identify resources on the remote machine.
 SSH credentials and connection options come from OpenSSH.
 
-Durable daemon startup requires Codex installed through the official standalone
-installer. Package-manager-only installations that previously worked through
-remote stdio now fail before a turn is sent. The router never installs or
-updates Codex, bootstraps an updater, enables remote control, restarts an
-existing app-server, or stops the daemon it starts. Plain daemon startup does
-not make the host available from signed-in mobile devices.
+Durable startup requires a Codex version that supports `codex app-server daemon start`.
+The router checks command support, not the installation directory.
+The router does not install or update Codex, enable remote control, or restart an existing app-server.
+It does not stop the daemon that it starts.
+Daemon startup does not make the host available from signed-in mobile devices.
 
-Install or update standalone Codex manually on an SSH target with:
+To install or update Codex on an SSH target, you can use the official installer:
 
 ```sh
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
@@ -104,8 +103,8 @@ connection, and task IDs.
 
 For remote agents, the Codex, directory, app-server, and task checks run through
 SSH. Doctor is read-only: when the persistent app-server is absent, it reports
-whether durable startup is available and does not start the daemon. In that
-case the task is not checked; the first `send` performs startup.
+whether the CLI supports daemon startup. Doctor does not start the daemon or check the task in that case.
+The first `send` attempts startup. Command support does not guarantee startup success.
 
 ```sh
 codex-router doctor
@@ -226,43 +225,50 @@ The snapshot refreshes every five seconds. After 15 seconds without an update, s
 Missing, invalid, or mismatched live snapshots report `unavailable`. Both conditions return exit code 1.
 `gateway resolve` still requires a stopped service and acquires the state lock.
 
-Status JSON preserves the `unresolved` array and adds a `runtime` object. Each entry contains `routeId`, `effectId`, and `kind`.
-The `kind` value is `codex_admission` or `send`. Check `runtime.state` before interpreting an empty array.
-Live runtime status includes readiness, polling errors, retry times, last polling success, and route activity.
+Status reports unresolved admissions and deliveries separately from runtime readiness.
+Inspect the affected agent and effect identifiers before choosing a resolution.
+Live diagnostics include polling errors, retry times, execution activity, and delivery blockage.
 Stopped status reads unresolved effects from canonical state without changing it.
-Plain output shows runtime state, account and route summaries, then unresolved effect IDs.
 
-Resolution JSON has this shape:
+For a failed effect, use the configured agent ID and reported effect ID:
 
-```json
-{"type":"resolved","routeId":"home-messages","effectId":"part-uuid","resolution":"failed"}
+```sh
+codex-router gateway resolve home EFFECT_ID failed --json
 ```
 
-An accepted send resolution also contains `providerHandle`. Codex admissions permit only `failed`.
+For a provider-confirmed send:
+
+```sh
+codex-router gateway resolve home EFFECT_ID accepted PROVIDER_HANDLE --json
+```
+
+An accepted send resolution records its provider handle. Codex admissions permit only `failed`.
 Unknown or already resolved identities fail with `effect_not_found`. No retry command exists.
 
 ### Gateway configuration contract
 
 | Table | Fields |
 | --- | --- |
-| `gateway` | Required `listen_port`; optional `listen_host`, `state_dir`, `public_url`, `max_requests`, `retained_bytes` |
-| `gateway.tls` | Required `cert` and `key` when the table is present |
-| `gateway.sendblue` | Required `id` and API credentials; optional polling fields; webhook credentials only for webhook mode |
-| `gateway.https` | Required `id` and exactly one of `bearer_token` or `bearer_token_env` |
-| `gateway.routes` | Required `id` and `agent`; `sendblue` with both phone numbers, `https`, or both connectors |
+| `gateway` | Optional `state_dir`, `max_requests`, and `retained_bytes` |
+| `gateway.http` | Optional `port` (default 8787) and `api` (default true) |
+| `gateway.sendblue` | Required `id`, API credentials, and conversation mappings; optional polling fields |
+| `gateway.sendblue.conversations` | Required `sender`, `sendblue_number`, and `agent` |
 
-Set exactly one direct value or environment reference for each credential.
-Unknown gateway fields are rejected. See [SendBlue setup](sendblue.md) and [HTTPS setup](https.md) for complete examples and limits.
+The presence of `[gateway.http]` enables the loopback listener. Without that table, polling-only gateways open no listener.
+`port` accepts 1–65535. The listener binds only to `127.0.0.1`.
+`api = false` permits a webhook-only listener without agent API access.
+There are no native TLS, HTTP credential, LAN bind, or top-level route fields.
 
-`listen_port` accepts 1–65535. The listener defaults to `127.0.0.1`.
-Nonloopback access requires TLS and a specific private IPv4 address.
-`public_url` is required only for SendBlue webhook mode. It must be an HTTPS origin without credentials, path, query, or fragment.
 `state_dir` must be absolute. Its default is `~/.codex-router/gateway`.
+Each SendBlue conversation references an existing agent. Several conversations can select the same agent.
+The account, sender, and receiving line tuple must be unique.
+Pending work retains its original target and destination.
 
-Routes reference existing accounts and agents. Each account/sender/line combination and each execution target must be unique.
-Pending work prevents changes to its source identity or execution target.
+For webhook mode, `public_url` belongs to the SendBlue account. It must be an HTTPS origin without credentials, path, query, or fragment.
+Set exactly one direct value or environment reference for each provider credential. Unknown fields are rejected.
+See [SendBlue setup](sendblue.md) and [HTTP API](https.md) for examples.
 
-`gateway polling-reset` requires a stopped service. It changes a SendBlue account's recovery boundary while retaining receipts.
+`gateway polling-reset` requires a stopped service. It changes a SendBlue recovery boundary while retaining receipts.
 See [polling recovery](sendblue.md#polling-recovery) for timestamp requirements.
 
 ### Gateway HTTP contract
@@ -276,7 +282,8 @@ See [polling recovery](sendblue.md#polling-recovery) for timestamp requirements.
 
 The SendBlue webhook and callback endpoints exist only in webhook mode.
 Those POST requests require `application/json` and the configured `sb-signing-secret` header.
-See [HTTPS requests and SSE](https.md) for the separate bearer-authenticated API.
+See [HTTP requests and SSE](https.md) for the optional agent API.
+External proxies authenticate LAN API clients. The backend validates the exact loopback Host header.
 Authentication precedes JSON parsing. POST responses have empty bodies.
 Authenticated outbound, group, and unmatched inbound events make no state changes.
 A current callback also requires its random token. An authenticated stale callback returns 204.
@@ -318,7 +325,7 @@ potentially accepted and inspect the task before sending the same text again.
 | `config_invalid` | The TOML file or one of its agent entries is invalid |
 | `gateway_running` | Another process owns the gateway state lock |
 | `effect_not_found` | The requested unresolved effect is absent |
-| `state_invalid` | The durable state or a pending route binding is invalid |
+| `state_invalid` | The durable state or a pending execution binding is invalid |
 | `storage_failed` | The gateway cannot read or write its durable files |
 | `input_invalid` | The command arguments or stdin input are invalid |
 | `interrupted` | The caller interrupted the turn |

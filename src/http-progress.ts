@@ -1,24 +1,9 @@
-import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 
-export type ProgressStatus = Record<string, unknown>;
-export interface ProgressMessage {
-  id: string;
-  kind: "commentary" | "terminal";
-  text: string;
-  metadata?: ProgressStatus;
-}
-export interface ProgressSnapshot { status: ProgressStatus; terminal?: ProgressMessage }
-export interface ProgressFrame { id: string; event: "status" | "commentary" | "terminal" | "reset"; data: string; end: boolean }
+import { RequestProgress, type ProgressEntry, type ProgressMessage, type ProgressSnapshot, type ProgressStatus } from "./request-progress.js";
+export type { ProgressMessage, ProgressSnapshot, ProgressStatus } from "./request-progress.js";
+export interface ProgressFrame { id: string; event: "status" | "reasoning" | "commentary" | "terminal" | "reset"; data: string; end: boolean }
 interface Cursor { e: string; s: number; p: number }
-interface Entry { sequence: number; message: ProgressMessage; frames: ProgressFrame[]; bytes: number }
-interface RequestState {
-  epoch: string;
-  sequence: number;
-  entries: Entry[];
-  bytes: number;
-  listeners: Set<() => void>;
-}
 export interface ProgressLimits {
   requestBytes?: number;
   requestMessages?: number;
@@ -28,14 +13,14 @@ export interface ProgressLimits {
   heartbeatMs?: number;
   drainTimeoutMs?: number;
   writableBytes?: number;
+  encodedCacheBytes?: number;
 }
 const FRAME_BYTES = 4096;
 const TEXT_BYTES = 256 * 1024;
 const METADATA_BYTES = 16 * 1024;
-const STATE_BYTES = 256;
 const defaults = {
   requestBytes: 2 * 1024 * 1024, requestMessages: 128, globalBytes: 16 * 1024 * 1024,
-  globalStreams: 32, accountStreams: 4, heartbeatMs: 15_000, drainTimeoutMs: 10_000, writableBytes: 64 * 1024,
+  globalStreams: 32, accountStreams: 4, heartbeatMs: 15_000, drainTimeoutMs: 10_000, writableBytes: 64 * 1024, encodedCacheBytes: 2 * 1024 * 1024,
 };
 function cursorId(cursor: Cursor): string { return Buffer.from(JSON.stringify(cursor)).toString("base64url"); }
 function parseCursor(value: string | undefined): Cursor | undefined {
@@ -52,36 +37,56 @@ function json(value: ProgressStatus): string {
   if (Buffer.byteLength(encoded) > METADATA_BYTES) throw new RangeError("Progress metadata exceeds 16 KiB");
   return encoded;
 }
-/** Fragments only complete messages. Metadata is serialized JSON carried in field=metadata parts. */
-export function encodeProgressFrames(epoch: string, sequence: number, event: ProgressFrame["event"], message: { id: string; text: string; metadata?: ProgressStatus }): ProgressFrame[] {
+interface FrameIndex { parts: Uint32Array; metadata?: string }
+type FrameMessage = { id: string; text: string; metadata?: ProgressStatus };
+function frame(epoch: string, sequence: number, event: ProgressFrame["event"], messageId: string,
+  part: number, field: string, text: string, end: boolean): ProgressFrame {
+  const id = cursorId({ e: epoch, s: sequence, p: part });
+  return { id, event, end, data: `id: ${id}\nevent: ${event}\ndata: ${JSON.stringify({ message_id: messageId, part, end, field, text })}\n\n` };
+}
+/** Index UTF-16 slice boundaries once; retain neither escaped payloads nor source text. */
+function indexFrames(epoch: string, sequence: number, event: ProgressFrame["event"], message: FrameMessage): FrameIndex {
   if (Buffer.byteLength(message.id) > 512) throw new RangeError("Progress identity exceeds 512 bytes");
   if (Buffer.byteLength(message.text) > TEXT_BYTES) throw new RangeError("Progress text exceeds 256 KiB");
-  const fields: Array<[string, string]> = [];
-  if (message.metadata !== undefined) fields.push(["metadata", json(message.metadata)]);
-  if (event === "commentary" || event === "terminal") fields.push(["text", message.text]);
-  if (fields.length === 0) fields.push(["text", ""]);
-  const parts: Array<{ field: string; text: string }> = [];
-  const frame = (part: number, field: string, text: string, end: boolean): ProgressFrame => {
-    const id = cursorId({ e: epoch, s: sequence, p: part });
-    return { id, event, end, data: `id: ${id}\nevent: ${event}\ndata: ${JSON.stringify({ message_id: message.id, part, end, field, text })}\n\n` };
-  };
+  const metadata = message.metadata === undefined ? undefined : json(message.metadata);
+  const fields: Array<[number, string]> = [];
+  if (metadata !== undefined) fields.push([1, metadata]);
+  if (event === "reasoning" || event === "commentary" || event === "terminal") fields.push([0, message.text]);
+  if (!fields.length) fields.push([0, ""]);
+  const parts: number[] = [];
   for (const [field, value] of fields) {
-    let piece = "";
-    let used = Buffer.byteLength(frame(parts.length, field, "", false).data);
+    let start = 0, offset = 0;
+    const envelope = () => Buffer.byteLength(frame(epoch, sequence, event, message.id, parts.length / 3,
+      field ? "metadata" : "text", "", false).data);
+    let used = envelope();
+    if (used > FRAME_BYTES) throw new RangeError("Progress frame envelope exceeds 4 KiB");
     for (const character of value) {
       const bytes = Buffer.byteLength(JSON.stringify(character)) - 2;
       if (used + bytes > FRAME_BYTES) {
-        if (!piece) throw new RangeError("Progress frame envelope exceeds 4 KiB");
-        parts.push({ field, text: piece });
-        piece = "";
-        used = Buffer.byteLength(frame(parts.length, field, "", false).data);
+        if (offset === start) throw new RangeError("Progress frame envelope exceeds 4 KiB");
+        parts.push(field, start, offset);
+        start = offset; used = envelope();
+        if (used + bytes > FRAME_BYTES) throw new RangeError("Progress frame envelope exceeds 4 KiB");
       }
-      piece += character;
-      used += bytes;
+      used += bytes; offset += character.length;
     }
-    parts.push({ field, text: piece });
+    parts.push(field, start, offset);
   }
-  return parts.map((part, index) => frame(index, part.field, part.text, index === parts.length - 1));
+  return { parts: new Uint32Array(parts), ...(metadata === undefined ? {} : { metadata }) };
+}
+function indexedFrame(index: FrameIndex, epoch: string, sequence: number, event: ProgressFrame["event"], message: FrameMessage,
+  part: number): ProgressFrame | undefined {
+  const offset = part * 3;
+  if (!Number.isSafeInteger(part) || part < 0 || offset >= index.parts.length) return undefined;
+  const metadata = index.parts[offset] === 1;
+  const value = metadata ? index.metadata! : message.text;
+  return frame(epoch, sequence, event, message.id, part, metadata ? "metadata" : "text",
+    value.slice(index.parts[offset + 1], index.parts[offset + 2]), offset + 3 === index.parts.length);
+}
+/** Convenience encoder; live streams use the compact index and encode only the requested frame. */
+export function encodeProgressFrames(epoch: string, sequence: number, event: ProgressFrame["event"], message: FrameMessage): ProgressFrame[] {
+  const index = indexFrames(epoch, sequence, event, message);
+  return Array.from({ length: index.parts.length / 3 }, (_, part) => indexedFrame(index, epoch, sequence, event, message, part)!);
 }
 function controlFrames(epoch: string, event: "status" | "reset", metadata: ProgressStatus): ProgressFrame[] {
   // Control updates must not overwrite Last-Event-ID for commentary/result replay.
@@ -93,83 +98,47 @@ export interface ProgressSubscription { read(): ProgressFrame | undefined; close
 /** Volatile progress only. The caller owns durable results and admission/observation identity. */
 export class ProgressHub {
   readonly limits: typeof defaults;
-  private readonly nonce = randomUUID();
-  private generation = 0;
-  private states = new Map<string, RequestState>();
-  private bytes = 0;
   private closed = false;
   private streams = new Map<string, number>();
   private streamClosers = new Set<() => void>();
-  constructor(limits: ProgressLimits = {}) {
+  private subscriptionClosers = new Set<() => void>();
+  private readonly encoded = new Map<string, { index: FrameIndex; bytes: number }>();
+  private encodingBytes = 0;
+  private readonly ownsSource: boolean;
+  private readonly detach: () => void;
+  readonly semantic: RequestProgress;
+  constructor(limits: ProgressLimits = {}, source?: RequestProgress) {
     this.limits = { ...defaults, ...limits };
     for (const value of Object.values(this.limits)) if (!Number.isSafeInteger(value) || value <= 0) throw new RangeError("Progress limits must be positive integers");
-    if (this.limits.globalBytes < STATE_BYTES) throw new RangeError("Progress global budget is too small");
+    this.ownsSource = source === undefined;
+    this.semantic = source ?? new RequestProgress({ requestBytes: this.limits.requestBytes, requestMessages: this.limits.requestMessages, globalBytes: this.limits.globalBytes });
+    this.detach = this.semantic.onClose(() => this.close());
   }
-  private state(key: string): RequestState {
-    if (this.closed) throw new Error("Progress hub is closed");
-    let state = this.states.get(key);
-    if (!state) {
-      state = { epoch: `${this.nonce}.${++this.generation}`, sequence: 0, entries: [], bytes: 0, listeners: new Set() };
-      this.states.set(key, state);
-      this.bytes += STATE_BYTES;
+  private frameIndex(epoch: string, entry: ProgressEntry): FrameIndex {
+    const key = `${epoch}:${entry.sequence}`;
+    const cached = this.encoded.get(key);
+    if (cached) { this.encoded.delete(key); this.encoded.set(key, cached); return cached.index; }
+    const index = indexFrames(epoch, entry.sequence, entry.message.kind, entry.message);
+    // Typed boundaries have exact byte size; reserve UTF-16 storage and map/object overhead.
+    const bytes = index.parts.byteLength + 2 * (key.length + (index.metadata?.length ?? 0)) + 128;
+    if (bytes > this.limits.encodedCacheBytes) throw new RangeError("Progress frame index exceeds presentation budget");
+    while (this.encodingBytes + bytes > this.limits.encodedCacheBytes) {
+      const oldest = this.encoded.keys().next().value!;
+      this.encodingBytes -= this.encoded.get(oldest)!.bytes; this.encoded.delete(oldest);
     }
-    return state;
+    this.encoded.set(key, { index, bytes }); this.encodingBytes += bytes;
+    return index;
   }
-  private signal(state: RequestState): void {
-    for (const listener of [...state.listeners]) { try { listener(); } catch { /* Observers cannot break execution. */ } }
-  }
-  notify(key: string): void { const state = this.states.get(key); if (state) this.signal(state); }
-  /** Returns false for a duplicate retained item. Native observation dedup remains authoritative after eviction. */
-  publish(key: string, message: ProgressMessage): boolean {
-    const state = this.state(key);
-    if (state.entries.some((entry) => entry.message.id === message.id && entry.message.kind === message.kind)) return false;
-    const sequence = state.sequence + 1;
-    let frames: ProgressFrame[];
-    let bytes: number;
-    try {
-      frames = encodeProgressFrames(state.epoch, sequence, message.kind, message);
-      bytes = frames.reduce((sum, frame) => sum + Buffer.byteLength(frame.data), 0);
-      if (bytes > this.limits.requestBytes || bytes + STATE_BYTES > this.limits.globalBytes) throw new RangeError("Completed progress message exceeds replay budget");
-    } catch (error) {
-      if (state.entries.length === 0 && state.listeners.size === 0) { this.states.delete(key); this.bytes -= STATE_BYTES; }
-      throw error;
-    }
-    state.sequence = sequence;
-    state.entries.push({ sequence, message: { id: message.id, kind: message.kind, text: "" }, frames, bytes });
-    state.bytes += bytes;
-    this.bytes += bytes;
-    this.trim();
-    this.signal(state);
-    return true;
-  }
-  reset(key: string): void {
-    const state = this.states.get(key);
-    if (!state) return;
-    this.bytes -= state.bytes;
-    state.bytes = 0;
-    state.entries = [];
-    state.sequence = 0;
-    state.epoch = `${this.nonce}.${++this.generation}`;
-    this.signal(state);
-  }
-  private removeFirst(state: RequestState): void {
-    const entry = state.entries.shift();
-    if (entry) { state.bytes -= entry.bytes; this.bytes -= entry.bytes; }
-  }
-  private trim(): void {
-    for (const state of this.states.values()) {
-      while (state.bytes > this.limits.requestBytes || state.entries.length > this.limits.requestMessages) this.removeFirst(state);
-    }
-    for (const [key, state] of this.states) {
-      if (this.bytes <= this.limits.globalBytes) break;
-      while (state.entries.length && this.bytes > this.limits.globalBytes) this.removeFirst(state);
-      if (state.entries.length === 0 && state.listeners.size === 0) { this.states.delete(key); this.bytes -= STATE_BYTES; }
-    }
-  }
+  get encodedBytes(): number { return this.encodingBytes; }
+
+  notify(key: string): void { this.semantic.notify(key); }
+  publish(key: string, message: ProgressMessage): boolean { return this.semantic.publish(key, message); }
+  reset(key: string): void { this.semantic.reset(key); }
   /** Snapshot, cursor validation and listener registration are synchronous. onAvailable is only a wake signal. */
   subscribe(key: string, options: { cursor?: string; snapshot: () => ProgressSnapshot }, onAvailable: () => void): ProgressSubscription {
     const initialSnapshot = options.snapshot();
-    const state = this.state(key);
+    const watch = this.semantic.watch(key, () => wake());
+    const state = watch.view;
     let closed = false;
     let epoch = state.epoch;
     let cursor = parseCursor(options.cursor);
@@ -183,8 +152,7 @@ export class ProgressHub {
     let lastTerminal: string | undefined;
     const wake = () => { statusDirty = true; try { onAvailable(); } catch { /* Isolate observers. */ } };
     let firstSnapshot: ProgressSnapshot | undefined = initialSnapshot;
-    state.listeners.add(wake);
-    this.trim();
+
     const reset = (snapshot: ProgressSnapshot) => {
       epoch = state.epoch;
       cursor = { e: epoch, s: (state.entries[0]?.sequence ?? state.sequence + 1) - 1, p: Number.MAX_SAFE_INTEGER };
@@ -195,7 +163,7 @@ export class ProgressHub {
       initialStatusPending = false;
       lastTerminal = undefined;
     };
-    return {
+    const subscription: ProgressSubscription = {
       read: () => {
         if (closed || this.closed) return undefined;
         if (controls.length) return controls.shift();
@@ -205,7 +173,7 @@ export class ProgressHub {
           // Durable regeneration uses the shared ring, never a per-subscriber message queue.
           this.publish(key, snapshot.terminal);
         }
-        const invalid = epoch !== state.epoch || (cursor !== undefined && (cursor.e !== state.epoch || cursor.s > state.sequence || (cursor.s > 0 && !state.entries.some((e) => e.sequence === cursor!.s && cursor!.p < e.frames.length))));
+        const invalid = epoch !== state.epoch || (cursor !== undefined && (cursor.e !== state.epoch || cursor.s > state.sequence || (cursor.s > 0 && !state.entries.some((e) => e.sequence === cursor!.s && cursor!.p < this.frameIndex(state.epoch, e).parts.length / 3))));
         if (initial) {
           initial = false;
           if ((options.cursor !== undefined && !cursor) || invalid) { reset(snapshot); statusDirty = false; return controls.shift(); }
@@ -217,7 +185,7 @@ export class ProgressHub {
           if (initialStatusPending && entry.sequence > watermark) break;
           if (entry.sequence < cursor!.s) continue;
           const next = entry.sequence === cursor!.s ? cursor!.p + 1 : 0;
-          const frame = entry.frames[next];
+          const frame = indexedFrame(this.frameIndex(state.epoch, entry), state.epoch, entry.sequence, entry.message.kind, entry.message, next);
           if (frame) {
             cursor = { e: epoch, s: entry.sequence, p: next };
             cursorComplete = frame.end;
@@ -241,11 +209,12 @@ export class ProgressHub {
       close: () => {
         if (closed) return;
         closed = true;
-        state.listeners.delete(wake);
-        if (!state.entries.length && this.states.get(key) === state) { this.states.delete(key); this.bytes -= STATE_BYTES; }
-        this.trim();
+        watch.close();
+        this.subscriptionClosers.delete(subscription.close);
       },
     };
+    this.subscriptionClosers.add(subscription.close);
+    return subscription;
   }
   /** Stream slots are acquired before sending HTTP headers. */
   acquireStream(account: string, close: () => void): (() => void) | undefined {
@@ -258,23 +227,33 @@ export class ProgressHub {
       if (remaining) this.streams.set(account, remaining); else this.streams.delete(account);
     };
   }
-  get retainedBytes(): number { return this.bytes; }
-  get requestCount(): number { return this.states.size; }
+  get retainedBytes(): number { return this.semantic.retainedBytes; }
+  get requestCount(): number { return this.semantic.requestCount; }
   close(): void {
+    if (this.closed) return;
     this.closed = true;
     for (const close of [...this.streamClosers]) close();
-    for (const state of this.states.values()) state.listeners.clear();
-    this.states.clear();
-    this.bytes = 0;
+    for (const close of [...this.subscriptionClosers]) close();
+    this.detach?.();
+    this.encoded.clear(); this.encodingBytes = 0;
+    if (this.ownsSource) this.semantic.close();
   }
 }
 
+const presentations = new WeakMap<RequestProgress, ProgressHub>();
+
 /** Returns false on stream-capacity rejection; the caller sends its normal HTTP error. */
 export function writeProgressStream(options: {
-  hub: ProgressHub; requestKey: string; accountId: string; response: ServerResponse;
+  hub: ProgressHub | RequestProgress; requestKey: string; accountId: string; response: ServerResponse;
   cursor?: string; snapshot: () => ProgressSnapshot;
 }): boolean {
-  const { hub, response } = options;
+  const { response } = options;
+  let hub: ProgressHub;
+  if (options.hub instanceof ProgressHub) hub = options.hub;
+  else {
+    hub = presentations.get(options.hub) ?? new ProgressHub({}, options.hub);
+    presentations.set(options.hub, hub);
+  }
   let subscription: ProgressSubscription | undefined;
   let closed = false;
   let blocked = false;

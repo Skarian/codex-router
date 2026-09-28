@@ -6,9 +6,9 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import { Sendblue, SendblueRequestError, retryPolicy, sendblueCredentials } from "../src/sendblue.js";
-import type { GatewayRoute } from "../src/config.js";
+import type { SendblueConversation } from "../src/config.js";
 
-const route = { sender: "+15555550001", sendblueNumber: "+15555550002" } as GatewayRoute;
+const route = { sender: "+15555550001", sendblueNumber: "+15555550002" } as SendblueConversation;
 const credentials = { apiKeyId: "key", apiSecretKey: "secret", signingSecret: "sign" };
 const signal = new AbortController().signal;
 const event = { is_outbound: false, status: "RECEIVED", from_number: route.sender, sendblue_number: route.sendblueNumber,
@@ -117,7 +117,7 @@ test("polling uses typed SDK filters and status lookup without requiring a webho
   for (const [key, value] of Object.entries(query)) assert.equal(calls[0]!.searchParams.get(key), String(value));
   assert.equal((await connector.getStatus("known", signal)).status, "DELIVERED");
   assert.equal(calls[1]!.searchParams.get("handle"), "known");
-  const account = { id: "personal", apiKeyId: "key", apiSecretKey: "secret" };
+  const account = { id: "personal", conversations: [], apiKeyId: "key", apiSecretKey: "secret" };
   assert.deepEqual(sendblueCredentials(account), { apiKeyId: "key", apiSecretKey: "secret" });
   assert.throws(() => sendblueCredentials({ ...account, mode: "webhook" }));
 });

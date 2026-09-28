@@ -21,9 +21,9 @@ test("live CLI status works with the writer lock held and excludes private owner
   const f = await fixture();
   try {
     const config = join(f.directory,"config.toml");
-    await writeFile(config, `[[agents]]\nid="chat"\nlabel="Chat"\ncwd="/tmp"\nthread_id="thread"\nmodel="test"\n[gateway]\nlisten_port=8787\nstate_dir=${JSON.stringify(f.directory)}\n[[gateway.https]]\nid="local"\nbearer_token="SECRET_SENTINEL"\n[[gateway.routes]]\nid="chat"\nagent="chat"\nhttps="local"\n`,{mode:0o600});
+    await writeFile(config, `[[agents]]\nid="chat"\nlabel="Chat"\ncwd="/tmp"\nthread_id="thread"\nmodel="test"\n[gateway]\nstate_dir=${JSON.stringify(f.directory)}\n[gateway.http]\nport=8787\n`,{mode:0o600});
     const result = JSON.parse((await exec(process.execPath,["dist/src/cli.js","--config",config,"gateway","status","--json"])).stdout);
-    assert.equal(result.runtime.state,"live"); assert.equal(result.runtime.routes[0].code,"thread_unavailable");
+    assert.equal(result.runtime.state,"live"); assert.equal(result.runtime.agents[0].code,"thread_unavailable");
     assert.deepEqual(result.unresolved,[]);
     assert.ok(!JSON.stringify(result).includes("SECRET_SENTINEL"));
     assert.ok(!JSON.stringify(result).includes('"owner"'));

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -11,11 +11,38 @@ import {
   parseDaemonStartResult,
   parseRemoteControlSocketState,
   remoteDaemonStartSpec,
+  remoteDaemonAvailable,
   type AppServerConnection,
   type RemoteSocketState,
 } from "../src/app-server.js";
 import { RouterError } from "../src/errors.js";
 import type { JsonRpcClient } from "../src/json-rpc.js";
+
+test("remote daemon capability uses read-only CLI help without an installation layout", { skip: process.platform === "win32" }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "daemon-capability-"));
+  const previousPath = process.env.PATH, previousHome = process.env.CODEX_HOME;
+  try {
+    await symlink("/bin/sh", join(directory, "sh"));
+    await writeFile(join(directory, "ssh"), '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n', { mode: 0o700 });
+    const cli = '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CODEX_HOME/calls"\ntest "$*" = "app-server daemon start --help" || exit 99\n';
+    await writeFile(join(directory, "codex"), cli + "exit 0\n", { mode: 0o700 });
+    process.env.PATH = directory; process.env.CODEX_HOME = directory;
+    assert.equal(await remoteDaemonAvailable("host"), true);
+    await writeFile(join(directory, "codex"), cli + "exit 2\n");
+    assert.equal(await remoteDaemonAvailable("host"), false);
+    assert.deepEqual((await readFile(join(directory, "calls"), "utf8")).trim().split("\n"), [
+      "app-server daemon start --help", "app-server daemon start --help",
+    ]);
+    await rm(join(directory, "codex"));
+    assert.equal(await remoteDaemonAvailable("host"), false);
+    await writeFile(join(directory, "ssh"), "#!/bin/sh\nexit 255\n");
+    await assert.rejects(remoteDaemonAvailable("host"), { code: "app_server_connect_failed" });
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previousHome;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("remote socket probe distinguishes only an absent or live socket", () => {
   assert.equal(parseRemoteControlSocketState("socket\n"), "socket");

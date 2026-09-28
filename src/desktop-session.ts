@@ -144,7 +144,15 @@ export class DesktopSession {
   get artifactBaseline(): string[] { return [...this.baseline]; }
   private async history(): Promise<Row[]> {
     if (this.disposed) throw new RouterError("app_server_disconnected", "Desktop session is closed.");
-    const response = await this.ipc.request("thread-follower-load-complete-history", { conversationId: this.agent.threadId }, 1, this.owner);
+    let response: Row;
+    try {
+      response = await this.ipc.request("thread-follower-load-complete-history", { conversationId: this.agent.threadId }, 1, this.owner);
+    } catch (error) {
+      if (error instanceof DesktopResponseError && error.response.error === "Conversation must be resumed before loading history") {
+        throw new RouterError("thread_busy", "Desktop is still loading the conversation.", { cause: error });
+      }
+      throw error;
+    }
     const revision = response.result?.revision;
     if (!Number.isSafeInteger(revision) || revision < 0) throw new RouterError("app_server_protocol_failed", "Desktop history acknowledgement has no revision.");
     const deadline = Date.now() + 15_000;
